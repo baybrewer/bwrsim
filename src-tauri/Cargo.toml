@@ -1,0 +1,19 @@
+[package]
+name = "bwrx300-sim"
+description = "BWRX-300 control room simulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "bwrx300_sim_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "~2.12.1", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bwr-core = { path = "../crates/bwr-core" }

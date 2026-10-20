@@ -1,0 +1,17 @@
+{
+  "name": "bwrx300-sim",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Realistic control room simulator for the GE Hitachi BWRX-300 boiling water reactor",
+  "license": "MIT",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "ui:dev": "npm --prefix ui run dev",
+    "test": "cargo test --release -p bwr-core"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.1"
+  }
+}

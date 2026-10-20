@@ -1,0 +1,12 @@
+[package]
+name = "bwr-core"
+description = "Physics engine for a BWRX-300 control room simulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
