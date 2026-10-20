@@ -1508,21 +1508,14 @@ Expected: compile error `cannot find function `standard_cases``.
 
 - [ ] **Step 3: Implement `standard_cases`**
 
-Add to the `use` lines at the top of `validation.rs`:
-
-```rust
-use crate::api::ModeSwitch;
-use crate::params::PRESSORE_SETPOINT_DEFAULT_PLACEHOLDER;
-```
-
-Correction: the constant is `PRESSURE_SETPOINT_DEFAULT`; the import line is exactly:
+At the top of `validation.rs`, replace the line `use crate::api::{Command, ScenarioName};` with:
 
 ```rust
 use crate::api::{Command, ModeSwitch, ScenarioName};
 use crate::params::PRESSURE_SETPOINT_DEFAULT;
 ```
 
-(replace the existing `use crate::api::{Command, ScenarioName};` line). Then insert before `#[cfg(test)]`:
+Then insert before `#[cfg(test)]`:
 
 ```rust
 fn at(at_s: f64, cmd: Command) -> ScriptedCommand {
