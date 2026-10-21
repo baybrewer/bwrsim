@@ -8,7 +8,9 @@
 
 **Tech Stack:** Rust 2021, serde, Python 3 + CoolProp (`tools/gen_steam_table.py`), existing `validation` module from Package 2.
 
-**Prerequisites (assumed complete):** Package 1 (`docs/model/*.csv`, `assumptions.md`), Package 2 (`ledger.rs`, `BoundaryFlows`, `validation.rs`, `standard_cases()` with ids `fp_steady_600`, `hs_steady_600`, `cs_steady_600`), Package 3 (`domain.rs::DomainError`, `Vessel.collapsed_level_z`, `Vessel.last_error: Option<DomainError>`, `solve_eos` returning `Result`, outflow bounding in `Vessel::step`, `core_coverage` fix).
+**Prerequisites (assumed complete, master r2):** Package 1 (`docs/model/*.csv` with the locked headers, `assumptions.md`, `tests/register.rs` enforcing a `parameters.csv` row per constant), Package 2 (`ledger.rs` with `BoundaryFlows` incl. `w_ic_steam`/`w_ic_return`/`h_ic_return` and `Ledger.integrated`; `validation.rs` with trace schema v2 (`N_TRACE_COLS = 59`, columns `gas_mass_kg`, `t_coolant_c`, `moderator_t_c` emitted as 0.0 until this package); `standard_cases()` with ids `fp_steady_600`, `hs_steady_600`, `cs_steady_600`; `Sim::finalize_init()` as the constructor epilogue that re-bases the ledger), Package 3 (`domain.rs::DomainError`, `Vessel.collapsed_level_z`, `Vessel.exhausted: Option<f64>`, `Vessel.last_error: Option<DomainError>`, `pub const T_EOS_MIN/T_EOS_MAX` in `vessel.rs`, `solve_eos` returning `Result` with the master rejection semantics, outflow bounding in `Vessel::step` as the transfer-allocation point, `core_coverage` fix, `Sim::step` order steps 1–17).
+
+**Derives rule (master r2):** `Regime` derives `Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize` with `#[serde(rename_all = "camelCase")]`; the replacement `Eos` keeps the baseline derives `Clone, Copy, Debug`. Both appear verbatim in Task 3 Step 3.
 
 **Spec section:** Package 4 of `docs/superpowers/plans/2026-10-20-existing-systems-refinement.md`.
 
@@ -34,6 +36,7 @@ See master plan "Global Constraints". In addition for this package:
 | `crates/bwr-core/src/vessel.rs` | Modify | `Regime`, `Eos`, `solve_eos` with gas and water-solid, `gas_mass`, vent/gas dynamics, hydrostatic head, `moderator_t`, `steam_available`, `friction_dp` |
 | `crates/bwr-core/src/sim.rs` | Modify | Replace `eos.subcooled`/`eos.solid` call sites, pass `moderator_t()`, snapshot `regime`, gas-blanket alarm |
 | `crates/bwr-core/src/api.rs` | Modify | `Vessel.regime` |
+| `crates/bwr-core/src/validation.rs` | Modify | Populate trace schema v2 columns `gas_mass_kg`, `t_coolant_c` (Task 3) and `moderator_t_c` (Task 6) in `run_case` sampling |
 | `ui/src/sim/types.ts`, `ui/src/sim/mock.ts` | Modify | `Regime` type and `vessel.regime` field |
 | `crates/bwr-core/tests/vessel_transients.rs` | Create | Shrink/swell, heatup, cooldown, pressure step, low level, steady consistency, water-solid, conservation |
 | `docs/model/parameters.csv`, `assumptions.md`, `esbwr-applicability.csv`, `sources.csv`, `coverage.md` | Modify | Register rows for every constant and borrowed concept |
@@ -87,8 +90,11 @@ Status: Package 4 of the refinement program. Model owner file: `crates/bwr-core/
 | Static quality `x` | 0 .. 1 | clamped by volume (cannot leave) |
 | Water level | 0 .. `VESSEL_HEIGHT` (26.7 m); narrow-range display is relative to `Z_NWL` | — |
 
-The simulation keeps running after a `DomainError`; the vessel state freezes for the
-offending step, `Vessel.last_error` is set, the Sim raises `MODEL ENVELOPE EXCEEDED`.
+The simulation keeps running after a `DomainError`; for the offending step the vessel
+rolls `mass`, `energy` and `gas_mass` back to their entry values and reports
+`BoundaryFlows::default()` (nothing applied), `Vessel.last_error` is set, and the Sim
+raises `MODEL ENVELOPE EXCEEDED`. When outflows must be bounded to the available
+inventory, `Vessel.exhausted` carries the deficit and the bounded flows are applied.
 
 ## 2. State variables
 
@@ -384,7 +390,16 @@ Expected: `known_points`, `reference_points_iapws`, `compressibility_in_publishe
 
 Append to `docs/model/sources.csv` (use the column order of the Package 1 header) a row with id `SRC-IAPWS-TABLES`, title "Saturated water and steam tables (IAPWS-IF97 values as tabulated in standard thermodynamics texts)", revision "IF97 (2007)", jurisdiction "n/a", document kind "accepted methodology", retrieval date today, and in notes the three reference points used in `reference_points_iapws`. Update the existing CoolProp/IAPWS row (or add `SRC-COOLPROP`) with the CoolProp version printed in Step 4.
 
-Append to `docs/model/parameters.csv`: `kappa_f` — unit `1/Pa`; definition "isothermal compressibility of saturated liquid, table column 7"; reference state "saturation line 1..350 degC"; source design "water property"; status `confirmed`; source `SRC-IAPWS-TABLES`; notes "finite difference of IF97 region-1 density 0.1–0.3 MPa above saturation; 20 degC value <printed value>".
+Append to `docs/model/parameters.csv` (locked header `id,value,unit,definition,reference_state,source_design,status,source_ids,interval_lo,interval_hi,assumption_id,location,notes`), filling `<k20>` with the value printed by `compressibility_in_published_range`:
+
+```csv
+KAPPA_F_TABLE,table,1/Pa,isothermal compressibility of saturated liquid (SAT_TABLE column 7),saturation line 1..350 degC,water property,confirmed,SRC-IAPWS-TABLES;SRC-COOLPROP,,,,crates/bwr-core/src/steam_table.rs,finite difference of IF97 region-1 density 0.1-0.3 MPa above saturation; 20 degC value <k20>
+T_TABLE_MIN,1.0,degC,first saturation-table temperature,,water property,confirmed,SRC-IAPWS-TABLES,,,,crates/bwr-core/src/steam.rs,
+T_TABLE_MAX,350.0,degC,last saturation-table temperature,,water property,confirmed,SRC-IAPWS-TABLES,,,,crates/bwr-core/src/steam.rs,
+```
+
+Run: `cargo test --release -p bwr-core --test register`
+Expected: pass (every constant has a row).
 
 - [ ] **Step 8: Commit**
 
@@ -403,10 +418,11 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Modify: `crates/bwr-core/src/vessel.rs` (`Eos`, `Regime`, `solve_eos`, `energy_for`, `Vessel` fields, `Vessel::new`, `update_level`, `sat_for_core`, `steam_available`)
 - Modify: `crates/bwr-core/src/sim.rs` (call sites in the table above; snapshot)
 - Modify: `crates/bwr-core/src/api.rs`, `ui/src/sim/types.ts`, `ui/src/sim/mock.ts`
+- Modify: `crates/bwr-core/src/validation.rs` (`run_case` sampling of `gas_mass_kg`, `t_coolant_c`)
 - Modify: any Package 3 test calling `solve_eos`
 
 **Interfaces:**
-- Consumes: `steam::compressed_liquid_rho`, `Sat.kappa_f`, `steam::T_TABLE_MIN`, `domain::DomainError`.
+- Consumes: `steam::compressed_liquid_rho`, `Sat.kappa_f`, `domain::DomainError`, Package 3's `pub const T_EOS_MIN: f64 = 1.0` and `pub const T_EOS_MAX: f64 = 349.5` in `vessel.rs` (not redeclared here), `Vessel.last_error`, `Vessel.exhausted`.
 - Produces (master contract): `pub enum Regime { Vented, Saturated, WaterSolid, GasBlanketed }`, `pub struct Eos { t, p, p_steam, p_gas, x, regime }`, `pub const R_AIR: f64 = 287.0`, `pub fn solve_eos(mass: f64, energy: f64, gas_mass: f64, vent_open: bool) -> Result<Eos, DomainError>`, `Vessel.gas_mass: f64`, `Vessel::steam_available(&self) -> bool`, `Snapshot.vessel.regime`.
 
 - [ ] **Step 1: Write the failing unit tests in `vessel.rs`**
@@ -460,6 +476,7 @@ Replace the existing `eos_roundtrip` test with:
         assert!((v.eos.p - P_ATM).abs() < 500.0, "p = {}", v.eos.p);
         assert!(v.gas_mass > 50.0 && v.gas_mass < 500.0, "gas {}", v.gas_mass);
         assert!(!v.steam_available());
+        assert!(v.last_error.is_none() && v.exhausted.is_none());
         let h = Vessel::new(sat_p(P_RATED).t, Z_NWL, RATED_POWER_W, STEAM_FLOW_RATED, T_FW_RATED, false);
         assert_eq!(h.eos.regime, Regime::Saturated);
         assert_eq!(h.gas_mass, 0.0);
@@ -478,16 +495,18 @@ In `vessel.rs`, replace the `Eos` struct, `energy_at`, `solve_eos`, and `energy_
 
 ```rust
 use crate::domain::DomainError;
-use crate::steam::{self, compressed_liquid_rho, sat_p, sat_t, Sat, P_ATM, T_TABLE_MIN};
+use crate::steam::{self, compressed_liquid_rho, sat_p, sat_t, Sat, P_ATM};
 use serde::{Deserialize, Serialize};
+
+// `pub const T_EOS_MIN: f64 = 1.0;` and `pub const T_EOS_MAX: f64 = 349.5;` already
+// exist from Package 3 and are used below; do not redeclare them.
 
 /// Gas constant of air (noncondensable in the head), J/kg/K.
 pub const R_AIR: f64 = 287.0;
-/// Upper temperature of the EOS bisection, degC (last table row is 350).
-const T_EOS_MAX: f64 = 349.5;
 /// Gas below this mass is treated as dissolved when the vessel goes water-solid, kg.
-const WATER_SOLID_GAS_TOLERANCE_KG: f64 = 1.0;
+pub const WATER_SOLID_GAS_TOLERANCE_KG: f64 = 1.0;
 
+/// Derives per master r2 Derives rule (nested in Sim via Vessel.eos and placed in api.rs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Regime {
@@ -497,7 +516,7 @@ pub enum Regime {
     GasBlanketed,
 }
 
-/// Equilibrium state of the vessel fluid.
+/// Equilibrium state of the vessel fluid. Keeps the baseline derives (Clone, Copy, Debug).
 #[derive(Clone, Copy, Debug)]
 pub struct Eos {
     pub t: f64,
@@ -532,10 +551,10 @@ pub fn solve_eos(mass: f64, energy: f64, gas_mass: f64, vent_open: bool) -> Resu
     if !(mass > 0.0) || !energy.is_finite() {
         return Err(DomainError::EosOutOfRange { mass_kg: mass, energy_j: energy });
     }
-    if energy < state_at(T_TABLE_MIN, mass).0 || energy > state_at(T_EOS_MAX, mass).0 {
+    if energy < state_at(T_EOS_MIN, mass).0 || energy > state_at(T_EOS_MAX, mass).0 {
         return Err(DomainError::EosOutOfRange { mass_kg: mass, energy_j: energy });
     }
-    let (mut lo, mut hi) = (T_TABLE_MIN, T_EOS_MAX);
+    let (mut lo, mut hi) = (T_EOS_MIN, T_EOS_MAX);
     for _ in 0..60 {
         let mid = 0.5 * (lo + hi);
         if state_at(mid, mass).0 < energy {
@@ -601,7 +620,7 @@ In `Vessel::new`, change the struct literal and the initialisation tail:
             eos: Eos { t, p: P_ATM, p_steam: 0.0, p_gas: 0.0, x: 0.0, regime: Regime::Vented },
             // ... remaining fields unchanged (core_flow, h_in, alpha_core, alpha_ch, core,
             // level_z, collapsed_level_z, head_vent_open, vent_flow, heatup_rate, k_fric,
-            // drive_dp, last_error)
+            // drive_dp, exhausted: None, last_error: None)
         };
         // A vessel colder than 100 degC sits at atmospheric pressure under air;
         // a hotter one is at saturation pressure with no gas.
@@ -620,12 +639,18 @@ In `Vessel::new`, change the struct literal and the initialisation tail:
         v.mass = v_l * rho_l + v_g * sg.rho_g;
         v.energy = energy_for(v.mass, t);
         v.gas_mass = if v_g > 0.0 && sg.p < P_ATM { (P_ATM - sg.p) * v_g / (R_AIR * (t + 273.15)) } else { 0.0 };
-        v.eos = solve_eos(v.mass, v.energy, v.gas_mass, vent_open).expect("initial vessel state is inside the envelope");
+        // An invalid initial condition must stay visible (master: finalize_init retains
+        // domain errors), so it is recorded, not panicked on; the fallback eos is the
+        // atmospheric placeholder set above.
+        match solve_eos(v.mass, v.energy, v.gas_mass, vent_open) {
+            Ok(e) => v.eos = e,
+            Err(e) => v.last_error = Some(e),
+        }
         v.update_level();
         v
 ```
 
-(Delete the old `let s = if t < 100.0 { sat_p(P_ATM) } else { sat_t(t) };` and the old `rho_l`/`m_g` lines.)
+(Delete the old `let s = if t < 100.0 { sat_p(P_ATM) } else { sat_t(t) };` and the old `rho_l`/`m_g` lines.) `Vessel::new` adds no settling; the scenario constructors in `sim.rs` are untouched by this task and still end with `Sim::finalize_init()`, which re-bases the ledger from the vessel built here and drains `vessel.last_error` into `domain_errors` at `t = 0.0`.
 
 Replace `update_level`:
 
@@ -693,6 +718,8 @@ and in `interface Vessel` after `heatupRateCph: number;`:
 
 Run: `grep -n "subcooled\|\.solid" ui/src/components -r` — expected: no matches (the mimic reads only Snapshot fields).
 
+Trace schema v2 (Package 2 emits these as 0.0 "populated from Package 4"): in `crates/bwr-core/src/validation.rs` `run_case` sampling, set column `gas_mass_kg` from `sim.vessel.gas_mass` and `t_coolant_c` from `sim.vessel.eos.t` (use `col_index("gas_mass_kg")` / `col_index("t_coolant_c")`, never a literal index). `moderator_t_c` is populated in Task 6 once `moderator_t()` exists. Update the "populated from Package N" note for these two columns in `docs/validation/method.md`.
+
 - [ ] **Step 7: Fix Package 3 call sites and run everything**
 
 Run: `grep -rn "solve_eos(" crates/bwr-core/tests crates/bwr-core/src` and change any two-argument call to `solve_eos(m, e, 0.0, false)`.
@@ -704,7 +731,7 @@ Expected: exit 0.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/bwr-core/src/vessel.rs crates/bwr-core/src/sim.rs crates/bwr-core/src/api.rs crates/bwr-core/tests ui/src/sim/types.ts ui/src/sim/mock.ts
+git add crates/bwr-core/src/vessel.rs crates/bwr-core/src/sim.rs crates/bwr-core/src/api.rs crates/bwr-core/src/validation.rs crates/bwr-core/tests ui/src/sim/types.ts ui/src/sim/mock.ts docs/validation/method.md
 git commit -m "feat(vessel): regimes, noncondensable gas and water-solid equation of state
 
 Replaces the 'below 100 degC is atmospheric' rule with Vented / Saturated /
@@ -908,12 +935,17 @@ Replace the body of `pub fn step(&mut self, dt: f64, inp: &VesselInputs) -> Boun
         };
         let w_liquid_req = inp.w_liquid_out + w_vent_liquid;
 
-        // Bound outflows by the inventory available this step (Package 3 semantics).
+        // Transfer-allocation point (master step 8): bound ALL outflows to the inventory
+        // available this step. Before Package 7 the IC removes energy only (inp.q_ic);
+        // Package 7 adds inp.w_ic_steam to `out_req` and reports w_ic_steam/w_ic_return.
+        self.exhausted = None;
         let out_req = (w_steam_req + w_vent_steam + w_liquid_req) * dt;
         let avail = self.mass + inp.w_feed * dt;
         let scale = if out_req > avail && out_req > 0.0 { avail / out_req } else { 1.0 };
         if scale < 1.0 {
-            self.last_error = Some(DomainError::InventoryExhausted { deficit_kg: out_req - avail });
+            let deficit = out_req - avail;
+            self.exhausted = Some(deficit);
+            self.last_error = Some(DomainError::InventoryExhausted { deficit_kg: deficit });
         }
         let w_steam = w_steam_req * scale;
         let w_vent_steam = w_vent_steam * scale;
@@ -932,22 +964,34 @@ Replace the body of `pub fn step(&mut self, dt: f64, inp: &VesselInputs) -> Boun
             w_vent: w_vent_steam,
             w_liquid_out,
             h_liquid_out: h_liq,
+            w_ic_steam: 0.0,
+            w_ic_return: 0.0,
+            h_ic_return: 0.0,
             q_core: inp.q_core,
             q_ic: inp.q_ic,
             q_loss: heat_loss,
             mass_clipped: 0.0,
             energy_clipped: 0.0,
         };
-        let gas_new = (self.gas_mass + dgas * dt).max(0.0);
-        match solve_eos(self.mass + dm * dt, self.energy + de * dt, gas_new, self.head_vent_open) {
+
+        // Commit only if the new state is inside the envelope (master rejection
+        // semantics): on Err roll mass, energy and gas_mass back to their entry values,
+        // report nothing applied, and record the error.
+        let (mass0, energy0, gas0) = (self.mass, self.energy, self.gas_mass);
+        let gas_new = (gas0 + dgas * dt).max(0.0);
+        match solve_eos(mass0 + dm * dt, energy0 + de * dt, gas_new, self.head_vent_open) {
             Ok(e) => {
-                self.mass += dm * dt;
-                self.energy += de * dt;
+                self.mass = mass0 + dm * dt;
+                self.energy = energy0 + de * dt;
                 self.gas_mass = gas_new;
                 self.eos = e;
             }
             Err(e) => {
-                // Freeze the vessel for this step and report; nothing crossed the boundary.
+                self.mass = mass0;
+                self.energy = energy0;
+                self.gas_mass = gas0;
+                self.vent_flow = 0.0;
+                self.exhausted = None;
                 self.last_error = Some(e);
                 return BoundaryFlows::default();
             }
@@ -955,7 +999,7 @@ Replace the body of `pub fn step(&mut self, dt: f64, inp: &VesselInputs) -> Boun
         let s = self.sat_for_core();
 ```
 
-Keep the rest of `step` (core inlet enthalpy, voids, momentum, `update_level`, heatup rate) unchanged except that the function ends with `flows` as its return value. Note the vented gas is outside the water `Ledger` by design (gas is not part of `mass`); `docs/model/vessel.md` section 2 states this.
+Keep the rest of `step` (core inlet enthalpy, voids, momentum, `update_level`, heatup rate) unchanged except that the function ends with `flows` as its return value. `Sim::step` step 9 (Package 3) continues to scale `steam.w_tcv`, `steam.w_bypass` and `fw.rwcu_reject` by `flows.w_steam / requested` so downstream consumers see applied transfers; nothing in this task changes that code. The vented gas is outside the water `Ledger` by design (gas is not part of `mass`); `docs/model/vessel.md` section 2 states this.
 
 - [ ] **Step 4: Run the tests**
 
@@ -1126,7 +1170,19 @@ Expected: all pass. `rated_flow_and_voids_are_plausible` (flow within 50 kg/s of
 
 - [ ] **Step 5: Parameter rows**
 
-Append to `docs/model/parameters.csv`: `LOOP_FADE_M` (m, 0.5, "height above TAF over which loop head fades", assumed, A-P4-6); `VENT_BOILOFF_KGS_PER_K` (kg/s/K, 0.02, "extra vent flow per degC above 100", assumed, pre-existing inline value); `C_HEAD_VENT` (kg/s/Pa, 5/7e6, "head vent coefficient, also used for air ingress", assumed); `R_AIR` (J/kg/K, 287, physical constant, confirmed); `WATER_SOLID_GAS_TOLERANCE_KG` (kg, 1.0, assumed). Replace the `tau_dc` note that referenced the literal 750 kg/m3 with "downcomer liquid density from compressed_liquid_rho".
+Append to `docs/model/parameters.csv` (locked header; `assumption_id` values are the ids assigned in Task 8 Step 2, written as `A-P4-n` until then):
+
+```csv
+LOOP_FADE_M,0.5,m,height above TAF over which the natural-circulation loop head fades to zero,level in the core region,none,assumed,,0.2,1.0,A-P4-6,crates/bwr-core/src/vessel.rs,no public BWRX value; sensitivity interval covers the chimney inlet geometry uncertainty
+VENT_BOILOFF_KGS_PER_K,0.02,kg/s/K,extra head-vent steam flow per degC above 100 with the vent open,vented hot vessel,none,assumed,,0.0,0.05,A-P4-2,crates/bwr-core/src/vessel.rs,was an inline literal in the baseline step(); if Package 1 registered it under another id rename that row
+R_AIR,287.0,J/kg/K,specific gas constant of air (head noncondensable),,physical constant,confirmed,,,,A-P4-1,crates/bwr-core/src/vessel.rs,
+WATER_SOLID_GAS_TOLERANCE_KG,1.0,kg,gas mass treated as dissolved when the vessel goes water-solid,water-solid,none,assumed,,0.1,10.0,A-P4-1,crates/bwr-core/src/vessel.rs,
+```
+
+Update the existing `C_HEAD_VENT` row (Package 1 inventoried the private constant): set `notes` to "also the air-ingress coefficient below atmospheric and the liquid-relief coefficient when water-solid (A-P4-2)" and `interval_lo,interval_hi` to `1e-7,1e-5`. Delete the row Package 1 created for the `tau_dc` literal `750.0` (downcomer density): the literal is replaced by `compressed_liquid_rho`, a computed property, not a constant. Note the deletion in the commit body.
+
+Run: `cargo test --release -p bwr-core --test register`
+Expected: pass.
 
 - [ ] **Step 6: Commit**
 
@@ -1195,11 +1251,9 @@ Add to `impl Vessel`:
     }
 ```
 
-In `sim.rs` replace every `update_reactivity(<alpha>, <t>)` call:
-- `base`: `s.core.update_reactivity(s.vessel.alpha_core, s.vessel.moderator_t());`
-- `set_source_equilibrium`: `self.core.update_reactivity(self.vessel.alpha_core, self.vessel.moderator_t());`
-- `full_power` critical search: `s.core.update_reactivity(s.vessel.alpha_core, s.vessel.moderator_t());`
-- `step`: `self.core.update_reactivity(self.vessel.alpha_core, self.vessel.moderator_t());`
+In `sim.rs`, wherever the moderator-temperature argument handed to the core reactivity update is currently the bulk vessel temperature (`self.vessel.eos.t`, the local `t`, or `t_cool`), pass `self.vessel.moderator_t()` (or `s.vessel.moderator_t()` inside constructors) instead. Four sites: `base`, `set_source_equilibrium`, the `full_power` critical-rod search loop, and `step` (master step order item 3). Change nothing else about the call or about `Core` internals: Package 5 replaces `Core::feedback` with `ReactivityCoeffs` and must find only the argument changed here.
+
+Also in `crates/bwr-core/src/validation.rs` `run_case` sampling, set the trace column `moderator_t_c` from `sim.vessel.moderator_t()` (it was emitted as 0.0 by Package 2) and update the "populated from Package 4" note in `docs/validation/method.md`.
 
 - [ ] **Step 4: Run the tests and record the shift**
 
@@ -1215,7 +1269,7 @@ and compare the `rho` and rod-average columns with the same command on the previ
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/bwr-core/src/vessel.rs crates/bwr-core/src/sim.rs crates/bwr-core/tests/vessel_transients.rs
+git add crates/bwr-core/src/vessel.rs crates/bwr-core/src/sim.rs crates/bwr-core/src/validation.rs crates/bwr-core/tests/vessel_transients.rs docs/validation/method.md
 git commit -m "feat(vessel): moderator temperature from the core liquid profile
 
 Before/after full-power rod position and rho (trace example, t=0):
@@ -1278,15 +1332,38 @@ fn pressure_step_down_swells() {
 
 #[test]
 fn steady_cases_conserve_mass_and_energy() {
+    // Residuals come from the Sim ledger (Ledger::mass_residual / energy_residual),
+    // re-based by finalize_init at t = 0; no hand-rolled sums.
+    for scenario in [ScenarioName::FullPower, ScenarioName::HotStandby, ScenarioName::ColdShutdown] {
+        let mut sim = Sim::new(scenario);
+        assert!(sim.domain_errors.is_empty(), "{scenario:?}: invalid initial condition {:?}", sim.domain_errors);
+        let mass0 = sim.vessel.mass;
+        let energy0 = sim.vessel.energy.abs();
+        run(&mut sim, 600.0);
+        let rm = sim.ledger.mass_residual(sim.vessel.mass);
+        let re = sim.ledger.energy_residual(sim.vessel.energy);
+        assert!(rm.abs() < 1e-6 * mass0, "{scenario:?}: mass residual {rm} kg");
+        assert!(re.abs() < 1e-6 * energy0, "{scenario:?}: energy residual {re} J");
+        assert!(sim.domain_errors.is_empty(), "{scenario:?}: {:?}", sim.domain_errors);
+    }
+    // The trace runner reports the same ledger residuals and the Package 4 columns.
     for id in ["fp_steady_600", "hs_steady_600", "cs_steady_600"] {
         let case = standard_cases().into_iter().find(|c| c.id == id).unwrap_or_else(|| panic!("missing case {id}"));
         let tr = run_case(&case, DT);
         let m = tr.metrics();
         let mass = tr.column("mass_kg")[0];
-        let energy = tr.column("energy_j")[0].abs();
-        assert!(m.max_abs_mass_residual_kg < 1e-6 * mass, "{id}: mass residual {} kg", m.max_abs_mass_residual_kg);
-        assert!(m.max_abs_energy_residual_j < 1e-6 * energy, "{id}: energy residual {} J", m.max_abs_energy_residual_j);
-        assert!(tr.events.iter().all(|(_, e)| !e.contains("ENVELOPE")), "{id}: {:?}", tr.events);
+        assert!(m.max_abs_mass_residual_kg < 1e-6 * mass, "{id}: trace mass residual {}", m.max_abs_mass_residual_kg);
+        assert!(!m.nonfinite, "{id}: nonfinite trace");
+        let gas = tr.column("gas_mass_kg");
+        let tc = tr.column("t_coolant_c");
+        let tm = tr.column("moderator_t_c");
+        assert!(tc.iter().all(|&v| v > 0.0), "{id}: t_coolant_c not populated");
+        assert!(tm.iter().all(|&v| v > 0.0), "{id}: moderator_t_c not populated");
+        if id == "cs_steady_600" {
+            assert!(gas[0] > 50.0, "{id}: cold vented vessel should carry air, gas_mass_kg = {}", gas[0]);
+        } else {
+            assert_eq!(gas[0], 0.0, "{id}: hot vessel should carry no gas");
+        }
     }
 }
 ```
@@ -1340,11 +1417,13 @@ Append to `docs/model/assumptions.md`, assigning the next sequential ids and rep
 
 - [ ] **Step 3: ESBWR applicability rows**
 
-Append to `docs/model/esbwr-applicability.csv` (Package 1 column order: source/section, target subsystem, supporting BWRX evidence, differences, adaptation, limits, test, classification):
+Append to `docs/model/esbwr-applicability.csv` (locked header `id,esbwr_source,esbwr_section,target_subsystem,bwrx_evidence,differences,adaptation,applicability_limits,test,classification`; `esbwr_source` values are `sources.csv` ids, e.g. `SRC-ESBWR-DCD-R10` as named by Package 1):
 
-- "ESBWR DCD Rev. 10 Tier 2 Sec. 4.4 (thermal-hydraulic design; natural circulation head/loss balance, chimney)" → vessel/circulation → "BWRX-300 General Description 005N9751 (natural circulation, chimney, 4 m x 26-27 m RPV)" → "BWRX chimney height, areas and rated flow are ASSUMED; ESBWR values not transferred" → "formula only; geometry from params.csv" → "single level for shroud and downcomer; no regional stability" → `head_formula_matches_baseline_above_chimney_top`, `flow_is_positive_and_rises_with_power` → `shared concept`.
-- "ESBWR DCD Rev. 10 Tier 2 Sec. 5.3 / 5.4 (RPV, head vent, water-solid operation principles)" → vessel → "005N9751 RPV description" → "BWRX integral isolation valves; no SRVs" → "vent as a mass boundary only" → "vent capacity ASSUMED" → `cold_vented_vessel_is_atmospheric`, `water_solid_pressure_rises_steeply_and_leaves_envelope` → `adapted model`.
-- "ESBWR DCD Rev. 10 Tier 2 Sec. 4.4 (drift-flux void correlation)" → core/chimney voids → none BWRX-specific → "GNF2 geometry assumed" → "C0 = 1.13 retained from baseline" → "validity above 1 MPa only demonstrated by plausibility" → `rated_flow_and_voids_are_plausible` → `provisional numerical estimate`.
+```csv
+ESBWR-P4-1,SRC-ESBWR-DCD-R10,Tier 2 Sec. 4.4 thermal-hydraulic design: natural-circulation head/loss balance and chimney,vessel/circulation,BWRX-300 General Description 005N9751: natural circulation with tall chimney; RPV ~4 m x 26-27 m,BWRX chimney height; areas and rated flow are ASSUMED; no ESBWR numerical value transferred,hydrostatic head formula only; geometry from parameters.csv,single level for shroud and downcomer; no regional or density-wave stability,head_formula_matches_baseline_above_chimney_top; flow_is_positive_and_rises_with_power,shared concept
+ESBWR-P4-2,SRC-ESBWR-DCD-R10,Tier 2 Sec. 5.3/5.4 reactor vessel: head vent and water-solid operation principles,vessel,005N9751 RPV description,BWRX integral RPV isolation valves and no SRVs; vent capacity unknown,vent as a mass boundary with an ASSUMED coefficient,water-solid pressure cannot be held by the vent at any plausible coefficient,cold_vented_vessel_is_atmospheric; water_solid_pressure_rises_steeply_and_leaves_envelope,adapted model
+ESBWR-P4-3,SRC-ESBWR-DCD-R10,Tier 2 Sec. 4.4 drift-flux void correlation,core and chimney voids,none BWRX-specific,GNF2 bundle geometry assumed; C0 = 1.13 retained from the baseline,none,validity demonstrated only by plausibility above 1 MPa,rated_flow_and_voids_are_plausible,provisional numerical estimate
+```
 
 - [ ] **Step 4: Coverage and README**
 
@@ -1370,7 +1449,15 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 Evidence: `tests/vessel_transients.rs` (13 tests), `steam::tests::reference_points_iapws`, `vessel::tests::eos_roundtrip_all_regimes`, `docs/model/vessel.md` sections 1–8, regenerated baselines with change log.
 
-## Self-review
+## Self-review (master r2 checklist)
 
-- Spec coverage: envelope (Task 1, 3); "below 100 C is atmospheric" replaced with vent/gas/compressibility (Task 3, 4); compressed-water properties with independent reference tests and out-of-domain behaviour (Task 2, 3); one geometry/inventory model (unchanged `liquid_volume_below`, now with compressed density, Task 3); chimney spillover cutoff replaced by hydrostatic head across level regimes, not calibrated to one point (Task 5); core inlet mixing/transport delay density and moderator temperature with compatible states (Task 5, 6); shrink/swell, heatup, cooldown, pressure step, low level, steady points (Task 4, 5, 7).
-- Names introduced beyond the master contract: `Eos.p_steam`, `Eos.p_gas`, `Vessel::friction_dp`, `VENT_BOILOFF_KGS_PER_K`, `LOOP_FADE_M`, `WATER_SOLID_GAS_TOLERANCE_KG`, `vessel::state_at` (private), alarm id `gas_blanket`. Deviations from the directive: `sat_for_core` uses total pressure (physically the core boils against total local pressure; using steam partial pressure would make a cold air-filled vessel boil at 40 degC); `moderator_t` uses the exit liquid temperature, not saturation, when the core is non-boiling (otherwise a cold core would report ~70 degC).
+- [x] **Spec coverage:** envelope (Task 1, 3); "below 100 C is atmospheric" replaced with vent/gas/compressibility (Task 3, 4); compressed-water properties with independent reference tests and out-of-domain behaviour (Task 2, 3); one geometry/inventory model (unchanged `liquid_volume_below`, now with compressed density, Task 3); chimney spillover cutoff replaced by hydrostatic head across level regimes, not calibrated to one point (Task 5); core inlet mixing/transport-delay density and moderator temperature with compatible states (Task 5, 6); shrink/swell, heatup, cooldown, pressure step, low level, steady points (Task 4, 5, 7).
+- [x] **No placeholders:** every code step shows code; the only fill-ins are measured values (`<k20>`, `<paste>`, "(measured in Task 8)") that the executor produces by running the named command.
+- [x] **Master r2 names:** `Regime`, `Eos { t, p, x, regime }` plus the additional `p_steam`/`p_gas` fields, `R_AIR`, `solve_eos(mass, energy, gas_mass, vent_open) -> Result<Eos, DomainError>`, `Vessel.gas_mass`, `Vessel::moderator_t`, `Sat.kappa_f`, `compressed_liquid_rho`, `T_TABLE_MIN/MAX`, `T_EOS_MIN/MAX` (reused from P3, not redeclared), `Vessel.exhausted`, `Vessel.last_error`, `BoundaryFlows` with `w_ic_steam`/`w_ic_return`/`h_ic_return`, `Ledger::mass_residual`/`energy_residual`, trace columns `gas_mass_kg`/`t_coolant_c`/`moderator_t_c`, `Sim::finalize_init`.
+- [x] **Derives rule:** `Regime` derives `Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize` + `camelCase`; `Eos` keeps `Clone, Copy, Debug` (Task 3 Step 3 shows both).
+- [x] **parameters.csv rows with status:** `KAPPA_F_TABLE`, `T_TABLE_MIN`, `T_TABLE_MAX` (Task 2 Step 7); `LOOP_FADE_M`, `VENT_BOILOFF_KGS_PER_K`, `R_AIR`, `WATER_SOLID_GAS_TOLERANCE_KG`, `C_HEAD_VENT` update, `tau_dc` literal row deleted (Task 5 Step 5); `tests/register.rs` run after each.
+- [x] **Snapshot change:** `vessel.regime` has `api.rs`, `types.ts`, `mock.ts` steps and a typecheck run (Task 3 Step 6–7).
+- [x] **Failing test first:** Tasks 2–6 each start with a failing test; Task 7 adds whole-plant tests on top of the implemented behaviour and compares baselines before regenerating.
+- [x] **Applied transfers:** `Vessel::step` returns applied flows after bounding all outflows (steam, vent, RWCU; IC steam added by P7 at the marked line) and rolls back on `solve_eos` Err; `Sim::step` step 9 scaling is untouched.
+- Names introduced beyond the master contract: `Eos.p_steam`, `Eos.p_gas`, `Vessel::friction_dp`, `Vessel::steam_available`, `VENT_BOILOFF_KGS_PER_K`, `LOOP_FADE_M`, `WATER_SOLID_GAS_TOLERANCE_KG`, `vessel::state_at` (private), alarm id `gas_blanket`, register ids `KAPPA_F_TABLE`, `ESBWR-P4-1..3`.
+- Accepted deviations (coordinator, r2): `sat_for_core` uses total pressure (the core boils against total local pressure; using steam partial pressure would make a cold air-filled vessel boil at 40 degC); `moderator_t` uses the exit liquid temperature, not saturation, as the top of the rise when the core is non-boiling (otherwise a cold core would report ~70 degC).

@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2021 (`crates/bwr-core`), serde, TypeScript/React UI contract mirror, Python 3 with numpy/scipy for the decay-heat fit.
 
-**Prerequisites:** Packages 1–4 complete. In particular this plan relies on: `docs/model/parameters.csv` with header columns `name`, `value`, `status` (P1); `docs/model/assumptions.md` and `docs/model/esbwr-applicability.csv` (P1); `Sim::log`, `Fault`, `Sim::set_fault`, `Sim::has_fault` (P2); `DomainError`, `Sim::domain_errors`, `Core::step_rods`, `Core::step(...) -> Result<f64, DomainError>`, `Kinetics::advance(rho, s, dt) -> Result<usize, DomainError>` (P3); `Vessel::moderator_t()` (P4). Baseline traces under `docs/validation/baseline/` exist (P2).
+**Prerequisites:** Packages 1–4 complete against master r2. In particular this plan relies on: `docs/model/parameters.csv` with the locked header `id,value,unit,definition,reference_state,source_design,status,source_ids,interval_lo,interval_hi,assumption_id,location,notes` (P1); `docs/model/assumptions.md` and `docs/model/esbwr-applicability.csv` (P1); `Sim::log`, `Fault`, `Sim::faults: Vec<Fault>`, `Sim::set_fault`, `Sim::has_fault`, `validation::run_case` with trace schema v2 (`clad_t_c`, `rods_min_pos`, `rods_max_pos` emitted as 0.0 until this package) (P2); `DomainError`, `Sim::domain_errors`, `Sim::domain_error(e)`, `Sim::finalize_init`, `Core::step_rods`, `Core::step(...) -> Result<f64, DomainError>`, `Kinetics::advance(rho, s, dt) -> Result<usize, DomainError>` (P3); `Vessel::moderator_t()` (P4). Baseline traces under `docs/validation/baseline/` exist (P2). `Sim::alternate_rod_insertion()` and `ARI_ENABLED` belong to P8; this package only supplies the two rod methods it will call.
 
 ## Global Constraints
 
@@ -44,7 +44,9 @@ Inherited verbatim from the master's Global Constraints section. Package-specifi
 | `ui/src/sim/types.ts`, `ui/src/sim/mock.ts` | Modify | Contract mirror |
 | `README.md` | Modify | Decay-heat and core-damage wording |
 
-Names introduced beyond the master contract: `ReactivityCoeffs`, `Sim::full_power_with`, `Sim::uncovered_s`, `Sim::fuel_envelope_exceeded()`, `Sim::record_domain_error`, `GAP_RESISTANCE_K_PER_W`, `CLAD_COOLANT_RESISTANCE_K_PER_W`, `CLAD_HEAT_CAP_J_PER_K`, `FUEL_MODEL_T_MAX_C`, `UNCOVERED_ENVELOPE_S`, `IRRADIATION_HISTORY_S`, `examples/sensitivity.rs`.
+Names from the master (r2) that this package owns: `RodMotion { Idle, Motor { target }, Scram, Sri, MotorRunIn }`, `Rods { motion, stuck }` and its method set, `ReactivityCoeffs { void, doppler, mod_t, xenon_worth }`, `Core { clad_t, coeffs }`, `DecayHeat::after_history`, `Sim::full_power_with`, `GAP_RESISTANCE_K_PER_W`, `CLAD_COOLANT_RESISTANCE_K_PER_W`, `CLAD_HEAT_CAP_J_PER_K`, `FUEL_MODEL_T_MAX_C`, `UNCOVERED_ENVELOPE_S`, `IRRADIATION_HISTORY_S`. Names introduced beyond the master: `Sim::uncovered_s`, `Sim::fuel_envelope_exceeded()`, `Sim::vessel_force_uncovered_for_test()` (test hook), `examples/sensitivity.rs`.
+
+Derives (master Derives rule): `RodMotion` derives `Clone, Copy, Debug, PartialEq`; `ReactivityCoeffs` derives `Clone, Copy, Debug` (plus a manual `Default`); `Rods` and `Core` keep `Clone, Debug`.
 
 ---
 
@@ -81,22 +83,39 @@ a specific inadequacy).
 
 ## 2. Rod motion mechanisms
 
-Four mechanisms are modelled as distinct `RodMotion` states (reactor.rs):
+Rod motion is a per-rod `RodMotion` state (reactor.rs):
 
 | Mechanism | State | Speed | Initiated by |
 |---|---|---|---|
 | Normal motor drive | `Motor { target }` | `ROD_SPEED` = 0.4 positions/s (assumed, A-053) | operator `RodSetTarget` |
-| Hydraulic scram | `Hydraulic` | `ROD_FULL_OUT / SCRAM_TIME` = 48 / 3 s (assumed, A-053) | RPS scram, Select Rod Insert |
-| Motor run-in (FMCRD electric backup / ARI path) | `MotorRunIn` | `ROD_SPEED` toward 0 | every scram, in parallel with hydraulic |
+| Hydraulic scram | `Scram` | `ROD_FULL_OUT / SCRAM_TIME` = 48 / 3 s (assumed, A-053) | RPS scram (`Sim::scram`) |
+| Select Rod Insert | `Sri` | same hydraulic speed, SRI group only | turbine trip / load rejection at power |
+| Motor run-in (FMCRD electric backup) | `MotorRunIn` | `ROD_SPEED` toward 0 | every scram, in parallel with hydraulic |
 | Stuck rod | `stuck[i] = true` | none | `Fault::RodStuck { index }` only |
+
+`Scram` and `Sri` move at the same speed but are distinct states: only `Scram`
+counts as "scramming" (the SCRAM lamp), matching the previous behaviour where
+an SRI did not light the scram indication. A scram converts `Sri` rods to
+`Scram`; an SRI never downgrades a `Scram` rod. `Sri` rods return to `Idle` at
+position 0. `Rods::target(i)` reports the commanded endpoint (motor target,
+0 for any insertion mechanism, own position when idle), which is what the
+rod display shows as TGT.
+
+Initiation paths are layered: `Sim::scram()` (RPS latch `Sim.scrammed`) calls
+`rods.scram_hydraulic()` then `rods.motor_run_in()`. An alternate rod
+insertion path (`Sim::alternate_rod_insertion()`, separate latch, guarded by
+`ARI_ENABLED = false` until its signals are sourced) is a Package 8 item that
+reuses the same two rod methods.
 
 FMCRD dual insertion (hydraulic plus electric run-in on the same drive) is a
 shared concept with ESBWR (DCD Rev. 10 Tier 2 Ch. 4.6, see
 esbwr-applicability.csv). BWRX-specific stroke times are not public; the
 values above are assumptions with the stated sensitivity (A-053).
 
-Scram reset requires every rod at position 0. A stuck rod therefore blocks
-reset until the fault is cleared; this is the intended consequence.
+Scram reset requires every `Scram` and `MotorRunIn` rod to be at position 0.
+A stuck rod is never commanded (it stays `Idle`), so it does not by itself
+block reset; it remains out, and the operator sees TGT = POS = its stuck
+position while the fault is active.
 
 ## 3. Reactivity
 
@@ -239,7 +258,7 @@ Append to `docs/model/esbwr-applicability.csv` (P1 header: ESBWR source/section,
 
 ```
 DCD Rev.10 Tier 2 Ch. 4.3 (nuclear design: feedback mechanisms),core reactivity,GE 005N9751 (natural circulation BWR; GNF2),smaller core and different exposure history,coefficients kept as calibrated ReactivityCoeffs with sensitivity study,qualitative sign and order only,core_transients::full_power_rod_insertion_fraction; examples/sensitivity.rs,shared concept
-DCD Rev.10 Tier 2 Ch. 4.6 (FMCRD: hydraulic scram plus electric run-in),rod mechanisms,GE 005N9751 (57 FMCRDs; NEDO-33912-A reactivity control),57 drives vs 269; stroke times not public,RodMotion::Hydraulic and RodMotion::MotorRunIn as distinct states with assumed speeds,timing values assumed (A-053),core_transients::scram_hydraulic_three_seconds; core_transients::motor_run_in_120_seconds,adapted model
+DCD Rev.10 Tier 2 Ch. 4.6 (FMCRD: hydraulic scram plus electric run-in),rod mechanisms,GE 005N9751 (57 FMCRDs; NEDO-33912-A reactivity control),57 drives vs 269; stroke times not public,RodMotion::Scram / RodMotion::Sri (hydraulic) and RodMotion::MotorRunIn (electric) as distinct states with assumed speeds,timing values assumed (A-053),core_transients::scram_hydraulic_three_seconds; core_transients::motor_run_in_120_seconds,adapted model
 DCD Rev.10 Tier 2 Ch. 15 (transient mechanisms: turbine trip reactivity response),core transient verification,none numerical,bypass capacity and SRI group differ,used only to order the expected response (void collapse then Doppler); no numerical trace imported,qualitative,examples/sensitivity.rs,shared concept
 ```
 
