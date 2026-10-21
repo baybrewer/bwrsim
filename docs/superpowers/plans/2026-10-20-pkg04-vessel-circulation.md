@@ -1667,10 +1667,10 @@ fn rwcu_cap_keeps_setpoint_and_feeds_condenser_applied_flow() {
 
 #[test]
 fn vented_heatup_purges_air_and_closes_ledger() {
-    use bwr_core::ledger::Ledger;
     let mut v = Vessel::new(40.0, Z_NWL, 0.0, 0.0, 40.0, true);
     let gas0 = v.gas_mass;
     let mut ledger = Ledger::new(v.mass, v.energy);
+    assert!(gas0 > DISSOLVED_GAS_CAPACITY_KG, "fixture must hold free gas to purge");
     let mut gas_prev = gas0;
     let mut time = 0.0;
     while v.eos.t < 120.0 && time < 4.0 * 3600.0 {
@@ -1918,23 +1918,41 @@ Keep the rest of `step` (core inlet enthalpy, voids, momentum, `update_level`, h
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cargo test --release -p bwr-core --test vessel_transients`
-Expected: all seven tests pass (`cold_vented_vessel_is_atmospheric`, `closed_vessel_heatup_transitions_gas_to_saturated`, `regime_boundaries_are_continuous_and_cross_once`, `vented_heatup_purges_air_and_closes_ledger`, `sealed_cooldown_draws_vacuum`, `adding_energy_raises_pressure`, `water_solid_pressure_rises_steeply_and_leaves_envelope`). Then `cargo test --release -p bwr-core` — all pass, including Package 3 `conservation.rs` (residual columns remain ~0 because `flows` reports exactly what was applied).
+Run: `cargo test --release -p bwr-core --test vessel_transients -- --nocapture > /tmp/p4t4.log 2>&1; echo "exit=$?"; grep -n "^test \|test result\|rwcu cap" /tmp/p4t4.log`
+Expected: `exit=0`; all twelve tests pass (`step_rejects_invalid_arguments_unchanged`, `cold_vented_vessel_is_atmospheric`, `closed_vessel_heatup_transitions_gas_to_saturated`, `regime_boundaries_are_continuous_and_cross_once`, `water_solid_boundary_with_dissolved_gas_is_continuous`, `vented_heatup_purges_air_and_closes_ledger`, `sealed_cooldown_draws_vacuum`, `adding_energy_raises_pressure`, `water_solid_pressure_rises_steeply_and_leaves_envelope`, `steam_space_cap_binds_and_reports_deficit`, `final_drain_commits_bounded_flows`, `rwcu_cap_keeps_setpoint_and_feeds_condenser_applied_flow`); the `rwcu cap:` line records which branch the coupled drain took. Then `cargo test --release -p bwr-core > /tmp/p4t4b.log 2>&1; echo "exit=$?"` — `exit=0`, including Package 3 `conservation.rs` (residual columns remain ~0 because `flows` reports exactly what was applied).
 
-Package 3 rejection semantics are preserved by the body above: (a) `exhausted` is reset at the allocation point every step; (b) all water outflows (steam-line steam, vent steam, RWCU; IC steam from P7) are bounded to `mass + w_feed*dt` before `solve_eos` is called; (c) on `Err` mass, energy and gas_mass are restored to entry values, `vent_flow` and `exhausted` are cleared, `last_error` is set, and `BoundaryFlows::default()` is returned; (d) no field is written between the allocation and the `match`, so no partial update can escape. One documented consequence: if the same step both exhausts inventory and fails `solve_eos`, `last_error` holds the EOS error (the exhaustion is moot because nothing was applied).
+Package 3 rejection semantics are preserved by the body above: (a) `exhausted` is reset at the allocation point every step; (b) every water outflow (steam-line steam and vent steam against the steam space, RWCU against the liquid plus feed; IC steam from P7) is bounded before `solve_eos` is called, so `mass + dm*dt >= 0` and the total never exceeds `mass + w_feed*dt`; (c) on `Err` mass, energy and gas_mass are restored to entry values, `vent_flow` and `exhausted` are cleared, `last_error` is set, and `BoundaryFlows::default()` is returned; (d) no field is written between the allocation and the `match`, so no partial update can escape. One documented consequence: if the same step both exhausts inventory and fails `solve_eos`, `last_error` holds the EOS error (the exhaustion is moot because nothing was applied). The dt/non-finite guard runs before all of this and writes only `last_error` and `vent_flow = 0.0`, as P3's guard did.
 
-Package 3 tests that can be affected, and the adjustment to make in the same commit:
-- `tests/numerics.rs` / `tests/conservation.rs` calls of `solve_eos(m, e)` → `solve_eos(m, e, 0.0, false)` (Task 3 Step 7).
+Package 3 tests that can be affected, and the adjustment to make in the same commit (each is a migration forced by the saturation-only EOS now rejecting superheated vapour and by phase-aware bounding; none loosens an assertion):
+- `tests/numerics.rs` / `tests/conservation.rs` calls of `solve_eos(m, e)` → `solve_eos(m, e, 0.0, false)`; the NaN-energy assertion → `PropertyOutOfRange { what: "energy" }` (Task 3 Step 7).
 - Any construction of an `Eos { .. }` literal or read of `eos.subcooled` / `eos.solid` → use `p_steam: sat_t(t).p, p_gas: 0.0, regime: Regime::Saturated` and `eos.regime` (run `grep -n "subcooled\|\.solid\|Eos {" crates/bwr-core/tests`).
 - A P3 assertion that `flows.h_steam == sat_p(vessel.eos.p).h_g` still holds whenever `gas_mass == 0` (then `p == p_steam`); with gas present `h_steam` is `sat_t(eos.t).h_g`, so such an assertion must read `sat_t(sim.vessel.eos.t).h_g`.
-- The P3 coupled low-inventory regression (hotwell gains what the vessel released) is unaffected: `flows.w_steam` is the applied value and `Sim::step` step 9 scales consumers by `flows.w_steam / requested` as before; the new steam-space cap only lowers the applied value further when the steam space is nearly empty, which is a legitimate shortfall handled by the same ratio.
+- P3 Task 6's one-step total drain (`w_liquid_out: 1.0e7`, asserting `v.mass < 1.0` and `flows.w_liquid_out * DT == m0`): RWCU is now bounded by the liquid inventory, so one step takes exactly the liquid and the steam space remains. Replace its two assertions with `flows.w_liquid_out * DT == m0 * (1 - x0)` (within 1e-6 relative) and `v.exhausted.is_some()`; the full depletion to `mass == 0` is `final_drain_commits_bounded_flows` here.
+- P3's Sim-level `drained_vessel_is_flagged_not_refilled` (decay heat on, RWCU draining for hours): the step in which the liquid runs out now either commits (`InventoryExhausted`) or, with net heat into a vessel holding only steam, flashes past the saturation envelope (`EosOutOfRange`, nothing applied, the vessel frozen with the last kilograms of liquid). Both are the plant being flagged unsupported and not refilled; the assertion becomes "`domain_errors` holds `InventoryExhausted` or `EosOutOfRange`, the vessel mass never rises afterwards, and the snapshot stays unsupported". Record which branch occurred in the commit body. This is the vapour-domain reconciliation of `docs/model/vessel.md` section 1 (a physical domain exit distinguished from successful depletion), not a mass floor.
+- The P3 coupled low-inventory regression (hotwell gains what the vessel released) is unaffected: `flows.w_steam` and `flows.w_liquid_out` are the applied values and `Sim::step` step 9 scales consumers by `flows.w_steam / requested` as before; a binding steam-space or liquid cap is a legitimate shortfall handled by the same ratio and reported as `InventoryExhausted`.
 
-If `closed_vessel_heatup_transitions_gas_to_saturated` reports the switch outside 95..115 degC, print `v.gas_mass` and the gas-space volume at 40 degC and check the `gas_mass` initialisation in `Vessel::new` before touching the test bounds.
+If `closed_vessel_heatup_transitions_gas_to_saturated` reports the switch outside 95..115 degC, the bounds are not changed: print `v.gas_mass` and the gas-space volume at 40 degC and check the `gas_mass` initialisation in `Vessel::new`; if the initialisation is right, record the switch temperature under the Finding policy.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Register rows and commit**
+
+Append to `docs/model/parameters.csv` (same task as the constant):
+
+```csv
+VENT_BOILOFF_KGS_PER_K,0.02,kg/s/K,extra head-vent steam flow per degC above 100 with the vent open,vented hot vessel,tuning,assumed,,0.0,0.05,A-041,crates/bwr-core/src/vessel.rs,was an inline literal in the baseline step(); interval none-based plausibility
+```
+
+If Package 1 registered the inline `0.02` under a `vessel.*` id, delete that row (note it in the commit body). Update the existing `C_HEAD_VENT` row: `notes` to "also the air-ingress coefficient below atmospheric; the vent passes nothing when water-solid (no steam space, A-041)"; `assumption_id` to `A-041`; `interval_lo,interval_hi` to `1e-7,1e-5`. Append to the `docs/model/assumptions.md` table:
+
+```markdown
+| A-041 | Head vent | One coefficient `C_HEAD_VENT` for steam-space relief above atmospheric (dome fluid by composition) and for air ingress below; `VENT_BOILOFF_KGS_PER_K` retained from the baseline. The vent passes nothing when the vessel is water-solid (no steam space): water-solid pressure is bounded only by the `P_EOS_MAX` envelope check, never relieved. No liquid leaves through the vent. | Cold-shutdown pressure is pinned to `P_ATM` for any coefficient above 1e-7 kg/s/Pa; water-solid heating pressure is not controllable by the vent at any coefficient (it passes nothing). | C_HEAD_VENT physical: 1e-7 (pins P_ATM) to 1e-5 kg/s/Pa (an order above); VENT_BOILOFF_KGS_PER_K none | Package 4 |
+| A-043 | Gas transport and steam availability | Free noncondensable gas is swept out through the main steam lines in the dome mass ratio with the applied steam and through the vent by composition, bounded by the free-gas inventory, outside the water ledger and not modelled downstream (the condenser's air model is untouched). Steam availability for the lines and the isolation condensers (`Vessel::steam_available`) is label-independent: a steam space with `p_steam > P_ATM`. Degradation of IC condensation by gas-rich steam is not modelled here (Package 7 sensitivity). | None; the sweep rate follows from the composition, no free parameter. | no intervals | Package 4 |
+```
+
+Run: `cargo test --release -p bwr-core --test register`
+Expected: exit 0.
 
 ```bash
-git add crates/bwr-core/src/vessel.rs crates/bwr-core/tests/vessel_transients.rs
+git add crates/bwr-core/src/vessel.rs crates/bwr-core/tests/vessel_transients.rs docs/model/parameters.csv docs/model/assumptions.md
 git commit -m "feat(vessel): head-vent gas dynamics, regime-dependent outflows, envelope tests
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -1950,7 +1968,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Modify: `docs/model/parameters.csv`
 
 **Interfaces:**
-- Produces: `pub const LOOP_FADE_M: f64 = 0.5`, `Vessel::friction_dp(&self) -> f64`, `Vessel.drive_dp` populated by `Vessel::new`.
+- Produces: `pub const LOOP_FADE_M: f64 = 0.5`, `pub const W_MIN` (made public), `Vessel::friction_dp(&self) -> f64`, `Vessel.drive_dp` populated by `Vessel::new` from the finalised state (Task 3).
+- Register rows in this task (Step 5): `LOOP_FADE_M`; retired `vessel.spill_band` and the `tau_dc` literal row; `vessel.W_MIN` renamed; assumption `A-045`; A-007 updated.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1964,7 +1983,9 @@ fn head_formula_matches_baseline_above_chimney_top() {
     let v = Vessel::new(sat_p(P_RATED).t, Z_NWL, RATED_POWER_W, STEAM_FLOW_RATED, T_FW_RATED, false);
     let s = sat_p(v.eos.p);
     let (_, rho_ch) = bwr_core::vessel::chimney_th(&s, v.core_flow, &v.core);
-    let rho_dc = steam::compressed_liquid_rho(steam::t_from_h_liquid(v.h_in.min(s.h_f)), v.eos.p);
+    // Same column-density model as drive (saturated-liquid density, vessel.md section 4),
+    // evaluated on the finalised state (eos.p, core, h_in), independently of drive().
+    let rho_dc = steam::rho_liquid(steam::t_from_h_liquid(v.h_in.min(s.h_f)));
     let baseline = G * (rho_dc * (Z_CHIMNEY_TOP - Z_CORE_BOTTOM) - v.core.rho_avg * CORE_HEIGHT - rho_ch * CHIMNEY_HEIGHT);
     assert!(v.level_z >= Z_CHIMNEY_TOP);
     assert!((v.drive_dp - baseline).abs() < 1e-6 * baseline.abs(), "{} vs {baseline}", v.drive_dp);
@@ -1980,16 +2001,41 @@ fn steady_points_balance_momentum() {
 }
 
 #[test]
+fn isothermal_non_boiling_vessel_has_no_driving_head() {
+    // Equal-temperature, non-boiling columns: one liquid-density model means zero
+    // buoyancy, so the loop sits at W_MIN. A cold vessel with no heat and no feed.
+    let v = Vessel::new(40.0, Z_NWL, 0.0, 0.0, 40.0, false);
+    assert_eq!(v.core.boiling_boundary, CORE_HEIGHT, "fixture must not boil");
+    let scale = G * steam::rho_liquid(40.0) * (CORE_HEIGHT + CHIMNEY_HEIGHT);
+    assert!(v.drive_dp.abs() < 1e-9 * scale, "artificial head {} Pa", v.drive_dp);
+    assert!(v.core_flow <= bwr_core::vessel::W_MIN + 1e-9, "flow {}", v.core_flow);
+}
+
+#[test]
 fn flow_is_positive_and_rises_with_power() {
+    // Predeclared operating-envelope gates (vessel.md section 6), not a curve shape:
+    // finite and positive everywhere; the single-phase decay-heat flow below the
+    // boiling 30 % flow (void buoyancy exceeds liquid thermal expansion); 30..100 %
+    // flows within the 0.5..1.5 x rated plausibility envelope; the rated point at
+    // the calibration reference. The 30/60/100 % values are recorded, and their
+    // ordering (monotonic or not) is reported in vessel.md section 6, never asserted.
     let flow = |q: f64, w: f64| Vessel::new(sat_p(P_RATED).t, Z_NWL, q, w, T_FW_RATED, false).core_flow;
     let decay = flow(0.005 * RATED_POWER_W, 0.0);
     let w30 = flow(0.3 * RATED_POWER_W, 0.3 * STEAM_FLOW_RATED);
     let w60 = flow(0.6 * RATED_POWER_W, 0.6 * STEAM_FLOW_RATED);
     let w100 = flow(RATED_POWER_W, STEAM_FLOW_RATED);
     println!("core flow kg/s: decay {decay:.0} 30% {w30:.0} 60% {w60:.0} 100% {w100:.0}");
-    assert!(decay > 5.0 && decay < w30, "decay-heat flow {decay}");
-    assert!(w30 > 0.0 && w60 >= 0.95 * w30 && w100 >= 0.95 * w60, "{w30} {w60} {w100}");
-    assert!((w100 - CORE_FLOW_RATED).abs() < 50.0);
+    for w in [decay, w30, w60, w100] {
+        assert!(w.is_finite() && w > 0.0, "{w}");
+    }
+    assert!(decay > bwr_core::vessel::W_MIN && decay < w30, "decay-heat flow {decay} vs 30 % flow {w30}");
+    for (name, w) in [("30 %", w30), ("60 %", w60), ("100 %", w100)] {
+        assert!(w > 0.5 * CORE_FLOW_RATED && w < 1.5 * CORE_FLOW_RATED, "{name} flow {w} outside the declared envelope");
+    }
+    assert!((w100 - CORE_FLOW_RATED).abs() < 50.0, "rated point {w100} vs reference {CORE_FLOW_RATED}");
+    if w60 < w30 || w100 < w60 {
+        println!("FINDING: natural-circulation flow is not monotonic in power ({w30:.0}, {w60:.0}, {w100:.0}); recorded in vessel.md section 6");
+    }
 }
 
 #[test]
@@ -2031,8 +2077,8 @@ fn draining_breaks_natural_circulation_in_order() {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cargo test --release -p bwr-core --test vessel_transients`
-Expected: compile error `no method named friction_dp`; after stubbing, `draining_breaks_natural_circulation_in_order` fails at the chimney-top spill switch (flow collapses within 0.5 m of the chimney top instead of fading toward TAF).
+Run: `cargo test --release -p bwr-core --test vessel_transients > /tmp/p4t5a.log 2>&1; echo "exit=$?"; grep -n "error\[\|^test \|test result" /tmp/p4t5a.log`
+Expected: nonzero exit; compile error `no method named friction_dp` (and `W_MIN` not public); after stubbing both, `draining_breaks_natural_circulation_in_order` fails at the chimney-top spill switch (flow collapses within 0.5 m of the chimney top instead of fading toward TAF) and `isothermal_non_boiling_vessel_has_no_driving_head` may already pass (the baseline uses the saturated density for every column).
 
 - [ ] **Step 3: Implement**
 
@@ -2040,11 +2086,13 @@ In `vessel.rs` add:
 
 ```rust
 /// Height above the top of active fuel over which the separated-liquid return path,
-/// and with it the loop head, fades out, m. ASSUMED (A-P4-6).
+/// and with it the loop head, fades out, m. ASSUMED (A-045).
 pub const LOOP_FADE_M: f64 = 0.5;
 ```
 
-Replace `drive`:
+Make `W_MIN` public (`pub const W_MIN`) so the tests can reference the residual flow; register-row unchanged (Package 1 already has `vessel.W_MIN`; rename that row's id to `W_MIN` with `location` `crates/bwr-core/src/vessel.rs` in Step 5).
+
+Replace `drive` (column densities stay on the saturated-liquid model of `vessel.md` section 4; only the heights change):
 
 ```rust
     /// Natural circulation driving head (Pa) and two-phase friction multiplier,
@@ -2055,8 +2103,9 @@ Replace `drive`:
         // Quasi-static densities corrected for the lagged void fractions.
         let rho_core = self.core.rho_avg + (self.alpha_core - self.core.alpha_avg) * dr;
         let rho_ch = rho_ch_qs + (self.alpha_ch - a_ch_qs) * dr;
-        let t_dc = steam::t_from_h_liquid(self.h_in.min(s.h_f));
-        let rho_dc = compressed_liquid_rho(t_dc, self.eos.p);
+        // Downcomer liquid at the same (saturated-liquid) density model as the core and
+        // chimney columns, so equal-temperature non-boiling columns have no head.
+        let rho_dc = steam::rho_liquid(steam::t_from_h_liquid(self.h_in.min(s.h_f)));
         let z = self.level_z;
         let h_dc = (z.min(Z_CHIMNEY_TOP) - Z_CORE_BOTTOM).max(0.0);
         let h_core = (z - Z_CORE_BOTTOM).clamp(0.0, CORE_HEIGHT);
@@ -2073,49 +2122,98 @@ Replace `drive`:
     }
 ```
 
-In `calibrate_friction` change `let rho_dc = steam::rho_liquid(steam::t_from_h_liquid(h_in));` to `let rho_dc = compressed_liquid_rho(steam::t_from_h_liquid(h_in), P_RATED);` so the calibration uses the same density model as `drive`.
+`calibrate_friction` is unchanged (it already uses `steam::rho_liquid`, the same model as `drive`).
 
 In `step`, replace `let tau_dc = (V_DOWNCOMER * 750.0 / w).clamp(2.0, 600.0);` with:
 
 ```rust
-        let rho_dc = compressed_liquid_rho(steam::t_from_h_liquid(self.h_in.min(s.h_f)), self.eos.p);
+        let rho_dc = steam::rho_liquid(steam::t_from_h_liquid(self.h_in.min(s.h_f)));
         let tau_dc = (V_DOWNCOMER * rho_dc / w).clamp(2.0, 600.0);
 ```
 
-(`Vessel::new` already stores `v.drive_dp = v.drive(&s).0;` from Task 3.)
+(`Vessel::new` already stores `v.drive_dp = v.drive(&v.sat_for_core()).0;` from the finalised state, Task 3.)
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cargo test --release -p bwr-core --test vessel_transients -- --nocapture`
-Expected: all pass; the printed flow line is copied into `docs/model/vessel.md` section 6 in Task 8.
-Run: `cargo test --release -p bwr-core`
-Expected: all pass. `rated_flow_and_voids_are_plausible` (flow within 50 kg/s of rated) must still pass because calibration and drive use the same density.
+Run: `cargo test --release -p bwr-core --test vessel_transients -- --nocapture > /tmp/p4t5.log 2>&1; echo "exit=$?"; grep -n "core flow kg/s\|FINDING\|^test \|test result" /tmp/p4t5.log`
+Expected: `exit=0`; all pass; the printed `core flow kg/s` line (and any `FINDING` line) is copied into `docs/model/vessel.md` section 6 in Task 8. A `FINDING` line is not a failure: the ordering is reported, not asserted (vessel.md section 6).
+Run: `cargo test --release -p bwr-core > /tmp/p4t5b.log 2>&1; echo "exit=$?"`
+Expected: `exit=0`. `rated_flow_and_voids_are_plausible` (flow within 50 kg/s of rated) must still pass because calibration and drive use the same density.
 
-- [ ] **Step 5: Parameter rows**
+- [ ] **Step 5: Register rows (same task as the constant), retire the replaced P1 rows**
 
-Append to `docs/model/parameters.csv` (locked header; `assumption_id` values are the ids assigned in Task 8 Step 2, written as `A-P4-n` until then):
+Append to `docs/model/parameters.csv`:
 
 ```csv
-LOOP_FADE_M,0.5,m,height above TAF over which the natural-circulation loop head fades to zero,level in the core region,none,assumed,,0.2,1.0,A-P4-6,crates/bwr-core/src/vessel.rs,no public BWRX value; sensitivity interval covers the chimney inlet geometry uncertainty
-VENT_BOILOFF_KGS_PER_K,0.02,kg/s/K,extra head-vent steam flow per degC above 100 with the vent open,vented hot vessel,none,assumed,,0.0,0.05,A-P4-2,crates/bwr-core/src/vessel.rs,was an inline literal in the baseline step(); if Package 1 registered it under another id rename that row
-R_AIR,287.0,J/kg/K,specific gas constant of air (head noncondensable),,physical constant,confirmed,,,,A-P4-1,crates/bwr-core/src/vessel.rs,
-WATER_SOLID_GAS_TOLERANCE_KG,1.0,kg,gas mass treated as dissolved when the vessel goes water-solid,water-solid,none,assumed,,0.1,10.0,A-P4-1,crates/bwr-core/src/vessel.rs,
-REGIME_HYSTERESIS,1.05,-,p_gas/p_steam ratio band for the Saturated/GasBlanketed display label,vent closed,none,assumed,,1.01,1.2,A-P4-1,crates/bwr-core/src/vessel.rs,display and alarm only; no physics reads the label
+LOOP_FADE_M,0.5,m,height above TAF over which the natural-circulation loop head fades to zero,level in the core region,tuning,assumed,,0.2,1.0,A-045,crates/bwr-core/src/vessel.rs,no public BWRX value; interval is the chimney-inlet geometry uncertainty of A-006
 ```
 
-Update the existing `C_HEAD_VENT` row (Package 1 inventoried the private constant): set `notes` to "also the air-ingress coefficient below atmospheric and the liquid-relief coefficient when water-solid (A-P4-2)" and `interval_lo,interval_hi` to `1e-7,1e-5`. Delete the row Package 1 created for the `tau_dc` literal `750.0` (downcomer density): the literal is replaced by `compressed_liquid_rho`, a computed property, not a constant. Note the deletion in the commit body.
+Edit the rows Package 1 created for the hardcoded behaviour this task replaces (each noted in the commit body): delete `vessel.spill_band` (the 0.5 m cut-off below the chimney top no longer exists; `LOOP_FADE_M` replaces it with a different quantity, so the row is retired, not renamed); delete the row for the `tau_dc` literal `750.0` (downcomer density is now the computed `rho_liquid`); rename the `vessel.W_MIN` row's id to `W_MIN` if it was registered under the `<file>.<name>` form (the constant is now `pub`). Append to the `docs/model/assumptions.md` table and update A-007 in place:
+
+```markdown
+| A-045 | Loop head below the chimney top | The natural-circulation head is the hydrostatic balance of the submerged column heights (`h_dc`, `h_core`, `h_ch` of vessel.md section 6); below `Z_TAF + LOOP_FADE_M` the separated-liquid return path is lost and the head fades linearly to zero over `LOOP_FADE_M` (0.5 m); residual core flow is `W_MIN` (5 kg/s). No public BWRX value supports either number. | `LOOP_FADE_M` 0.2..1.0 m; `W_MIN` none. | LOOP_FADE_M derived: the A-006 chimney-inlet elevation uncertainty; W_MIN none | Package 4 |
+```
+
+A-007 row: replace "loop head cut off over 0.5 m below chimney top" with "loop head from submerged column heights with a `LOOP_FADE_M` fade above TAF (A-045, Package 4)" and replace "vessel.spill_band none" in its Interval basis with "vessel.spill_band retired (Package 4)". Its CORE_FLOW_RATED clause is resolved in Task 5b.
 
 Run: `cargo test --release -p bwr-core --test register`
-Expected: pass.
+Expected: exit 0.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/bwr-core/src/vessel.rs crates/bwr-core/tests/vessel_transients.rs docs/model/parameters.csv
+git add crates/bwr-core/src/vessel.rs crates/bwr-core/tests/vessel_transients.rs docs/model/parameters.csv docs/model/assumptions.md
 git commit -m "feat(vessel): level-dependent natural-circulation head with loop-loss fade
 
 Replaces the 0.5 m spill switch below the chimney top with submerged column
-heights; flow at 30/60/100 % and decay heat is tested, not calibrated.
+heights; flow at 30/60/100 % and decay heat is reported against a predeclared
+envelope, not calibrated. Retired register rows: vessel.spill_band, vessel tau_dc literal.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 5b: Rated-flow and loss-coefficient evidence basis
+
+**Files:**
+- Modify: `docs/model/parameters.csv` (`CORE_FLOW_RATED`, `LOOP_INERTIA` notes), `docs/model/assumptions.md` (A-007), `docs/model/esbwr-applicability.csv` (E-02), `docs/model/vessel.md` section 6
+- Modify: `crates/bwr-core/tests/register.rs` (`BORROWED`)
+- Create: `tools/core_flow_basis.py` (one-off derivation script, committed as evidence)
+
+**Interfaces:**
+- Consumes: registered geometry (`A_CORE`, `A_CHIMNEY`, `A_DOWNCOMER`, `CORE_HEIGHT`, `CHIMNEY_HEIGHT`, `N_BUNDLES` and whatever bundle hydraulic data Package 1 registered), `calibrate_friction`'s head at rated conditions.
+- Produces: a status for `CORE_FLOW_RATED` that is no longer an output-scaled ESBWR number: `derived` with an interval, or `unavailable` with the origin recorded. `k_fric` stays calibrated to whatever reference this task leaves in `CORE_FLOW_RATED`; this task never changes the value to make a test pass.
+
+Why here: the master forbids scaling flow by output alone; Package 1 recorded that `CORE_FLOW_RATED` 2000 kg/s is ESBWR rated flow scaled by thermal power (A-007, E-02) and assigned the re-derivation to this package. Checking off-rated responses with the same fitted resistance (Task 5) does not resolve the basis.
+
+- [ ] **Step 1: Attempt an independent loss estimate from registered geometry**
+
+Write `tools/core_flow_basis.py`: read `docs/model/parameters.csv` by header name; take the rated driving head from the same column balance as `calibrate_friction` (print it: `drive_dp_rated`); estimate the loop loss coefficient `k_geom` from a Darcy friction factor over the bundle length with the registered hydraulic diameter and spacer count plus form losses at the inlet orifice, core exit, chimney and separator (each term with its correlation named and its source id); solve `W_geom = sqrt(drive_dp_rated / (k_geom * phi2))` and print `W_geom` with a low/high bracket from the loss-term uncertainty. If a required geometry value (`D_HYD_BUNDLE`, spacer count, orifice coefficient) has no row in `parameters.csv`, the script prints `UNAVAILABLE: <missing ids>` and exits 0; nothing is guessed.
+
+Run: `python3 tools/core_flow_basis.py > /tmp/p4flow.txt; echo "exit=$?"; cat /tmp/p4flow.txt`
+
+- [ ] **Step 2: Record the outcome in the register (one of the two branches, chosen by the script output, never by the tests)**
+
+(a) `W_geom` printed with a bracket: set the `CORE_FLOW_RATED` row to `status = derived`, `interval_lo/hi` = the bracket, `source_design = BWRX-300`, `source_ids` = the correlation/geometry source ids, `notes` = "head balance on registered geometry via tools/core_flow_basis.py: W_geom <value> kg/s [<lo>, <hi>]; ESBWR-scaled origin retired". If the derived value differs from 2000 kg/s by more than the bracket, change `value` to `W_geom` (rounded to 10 kg/s), record it as a finding in the commit body, and expect Task 7 to show the physical change; `rated_flow_and_voids_are_plausible` and `flow_is_positive_and_rises_with_power` compare to `CORE_FLOW_RATED`, so they follow the constant and are not edited.
+(b) `UNAVAILABLE` printed: set `status = unavailable`, `interval_lo/hi = none`, `notes` = "no public BWRX loss data (missing: <ids>); 2000 kg/s retained as a provisional magnitude; its ESBWR-per-MWt origin is recorded here and is not evidence (master: no output-only scaling)".
+
+In both branches: in `crates/bwr-core/tests/register.rs` remove `("CORE_FLOW_RATED", "E-02")` from `BORROWED` (the value is no longer an `esbwr-estimate`); edit the `E-02` row's `adaptation` to state the branch taken and its `classification` to `adapted-model` (a) or `provisional-estimate` (b); rewrite the A-007 statement's rated-flow clause to the branch taken and set its Interval basis for `CORE_FLOW_RATED` to "derived: tools/core_flow_basis.py" (a) or "none; unavailable" (b). Add the printed `drive_dp_rated`, `W_geom`/`UNAVAILABLE` lines verbatim to `docs/model/vessel.md` section 6 under "Rated reference".
+
+- [ ] **Step 3: Verify**
+
+Run: `cargo test --release -p bwr-core --test register > /tmp/p4t5b.log 2>&1; echo "exit=$?"`
+Expected: `exit=0`.
+Run (branch (a) with a changed value only): `cargo test --release -p bwr-core > /tmp/p4t5c.log 2>&1; echo "exit=$?"`
+Expected: `exit=0` (calibration follows the constant). If any test fails, it is a finding about the model at the new reference, recorded under the Finding policy; the constant is not moved back to make it pass.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add tools/core_flow_basis.py docs/model/parameters.csv docs/model/assumptions.md docs/model/esbwr-applicability.csv docs/model/vessel.md crates/bwr-core/tests/register.rs
+git commit -m "docs(model): CORE_FLOW_RATED evidence basis from registered geometry (or explicit unavailable)
+
+<paste the script output>
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -2181,14 +2279,35 @@ Also in `crates/bwr-core/src/validation.rs` `run_case` sampling, set the trace c
 
 - [ ] **Step 4: Run the tests and record the shift**
 
-Run: `cargo test --release -p bwr-core`
-Expected: all pass. Then run:
+Run: `cargo test --release -p bwr-core > /tmp/p4t6.log 2>&1; echo "exit=$?"`
+Expected: `exit=0`.
 
-```bash
-cargo run --release -p bwr-core --example trace -- full 60 | head -5
+Before/after evidence for the commit body. `examples/trace.rs` prints `rho` but no rod position, so use a one-off probe that prints both. The "before" is the committed pre-task state (`HEAD`, the Task 5b commit; this task's edits are still uncommitted in the working tree), run in a temporary detached worktree; the "after" is the working tree. Nothing in the working tree is checked out or stashed. Write `crates/bwr-core/examples/probe_moderator.rs`:
+
+```rust
+//! One-off probe (Package 4 Task 6): full-power t = 0 reactivity and mean rod position.
+use bwr_core::api::ScenarioName;
+use bwr_core::Sim;
+
+fn main() {
+    let sim = Sim::new(ScenarioName::FullPower);
+    let pos = &sim.core.rods.pos;
+    let mean = pos.iter().sum::<f64>() / pos.len() as f64;
+    println!("rho_total={:.6e} rods_mean_pos={:.4} t_coolant={:.3}", sim.core.rho_total, mean, sim.vessel.eos.t);
+}
 ```
 
-and compare the `rho` and rod-average columns with the same command on the previous commit (`git stash` is not needed: run `git show HEAD~1:crates/bwr-core/src/sim.rs > /dev/null` only to confirm the prior commit exists, then `git checkout HEAD~1 -- . && cargo run ... && git checkout HEAD -- .`). Paste both first lines into the commit body. No coefficient is changed; the full-power critical rod search absorbs the ~1 degC moderator shift.
+```bash
+git worktree add --detach ../bwrsim-before HEAD
+cp crates/bwr-core/examples/probe_moderator.rs ../bwrsim-before/crates/bwr-core/examples/
+cargo run --release --manifest-path ../bwrsim-before/Cargo.toml -p bwr-core --example probe_moderator > /tmp/p4-before.txt 2> /tmp/p4-before.err; echo "before exit=$?"
+cargo run --release -p bwr-core --example probe_moderator > /tmp/p4-after.txt 2> /tmp/p4-after.err; echo "after exit=$?"
+diff /tmp/p4-before.txt /tmp/p4-after.txt; cat /tmp/p4-before.txt /tmp/p4-after.txt
+git worktree remove --force ../bwrsim-before
+rm crates/bwr-core/examples/probe_moderator.rs
+```
+
+Expected: both exits 0 (a nonzero exit is a build or runtime failure to fix before going on; the `.err` files hold the output); the two lines differ in `rods_mean_pos` (the critical-rod search absorbs the moderator shift) and agree in `rho_total` to within 1e-5 (both critical). Paste both lines into the commit body. No coefficient is changed. Only the temporary worktree is removed; the working tree is untouched.
 
 - [ ] **Step 5: Commit**
 
@@ -2208,7 +2327,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `crates/bwr-core/tests/vessel_transients.rs`
-- Modify: `docs/validation/baseline/*.csv`, `docs/validation/method.md`
+- Create: `docs/validation/reports/<date>-pkg04.md` (compare-mode output plus the classification table; master baseline regeneration protocol)
+- Modify: `docs/validation/baseline/*.csv`, `docs/validation/method.md` (one-line change-log pointer), `docs/validation/findings.md` (only if the Finding policy fires)
 
 **Interfaces:**
 - Consumes: `validation::{run_case, standard_cases, Tolerance, compare}`, case ids `fp_steady_600`, `hs_steady_600`, `cs_steady_600`.
@@ -2220,11 +2340,31 @@ Append to `tests/vessel_transients.rs`:
 ```rust
 use bwr_core::validation::{run_case, standard_cases};
 
+/// Predeclared shrink/swell excursion bound, cm, from the pre-step state and physics
+/// alone (never from the test's own output): a pressure step `dp` compresses the
+/// two-phase void volume by about `dp / p` (vapour density rises nearly in
+/// proportion to pressure), and that volume leaves the narrow-range region of area
+/// `A_SEPARATOR_REGION`. The subcooling-driven void collapse adds to it, and the
+/// feedwater response within 10 s subtracts, so half of the vapour-density term is
+/// the asserted lower bound.
+fn excursion_bound_cm(sim: &Sim, dp: f64) -> f64 {
+    let v_void = sim.vessel.alpha_core * V_CORE + sim.vessel.alpha_ch * V_CHIMNEY;
+    0.5 * 100.0 * v_void * (dp / sim.vessel.eos.p) / A_SEPARATOR_REGION
+}
+
+/// Predeclared recovery tolerance, cm: one tenth of the +/-50 cm narrow-range half
+/// span the mimic displays. The level controller is expected to be well inside it
+/// 110 s after a 0.2 MPa setpoint step. A declared plausibility band, not a plant
+/// value; it is not adjusted after a failure (Finding policy).
+const RECOVERY_TOL_CM: f64 = 5.0;
+
 #[test]
 fn pressure_step_shrinks_then_recovers() {
     let mut sim = Sim::new(ScenarioName::FullPower);
     run(&mut sim, 30.0);
     let l0 = sim.vessel.level_nr_cm();
+    let bound = excursion_bound_cm(&sim, 0.2e6);
+    println!("shrink bound {bound:.2} cm from void volume at p = {:.3e} Pa", sim.vessel.eos.p);
     let sp = sim.steam.p_setpoint / 1e6 + 0.2;
     sim.apply(Command::SetPressureSetpoint { mpa: sp });
     let mut min_early = f64::MAX;
@@ -2232,10 +2372,12 @@ fn pressure_step_shrinks_then_recovers() {
         sim.step(DT);
         min_early = min_early.min(sim.vessel.level_nr_cm());
     }
-    assert!(min_early < l0 - 2.0, "no shrink: min {min_early} vs {l0}");
+    println!("shrink: l0 {l0:.2} cm, min over 10 s {min_early:.2} cm");
+    assert!(min_early < l0 - bound, "shrink {:.2} cm below the predeclared bound {bound:.2} cm", l0 - min_early);
     run(&mut sim, 110.0);
     let sp_cm = sim.fw.level_sp_cm;
-    assert!((sim.vessel.level_nr_cm() - sp_cm).abs() < 5.0, "level did not recover: {}", sim.vessel.level_nr_cm());
+    println!("recovery: level {:.2} cm vs setpoint {sp_cm:.2} cm at 120 s", sim.vessel.level_nr_cm());
+    assert!((sim.vessel.level_nr_cm() - sp_cm).abs() < RECOVERY_TOL_CM, "level did not recover: {}", sim.vessel.level_nr_cm());
     assert!(!sim.scrammed, "{:?}", sim.scram_reason);
 }
 
@@ -2244,6 +2386,7 @@ fn pressure_step_down_swells() {
     let mut sim = Sim::new(ScenarioName::FullPower);
     run(&mut sim, 30.0);
     let l0 = sim.vessel.level_nr_cm();
+    let bound = excursion_bound_cm(&sim, 0.2e6);
     let sp = sim.steam.p_setpoint / 1e6 - 0.2;
     sim.apply(Command::SetPressureSetpoint { mpa: sp });
     let mut max_early = f64::MIN;
@@ -2251,7 +2394,8 @@ fn pressure_step_down_swells() {
         sim.step(DT);
         max_early = max_early.max(sim.vessel.level_nr_cm());
     }
-    assert!(max_early > l0 + 2.0, "no swell: max {max_early} vs {l0}");
+    println!("swell: l0 {l0:.2} cm, max over 10 s {max_early:.2} cm, bound {bound:.2} cm");
+    assert!(max_early > l0 + bound, "swell {:.2} cm below the predeclared bound {bound:.2} cm", max_early - l0);
 }
 
 #[test]
@@ -2294,26 +2438,68 @@ fn steady_cases_conserve_mass_and_energy() {
 
 - [ ] **Step 2: Run**
 
-Run: `cargo test --release -p bwr-core --test vessel_transients`
-Expected: all pass. If `pressure_step_shrinks_then_recovers` fails only on the magnitude thresholds (2 cm / 5 cm), print `l0`, `min_early`, and the 120 s level, record the measured values in `docs/model/vessel.md` section 8, and adjust the threshold to half the measured excursion with that justification in the commit body. A failure where level moves the wrong way is a defect: stop and investigate the void/level coupling, do not loosen the test.
+Run: `cargo test --release -p bwr-core --test vessel_transients -- --nocapture > /tmp/p4t7.log 2>&1; echo "exit=$?"; grep -n "shrink\|swell\|recovery\|^test \|test result" /tmp/p4t7.log`
+Expected: `exit=0`. The excursion bound and the recovery tolerance are declared above, before this run, and are not changed afterwards. If `pressure_step_shrinks_then_recovers` or `pressure_step_down_swells` fails: a level moving the wrong way is a defect in the void/level coupling (stop, investigate, fix with a unit test). An excursion of the right sign but smaller than the predeclared bound, or a recovery outside `RECOVERY_TOL_CM`, is investigated the same way (feedwater controller response, void lag constants); if the model is judged right, the failure is recorded under the Finding policy (`docs/validation/findings.md`, `F-nnn`, the test marked `#[ignore = "F-nnn"]` with the printed values in the entry) and the baselines are NOT regenerated until the remaining independent gates are green. The test bounds are never edited to the computed values.
 
-- [ ] **Step 3: Compare against the Package 2 baselines, then regenerate**
+- [ ] **Step 3: Baseline regeneration protocol (master), in order**
 
-Run: `cargo run --release -p bwr-core --example validation` (compare mode as defined in the Package 2 plan).
-Expected: violations listed for cases that drain level below the chimney top or involve vented/cold conditions; steady full-power cases within the numerical tolerance class. Copy the full violation list into a scratch file.
-Run: the Package 2 write/update mode of the same example (e.g. `cargo run --release -p bwr-core --example validation -- --write`; use the flag the Package 2 plan defined).
-Append to `docs/validation/method.md` a "Baseline change log" entry: date, commit subject, the pasted violation list, and the one-line reason per case ("level-dependent loop head", "gas-blanketed pressure", "compressed-liquid level"). Baselines are regression evidence, not physical truth.
+This follows the master's protocol exactly as Package 3 Task 9 did: compare first and save the report, classify every change, pass the package's own gates, write once, commit report and baselines together. Package 3's baselines stay in git history as the "before".
 
-- [ ] **Step 4: Commit**
+(1) Compare and save the report:
 
 ```bash
-git add crates/bwr-core/tests/vessel_transients.rs docs/validation/baseline docs/validation/method.md
-git commit -m "test(vessel): shrink/swell, conservation; regenerate baselines after Package 4 physics
+mkdir -p docs/validation/reports
+cargo run --release -p bwr-core --example validation > docs/validation/reports/<date>-pkg04.md 2> /tmp/p4-compare.err; echo "exit=$?"
+```
 
-<paste violation list>
+Prepend the header `# Package 4 baseline comparison, <date>, commit <hash>: Package 3 baselines vs the Package 4 engine, Tolerance::numerical() from Package 3 Task 8`. The exit status of compare mode is whatever Package 2 defined for "violations present"; what matters is that the full output is in the report, untruncated. Expected changes, each with its physical reason:
+- every case: `gas_mass_kg`, `t_coolant_c`, `moderator_t_c` are non-zero for the first time (schema-population, Tasks 3 and 6);
+- cold-shutdown cases (`cs_*`): pressure `P_ATM` from the gas blanket instead of the subcooled rule (identical value, so no violation expected; any difference is to be explained);
+- every case: rod position at full power shifted by the moderator-temperature change (Task 6; `rho` unchanged at criticality);
+- cases that drain level below the chimney top: core flow fades with level instead of collapsing at 0.5 m below the top (Task 5);
+- cases with a pressure step: shrink/swell amplitude from the saturated-density level inversion (Task 3);
+- if Task 5b changed `CORE_FLOW_RATED`: every case's core flow and voids (physical, Task 5b).
+Steady cases (`fp_steady_600`, `hs_steady_600`, `cs_steady_600`) must show no physical violation beyond the newly populated columns and the rod-position shift; anything else is a defect to investigate before anything is written.
+
+(2) Classify every change: append to the report a table `case, metric, before, after, class, reason (task)` with one row per violated metric and one per newly populated column, `class` one of `physical` (reason from the list above, mandatory), `schema-population` (the three P4 columns) or `numerical` (below `Tolerance::numerical()` for that metric, or it is not numerical). A violation with no reason in the list is a new finding: stop, add a test that captures it and fix it, or record it under the Finding policy, before regenerating.
+
+(3) Pass the package's independent gates before any write:
+
+```bash
+cargo test --release -p bwr-core > /tmp/p4gate.log 2>&1; echo "exit=$?"
+```
+
+Expected: `exit=0` (Tasks 2 to 7 tests, the register test, and the Package 3 conservation/rejection tests are the independent gates; any `#[ignore = "F-nnn"]` from Step 2 is listed in the report). If anything fails, the regeneration does not happen.
+
+(4) Regenerate once:
+
+```bash
+cargo run --release -p bwr-core --example validation -- --write > /tmp/p4write.log 2>&1; echo "exit=$?"
+cargo run --release -p bwr-core --example validation > /tmp/p4verify.log 2>&1; echo "exit=$?"
+cargo test --release -p bwr-core > /tmp/p4gate2.log 2>&1; echo "exit=$?"; npm --prefix ui run typecheck; npm --prefix ui run build
+```
+
+Expected: write exit 0; the verify compare reports no violations (its exit is the "clean" status Package 2 defined); tests and UI green. `--write` runs exactly once for this reviewed change set: if review of the report asks for a further model change, go back to (1) against the committed baselines. No tolerance is changed at any point. Add a one-line pointer to the report in `docs/validation/method.md` under "Baseline change log" (date, commit subject, report path); the classification lives in the report, not in method.md.
+
+- [ ] **Step 4: Commit the report and the baselines together**
+
+```bash
+git add crates/bwr-core/tests/vessel_transients.rs docs/validation/reports/<date>-pkg04.md docs/validation/baseline docs/validation/method.md docs/validation/findings.md
+git commit -m "chore(validation): regenerate baselines after Package 4 vessel physics
+
+Regression evidence only, not physical truth. Report with the compare-mode
+output and the classification of every change (physical / schema-population /
+numerical) in docs/validation/reports/<date>-pkg04.md. Gates: cargo test green
+before --write; --write run once; compare clean afterwards.
+
+| case | metric | before | after | class | reason |
+|---|---|---|---|---|---|
+<paste table from Step 3 (2)>
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
+
+(`docs/validation/findings.md` is staged only if the Finding policy fired.)
 
 ---
 
@@ -2324,43 +2510,42 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 - [ ] **Step 1: Fill the measured table in `docs/model/vessel.md`**
 
-Run: `cargo test --release -p bwr-core --test vessel_transients flow_is_positive -- --nocapture` and copy the printed `core flow kg/s` line into section 6's table (core and chimney voids from `Vessel::new(...).alpha_core/alpha_ch` at the same points; add two `println!` lines to the test temporarily or compute in a one-off `examples/trace` run, then remove the prints). Replace every "(measured in Task 8)".
+Run: `cargo test --release -p bwr-core --test vessel_transients flow_is_positive -- --nocapture > /tmp/p4t8.log 2>&1; echo "exit=$?"; grep -n "core flow kg/s\|FINDING" /tmp/p4t8.log` and copy the printed `core flow kg/s` line into section 6's table (core and chimney voids from `Vessel::new(...).alpha_core/alpha_ch` at the same points; add two `println!` lines to the test temporarily, rerun with the same command, then remove the prints). If a `FINDING` line was printed, add under the table: "Finding: the modelled flow is not monotonic in power (values above); two-phase friction grows with power as fast as the void head in this model; no BWRX reference exists for the curve shape, so no ordering is asserted." Replace every "(measured in Task 8)".
 
-- [ ] **Step 2: Assumptions**
+- [ ] **Step 2: Assumption ids are complete**
 
-Append to `docs/model/assumptions.md`, assigning the next sequential ids and replacing `A-P4-n` in `vessel.rs` comments and `vessel.md` with the assigned ids:
+Every assumption this package introduces was added in the task that introduced it (A-042, A-046 in Task 2; A-040, A-044, A-047 in Task 3; A-041, A-043 in Task 4; A-045 and the A-007 update in Task 5; the A-007 rated-flow clause in Task 5b). Verify nothing provisional is left:
 
-- A-P4-1: Noncondensable gas in the head is air with `R_AIR = 287 J/kg/K`, ideal gas, at the water temperature.
-- A-P4-2: Head-vent flow coefficient `C_HEAD_VENT` applies to steam, gas, air ingress and liquid relief alike; `VENT_BOILOFF_KGS_PER_K` is retained from the baseline. Sensitivity: cold-shutdown pressure is pinned to `P_ATM` for any coefficient above 1e-7 kg/s/Pa; water-solid heating pressure is not controllable by the vent at any plausible coefficient.
-- A-P4-3: Gas internal energy and pressure work on compressed liquid are neglected in the energy balance (below 0.1 % of vessel energy).
-- A-P4-4: Steam-line and IC steam supply are not credited while `GasBlanketed`; gas transport through steam lines and IC tube gas accumulation are not modelled here (Package 7 treats IC degradation as a sensitivity).
-- A-P4-5: Core boiling is evaluated at dome total pressure; the downcomer hydrostatic head (about 0.15 MPa at rated level) is neglected, under-predicting core inlet saturation temperature by about 1 degC at 7.2 MPa.
-- A-P4-6: Below `Z_TAF + LOOP_FADE_M` the separated-liquid return path is lost and the loop head fades linearly to zero; residual core flow is `W_MIN = 5 kg/s`. No public BWRX value supports either number.
-- A-P4-7: Compressed-liquid enthalpy is approximated by the saturated-liquid enthalpy at the same temperature (error below 0.5 % at 7 MPa).
-- A-P4-8: Air in-leakage into a sealed sub-atmospheric vessel is not modelled.
+Run: `grep -rn "A-P4-\|WATER_SOLID_GAS_TOLERANCE\|ESBWR-P4-" crates docs/model docs/superpowers/plans/2026-10-20-pkg04-vessel-circulation.md; echo "exit=$?"`
+Expected: `exit=1` (no hits). Then run the P1 cross-check: `awk -F',' 'NR==1{for(i=1;i<=NF;i++) if($i=="assumption_id") c=i; next} $c!="" {print $c}' docs/model/parameters.csv | sort -u | while read id; do grep -q "^| $id |" docs/model/assumptions.md || { echo "missing $id"; exit 1; }; done; echo "exit=$?"` — expected `exit=0`.
 
 - [ ] **Step 3: ESBWR applicability rows**
 
-Append to `docs/model/esbwr-applicability.csv` (locked header `id,esbwr_source,esbwr_section,target_subsystem,bwrx_evidence,differences,adaptation,applicability_limits,test,classification`; `esbwr_source` values are `sources.csv` ids, e.g. `SRC-ESBWR-DCD-R10` as named by Package 1):
+Append to `docs/model/esbwr-applicability.csv` (locked header `id,esbwr_source,esbwr_section,target_subsystem,bwrx_evidence,differences,adaptation,applicability_limits,test,classification`; ids continue P1's `E-nn` series at `E-40`; `esbwr_source` as P1 wrote it for E-02; `esbwr_section` cites the retrieved chapter rows `S-ESBWR-04`/`S-ESBWR-05` as the register test requires; `classification` from the P1 vocabulary `shared-concept`, `adapted-model`, `provisional-estimate`):
 
 ```csv
-ESBWR-P4-1,SRC-ESBWR-DCD-R10,Tier 2 Sec. 4.4 thermal-hydraulic design: natural-circulation head/loss balance and chimney,vessel/circulation,BWRX-300 General Description 005N9751: natural circulation with tall chimney; RPV ~4 m x 26-27 m,BWRX chimney height; areas and rated flow are ASSUMED; no ESBWR numerical value transferred,hydrostatic head formula only; geometry from parameters.csv,single level for shroud and downcomer; no regional or density-wave stability,head_formula_matches_baseline_above_chimney_top; flow_is_positive_and_rises_with_power,shared concept
-ESBWR-P4-2,SRC-ESBWR-DCD-R10,Tier 2 Sec. 5.3/5.4 reactor vessel: head vent and water-solid operation principles,vessel,005N9751 RPV description,BWRX integral RPV isolation valves and no SRVs; vent capacity unknown,vent as a mass boundary with an ASSUMED coefficient,water-solid pressure cannot be held by the vent at any plausible coefficient,cold_vented_vessel_is_atmospheric; water_solid_pressure_rises_steeply_and_leaves_envelope,adapted model
-ESBWR-P4-3,SRC-ESBWR-DCD-R10,Tier 2 Sec. 4.4 drift-flux void correlation,core and chimney voids,none BWRX-specific,GNF2 bundle geometry assumed; C0 = 1.13 retained from the baseline,none,validity demonstrated only by plausibility above 1 MPa,rated_flow_and_voids_are_plausible,provisional numerical estimate
+E-40,DCD Rev 10 Tier 2;NUREG-1966 V2,S-ESBWR-04 Section 4.4 (natural-circulation head/loss balance and chimney); S-ESBWR-05 Section 5.4 (chimney and internals),Vessel and circulation,S-06 (natural circulation with a tall chimney; RPV about 4 m x 26-27 m),BWRX chimney height and areas are A-006 estimates; rated flow basis per Task 5b; no ESBWR numerical value transferred,hydrostatic head from submerged column heights with a LOOP_FADE_M fade above TAF (A-045); geometry from parameters.csv,single level for shroud and downcomer; no regional or density-wave stability; off-rated flows reported against a declared envelope only,head_formula_matches_baseline_above_chimney_top; steady_points_balance_momentum; flow_is_positive_and_rises_with_power; draining_breaks_natural_circulation_in_order,shared-concept
+E-41,DCD Rev 10 Tier 2;NUREG-1966 V2,S-ESBWR-05 Section 5.3 (RPV design pressure) and Section 5.4 (head vent and water-solid operation principles),Vessel,S-06 (RPV description; integral isolation valves),BWRX has integral RPV isolation valves and no SRVs; vent capacity unknown,vent as a mass boundary with an assumed coefficient (A-041); water-solid pressure from liquid compressibility bounded by P_EOS_MAX; no free gas when water-solid (A-040),water-solid pressure cannot be relieved by the vent (it passes nothing); linear compressibility to T_COMPRESSED_MAX only,cold_vented_vessel_is_atmospheric; water_solid_pressure_rises_steeply_and_leaves_envelope; water_solid_boundary_with_dissolved_gas_is_continuous,adapted-model
+E-42,DCD Rev 10 Tier 2;NUREG-1966 V2,S-ESBWR-04 Section 4.4 (void correlation and two-phase pressure drop),Core and chimney voids,none BWRX-specific,GNF2 bundle geometry assumed; C0 = 1.13 and the drift velocity retained from the baseline,none,validity shown only by plausibility above 1 MPa; voids at 30/60 % recorded in vessel.md section 6,rated_flow_and_voids_are_plausible,provisional-estimate
 ```
+
+Run: `cargo test --release -p bwr-core --test register > /tmp/p4reg.log 2>&1; echo "exit=$?"`
+Expected: `exit=0` (classification vocabulary and `S-ESBWR-` citations checked by `existing_borrowed_values_are_assessed`).
 
 - [ ] **Step 4: Coverage and README**
 
-In `docs/model/coverage.md` vessel row, list the sixteen tests from `vessel.md` section 8 and mark "natural circulation below chimney top" and "gas-blanketed heatup" as plausibility-verified, not validated. In `README.md` "Vessel" row replace "Mass and energy balance with real IAPWS-IF97 steam tables, so pressure, flashing, swell and shrink are physical" with "Mass, energy and noncondensable-gas balance with IAPWS-IF97 properties including liquid compressibility; vented, gas-blanketed, saturated and water-solid regimes" and add "flow stops if level falls below the chimney top" → "loop head falls with level and is lost near the top of the fuel".
+In `docs/model/coverage.md` vessel row, list the tests from `vessel.md` section 8 and mark "natural circulation below chimney top", "off-rated flow" and "gas-blanketed heatup" as plausibility-verified, not validated. In `README.md` "Vessel" row replace "Mass and energy balance with real IAPWS-IF97 steam tables, so pressure, flashing, swell and shrink are physical" with "Mass, energy and noncondensable-gas balance with IAPWS-IF97 properties including liquid compressibility; vented, gas-blanketed, saturated and water-solid regimes" and add "flow stops if level falls below the chimney top" → "loop head falls with level and is lost near the top of the fuel".
 
 - [ ] **Step 5: Final verification and commit**
 
-Run: `cargo test --release -p bwr-core && npm --prefix ui run typecheck && npm --prefix ui run build`
-Expected: all green.
+Run: `cargo test --release -p bwr-core > /tmp/p4final.log 2>&1; echo "exit=$?"`
+Expected: `exit=0`.
+Run: `npm --prefix ui run typecheck && npm --prefix ui run build`
+Expected: exit 0.
 
 ```bash
 git add docs/model README.md
-git commit -m "docs(model): vessel assumptions, ESBWR applicability and measured circulation points
+git commit -m "docs(model): vessel applicability rows, measured circulation points, coverage
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
