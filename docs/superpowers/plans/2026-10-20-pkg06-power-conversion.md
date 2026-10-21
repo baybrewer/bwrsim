@@ -1894,11 +1894,11 @@ Call `let (sf, cf, ff) = self.bop_faults();` once at the top of `Sim::step` and 
             Command::SetFeedPump { index, on } => {
                 if index < N_FEED_PUMPS {
                     if on && self.has_fault(&Fault::FeedPumpTrip { index }) {
-                        self.event("fw", format!("Feed pump {} start blocked: pump tripped", index + 1));
+                        self.refuse("fw", format!("Feed pump {} start blocked: pump tripped", index + 1));
                         return;
                     }
                     if on && !self.fw.cond_pumps.iter().any(|&b| b) {
-                        self.event("fw", "Feed pump start blocked: no condensate pump running");
+                        self.refuse("fw", "Feed pump start blocked: no condensate pump running");
                         return;
                     }
                     self.fw.pumps[index] = on;
@@ -1907,7 +1907,7 @@ Call `let (sf, cf, ff) = self.bop_faults();` once at the top of `Sim::step` and 
             Command::SetCondensatePump { index, on } => {
                 if index < N_COND_PUMPS {
                     if on && self.has_fault(&Fault::CondensatePumpTrip { index }) {
-                        self.event("fw", format!("Condensate pump {} start blocked: pump tripped", index + 1));
+                        self.refuse("fw", format!("Condensate pump {} start blocked: pump tripped", index + 1));
                         return;
                     }
                     self.fw.cond_pumps[index] = on;
@@ -1916,7 +1916,7 @@ Call `let (sf, cf, ff) = self.bop_faults();` once at the top of `Sim::step` and 
             Command::SetLevelControl { mode } => self.fw.set_mode(mode),
             Command::SetHeaters { in_service } => {
                 if in_service && self.has_fault(&Fault::HeatersLost) {
-                    self.event("fw", "Feedwater heaters unavailable");
+                    self.refuse("fw", "Feedwater heaters unavailable");
                     return;
                 }
                 self.fw.heaters_in_service = in_service;
@@ -1989,7 +1989,7 @@ Expected: compile error `cannot find value RWCU_REJECT_MAX_KGS`.
 
 - [ ] **Step 3: Implement**
 
-`params.rs` feedwater section: `/// Maximum RWCU reject flow to the hotwell, kg/s. ASSUMED (A-6xx: RWCU pumps always available). pub const RWCU_REJECT_MAX_KGS: f64 = 15.0;`. In `sim.rs` `apply`: `Command::SetRwcuReject { kgs } => self.fw.rwcu_reject = kgs.clamp(0.0, RWCU_REJECT_MAX_KGS),`. Confirm the Task 6 condenser block already uses `flows.w_liquid_out` and `flows.h_liquid_out` (so a subcooled vessel rejects subcooled liquid enthalpy, not `sat().h_f`); if the P3/P4 code left `self.vessel.sat().h_f` anywhere in the condenser block, replace it.
+`params.rs` feedwater section: `/// Maximum RWCU reject flow to the hotwell, kg/s. ASSUMED (A-6xx: RWCU pumps always available). pub const RWCU_REJECT_MAX_KGS: f64 = 15.0;`. In `sim.rs` `apply`: `Command::SetRwcuReject { kgs } => self.fw.rwcu_reject = kgs.clamp(0.0, RWCU_REJECT_MAX_KGS),`. Confirm the Task 6 condenser block already uses `flows.w_liquid_out` and `flows.h_liquid_out` (the APPLIED reject and its enthalpy, so a subcooled vessel rejects subcooled liquid enthalpy, not `sat().h_f`, and an inventory-bounded step moves only what the vessel released); if the P3/P4 code left `self.vessel.sat().h_f` or `self.fw.rwcu_reject` anywhere in the condenser block, replace it. Tests read the applied value through `sim.last_flows().w_liquid_out`; add to `rwcu_reject_moves_mass_from_vessel_to_hotwell` after the reject run: `assert!((sim.last_flows().w_liquid_out - RWCU_REJECT_MAX_KGS).abs() < 1e-9, "applied reject must equal the request at adequate inventory");`.
 
 - [ ] **Step 4: Run all tests, document, commit**
 
@@ -2071,14 +2071,62 @@ In `ui/src/sim/mock.ts`, find the object literal returned by the mock's snapshot
 
 Run: `npm --prefix ui run typecheck && npm --prefix ui run build` → Expected: both succeed.
 
+- [ ] **Step 5b: Populate the P6 trace columns (schema v2)**
+
+Package 2's `validation::run_case` sampling emits `0.0` for columns whose source did not exist yet. In the sampling function (the one that fills a `[f64; N_TRACE_COLS]` row by `col_index(name)`), set the P6-owned columns from the engine state:
+
+```rust
+    row[col_index("msiv_pos_0")] = sim.steam.msiv_pos[0];
+    row[col_index("msiv_pos_1")] = sim.steam.msiv_pos[1];
+    row[col_index("tsv_pos")] = sim.steam.tsv_pos;
+    row[col_index("header_pressure_pa")] = sim.steam.p_chest;
+    row[col_index("cst_kg")] = sim.cond.cst_mass;
+    row[col_index("fw_pump_0")] = sim.fw.pump_speed[0];
+    row[col_index("fw_pump_1")] = sim.fw.pump_speed[1];
+    row[col_index("fw_pump_2")] = sim.fw.pump_speed[2];
+```
+
+(`msiv_pos_0/1` may already be populated by Package 2 since `msiv_pos` exists at baseline; keep whichever assignment exists and do not duplicate.) In `docs/validation/method.md`, move these columns from "populated from Package 6" to the populated list. Add to `tests/power_conversion.rs`:
+
+```rust
+#[test]
+fn p6_trace_columns_are_populated() {
+    use bwr_core::validation::{run_case, standard_cases};
+    let case = standard_cases().into_iter().find(|c| c.id == "fp_turbine_trip").expect("P2 case");
+    let tr = run_case(&case, DT);
+    let last = *tr.rows.last().unwrap();
+    let col = |n: &str| last[bwr_core::validation::col_index(n)];
+    assert!(col("header_pressure_pa") > 1.0e5, "header pressure column empty");
+    assert!(col("cst_kg") > 0.0, "cst column empty");
+    assert!(col("fw_pump_0") > 0.0 || col("fw_pump_1") > 0.0, "fw pump speed columns empty");
+    let first = tr.rows[0];
+    assert!((first[bwr_core::validation::col_index("tsv_pos")] - 1.0).abs() < 1e-9, "tsv_pos must be 1 before the trip");
+    assert!(col("tsv_pos") < 1e-6, "tsv_pos must be 0 after the trip");
+}
+```
+
+Run: `cargo test --release -p bwr-core --test power_conversion p6_trace` → Expected: PASS once the sampling assignments are in; before them, FAIL on `header pressure column empty`.
+
 - [ ] **Step 6: Registers**
 
-Append to `docs/model/parameters.csv` (Package 1 column layout) one row for each name in the "New names" table above, with value, unit, definition, status, assumption id, and sensitivity interval where given; update the `TURBINE_DH_RATED` row to status `calibrated` with old/new values and the calibration formula. Append to `docs/model/esbwr-applicability.csv`:
+Append to `docs/model/parameters.csv` one row per constant in the "Names used by this package" table, using the **locked header** `id,value,unit,definition,reference_state,source_design,status,source_ids,interval_lo,interval_hi,assumption_id,location,notes` (the `id` is the Rust constant name; `location` is `crates/bwr-core/src/params.rs`). Example rows (fill `assumption_id` with the ids created in Task 1 and later tasks; `source_ids` is empty for assumed values):
 
 ```
-ESBWR DCD Tier 2 Ch. 10.2-10.4,main steam/turbine/condenser,BWRX general description (steam cycle outline),ESBWR is 4500 MWt with 4 steam lines; BWRX has 2 lines and ~870 MWt,topology and valve roles only; no numeric scaling,steady-state energy balance structure,shared concept,power_conversion::full_power_energy_balance_closes
-ESBWR DCD Tier 2 Ch. 7.7 (pressure regulator and turbine bypass),EHC pressure regulation,none numeric,regulator gains and bypass capacity not published for BWRX,regulator span and bypass capacity remain assumed,regulator fault and load rejection cases,shared concept,power_conversion::load_rejection_with_bypass_does_not_scram
-ESBWR DCD Tier 2 Ch. 10.4.7 (condensate and feedwater),feedwater pumps and heaters,none numeric,pump count/capacity differ,pump curves and heater duty remain assumed,feed pump trip and heater loss cases,shared concept,power_conversion::loss_of_feedwater_heating_raises_power
+V_STEAM_LINE_M3,60.0,m3,steam volume of both main steam lines plus header and chest,n/a,BWRX-300 (assumed),assumed,,30,120,A-6xx,crates/bwr-core/src/params.rs,line storage node; interval spans half to double
+TSV_STROKE,0.1,s,turbine stop valve closing stroke on trip,n/a,generic,assumed,,0.05,0.3,A-6xx,crates/bwr-core/src/params.rs,
+EXTRACTION_WORK_FRACTION,0.25,-,LP work forgone per unit extraction heat to feedwater heaters,rated,generic BWR cycle,assumed,,0.15,0.35,A-6xx,crates/bwr-core/src/params.rs,0.35 would push TURBINE_DH_RATED above the isentropic drop
+TURBINE_DH_RATED,0.897e6,J/kg,shaft work per kg throttle steam at full expansion,rated 7.0 MPa chest / 5.6 kPa,BWRX-300 (calibrated),calibrated,,,,A-6xx,crates/bwr-core/src/params.rs,was 0.703e6 effective (included extraction); recalibrated so net stays ~300 MWe
+CST_CAPACITY_KG,2.0e6,kg,condensate storage tank capacity (declared boundary inventory),n/a,BWRX-300 (assumed),assumed,,1.0e6,4.0e6,A-6xx,crates/bwr-core/src/params.rs,
+AIR_UA_DEGRADATION,5.0,-,condenser UA divisor coefficient on air/steam partial-pressure ratio,n/a,generic,assumed,,2,10,A-6xx,crates/bwr-core/src/params.rs,air blanketing
+SRI_TRIGGER_POWER_FRAC,0.4,-,power above which turbine trip/load rejection triggers Select Rod Insert,n/a,BWRX-300 (assumed),assumed,,0.3,0.6,A-6xx,crates/bwr-core/src/params.rs,was a literal in sim.rs
+```
+
+Write the remaining rows (`MSIV_DP_FRACTION`, `LINE_FLOW_RATED`, `K_LINE`, `K_MSIV_OPEN` as `derived`, `TSV_OPEN_RATE`, `CST_MASS_INITIAL`, `HOTWELL_MAKEUP_KGS`, `HOTWELL_MAKEUP_ON`, `HOTWELL_REJECT_ON`, `FW_STATIC_DP`, `FW_PUMP_COASTDOWN_S`, `RWCU_REJECT_MAX_KGS`) in the same shape. Append to `docs/model/esbwr-applicability.csv` using its locked header `id,esbwr_source,esbwr_section,target_subsystem,bwrx_evidence,differences,adaptation,applicability_limits,test,classification`:
+
+```
+ESBWR-P6-01,ESBWR DCD Tier 2 Rev. 10,Ch. 10.2-10.4 main steam and power conversion,main steam/turbine/condenser,BWRX general description (steam cycle outline),ESBWR is 4500 MWt with 4 steam lines; BWRX has 2 lines and ~870 MWt,topology and valve roles only; no numeric scaling,steady-state energy balance structure,power_conversion::full_power_energy_balance_closes,shared concept
+ESBWR-P6-02,ESBWR DCD Tier 2 Rev. 10,Ch. 7.7 pressure regulator and turbine bypass,EHC pressure regulation,none numeric,regulator gains and bypass capacity not published for BWRX,regulator span and bypass capacity remain assumed,regulator fault and load rejection cases,power_conversion::load_rejection_with_bypass_does_not_scram,shared concept
+ESBWR-P6-03,ESBWR DCD Tier 2 Rev. 10,Ch. 10.4.7 condensate and feedwater,feedwater pumps and heaters,none numeric,pump count/capacity differ,pump curves and heater duty remain assumed,feed pump trip and heater loss cases,power_conversion::loss_of_feedwater_heating_raises_power,shared concept
 ```
 
 - [ ] **Step 7: Baselines and results**
@@ -2111,3 +2159,28 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 | Verify pump count/capacity, check/isolation behaviour, head, suction limits, pump stopping response, heater losses, controller mode transfer | 8 |
 | RWCU reject destination, feasibility, mass/energy effects | 9 |
 | Acceptance gate: balances close; condenser loss, feedwater disturbances, turbine trips follow the design basis within documented uncertainty | 5, 6, 7, 8, 10 |
+
+Master r2 obligations carried by this package:
+
+| Master requirement | Task |
+|---|---|
+| Transfer allocation: every steam/RWCU consumer uses applied flows (step order 8–12, defect 13) | 3 (wiring), 6, 7, 9 |
+| `EnergyBalance` control volume with storage terms; steady and transient closure | 6 |
+| `SteamLine.energy`, `Turbine.p_losses`, `Condenser.hotwell_energy` storage states | 3, 6, 7 |
+| Derives rule (`SteamLine` Copy; fault views Copy+Default; `EnergyBalance` Copy+Default) | 3, 4, 6, 7, 8 |
+| `faults: Vec<Fault>` read via `has_fault`/`find_fault`; faults never auto-cleared (tested) | 4, 5, 7, 8 |
+| Trace schema v2 columns `tsv_pos`, `header_pressure_pa`, `cst_kg`, `fw_pump_0..2`, `msiv_pos_0/1` | 10 (Step 5b) |
+| Locked CSV headers for `parameters.csv`, `cases.csv`, `esbwr-applicability.csv` | 5, 10 |
+| Log-line convention (`msiv isolation:`, `command ignored:`) | 5, 7, 8 |
+| `Sim::last_flows()` for applied-flow reads in tests | 3, 9 |
+
+## Self-review against the master checklist (r2)
+
+- Spec coverage: every Package 6 bullet maps to a task (table above).
+- Placeholders: none; every code step shows code; the only cross-package references are to names the master defines (`run_case`, `col_index`, `standard_cases`, `last_flows`, `find_fault`, `CP_WATER`) or to the Package 2 runner flag, which is named explicitly as a dependency.
+- Names and signatures match master r2: `compute_flows(dt, p_vessel)`, `init_line_steady(p_vessel)`, `SteamSystem::new(msivs_open, tsv_open)`, `Turbine::step(.., extraction_heat_w)`, `Condenser::step(.., &CondenserFaults)`, `Feedwater::step(.., &FeedFaults)`, `Feedwater::set_mode(mode)`, `EnergyBalance` field list, `SteamLine { mass, p, energy }`, `Turbine.p_losses`, `Condenser.hotwell_energy`. Package-local additions (`step_line`, `kinetic_energy`, `refuse`, `house_load`, `bypass_available`, `overflow_kg`, `deficit_kg`, `HOTWELL_MAKEUP_ON/REJECT_ON`) are marked and consumed only inside P6.
+- Derives: stated on every new struct.
+- Constants: every new or changed constant has a `parameters.csv` row step with a status (Task 10 Step 6).
+- Snapshot changes: `types.ts` and `mock.ts` steps present (Task 10 Steps 4–5); typecheck/build commands given.
+- Defect fixes: defect 6 (hotwell) has a compile-failing test first (Task 7); the averaging defect has a compile-failing test first (Task 2); every fault has a persistence assertion.
+- Applied transfers: Task 3 Step 6 scales `w_line`, `w_tcv`, `w_bypass`; the condenser and balance read `flows.w_liquid_out`; `steam_consumers_see_applied_flows` guards it.

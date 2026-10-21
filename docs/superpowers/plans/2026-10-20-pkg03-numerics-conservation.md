@@ -1052,7 +1052,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `Vessel::sat().h_fg()`.
-- Produces: `pub struct IcStep { q_removed: f64, w_condensate_return: f64, energy_to_pool: f64, pool_boiloff_kg: f64, pool_cooling_w: f64 }` (master's four fields plus `pool_cooling_w`); `IcTrain::step(&mut self, dt, t_sat, h_fg, steam_available) -> IcStep`; constants `CP_WATER = 4186.0`, `H_FG_ATM = 2.257e6`, `POOL_BOIL_T = 100.0`, `POOL_IDLE_COOLING_K_PER_S = 0.0005`.
+- Produces: `pub struct IcStep { q_removed: f64, w_condensate_return: f64, energy_to_pool: f64, pool_boiloff_kg: f64, pool_cooling_w: f64 }` (the master r2 interim form, all five fields); `IcTrain::step(&mut self, dt, t_sat, h_fg, steam_available) -> IcStep`; constants `CP_WATER = 4186.0`, `H_FG_ATM = 2.257e6`, `POOL_BOIL_T = 100.0`, `POOL_IDLE_COOLING_K_PER_S = 0.0005`.
 
 **Baseline defect (verified in code):** `pool_t += q/(m cp)` can overshoot 100 degC and the excess sensible energy vanishes; `pool_mass = (pool_mass - q/h_fg).max(0.0)` discards energy at depletion; the lagged `heat` keeps reporting removal for ~20 s after the pool is gone; idle cooling `pool_t -= 0.0005*dt` removes energy with no boundary record.
 
@@ -1598,9 +1598,10 @@ Replace the first half of `Vessel::step`, from `pub fn step(` down to and includ
 
 The remainder of `step` (core inlet enthalpy, voids, momentum, `update_level`, heat-up rate) is unchanged except that its final expression must be `flows` (Package 2 already returns the flows struct; replace its name if different).
 
-In `crates/bwr-core/src/sim.rs`, `Sim::step`, directly after the `self.vessel.step(dt, &inputs)` call (keep Package 2's binding of its return value for the ledger):
+In `crates/bwr-core/src/sim.rs`, `Sim::step` (the Task 4 body), at the END of the function, after `self.last_flows = flows;` (master shared step order, item 17: "drain vessel.last_error / core error / ic errors into domain_errors"):
 
 ```rust
+        // 17: drain vessel errors raised this step.
         if let Some(deficit) = self.vessel.exhausted {
             self.domain_error(DomainError::InventoryExhausted { deficit_kg: deficit });
         }
@@ -1966,11 +1967,13 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - [ ] **Step 1: Compare against the Package 2 baselines**
 
 Run: `cargo run --release -p bwr-core --example validation`
-Expected: a per-case list of metric violations against the numerical tolerance class. Expected to change, with the physical reason:
+Expected: a per-case list of metric violations against the numerical tolerance class (now the measured values from Task 8). Expected to change, with the physical reason:
 - cases that scram (`fp_manual_scram`, `fp_msiv_closure`, any scram case): power falls one step (0.05 s) earlier (Task 4).
+- every case: turbine `p_mech` and condenser load are evaluated one phase later within the step (Task 4 reorder); at steady state this is a sub-tolerance re-timing, not a level change.
 - any case in which the level approaches the top of active fuel: fuel temperature higher and `CORE UNCOVERED` alarm earlier (Task 2).
 - long isolated cases with IC in service for hours: pool temperature capped at 100 degC (Task 5).
-- cases that previously touched the 1 000 kg floor: now end in an `unsupported` flag (Task 6).
+- cases that previously touched the 1 000 kg floor: now end in an `unsupported` flag (Task 6), and the `unsupported` and `collapsed_level_m` columns are non-zero for the first time (Tasks 1 and 2).
+- source startups from zero power: `period_s` finite throughout (Task 3, defect 12).
 Cases that only exercise steady operation (`fp_steady`, startup) must show no violation; if they do, investigate before writing.
 
 - [ ] **Step 2: Build the before/after table**
@@ -2011,8 +2014,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 Checklist against the gate:
 
-- [ ] Each of Tasks 2 to 6 recorded a baseline demonstration (printed line or failure message) in its commit body before the fix.
-- [ ] `tests/conservation.rs` shows `mass_clipped_kg == 0` and `|mass_residual| < 1e-6 * mass0` through a drained-vessel transient.
-- [ ] `Snapshot.unsupported`, the `unsupported` alarm, and `Sim.log` `DOMAIN:` entries make every domain error visible; `LoadScenario` is the only reset.
-- [ ] Convergence at 0.05 / 0.025 / 0.0125 s is enforced for `fp_turbine_trip` and `fp_manual_scram`.
-- [ ] Baselines were regenerated once with a reasoned before/after table; no tolerance was widened.
+- [ ] Each of Tasks 2 to 6 recorded a baseline demonstration (printed line or failure message) in its commit body before the fix, covering master defects 1, 2, 3, 4 (P3 part), 5, 12 and 13.
+- [ ] `tests/conservation.rs` shows `mass_clipped_kg == 0` and `|mass_residual| < 1e-6 * mass0` through a drained-vessel transient, and the coupled regression shows condenser-side receipts equal to vessel-side releases via `Sim::last_flows()` and `Ledger.integrated`.
+- [ ] Every rejection rule in master r2 ("what commits on failure") has its own test: `Kinetics` unchanged on Err (Task 3), `Core::step` leaves xenon/decay/fuel un-advanced (Task 3), `Vessel::step` rolls back on EOS Err and returns zero flows (Task 6), exhaustion scales outflows and records the deficit (Task 6).
+- [ ] `Snapshot.unsupported`, the `unsupported` alarm, and `Sim.log` `DOMAIN:` entries make every domain error visible; `LoadScenario` is the only reset; errors raised during initialisation survive `finalize_init` re-stamped at t = 0.
+- [ ] Every consumer of a transfer uses the applied (post-allocation) value: `steam.w_tcv`, `steam.w_bypass` scaled; condenser fed `flows.w_liquid_out`; the RWCU setpoint is never mutated.
+- [ ] Every new struct/enum carries the master Derives rule (`DomainError`: Clone, Debug, PartialEq, Serialize, Deserialize; `Unsupported`: Clone, Debug, Serialize, Deserialize, camelCase; `IcStep`: Clone, Copy, Debug, Default, PartialEq).
+- [ ] The `collapsed_level_m` and `unsupported` trace columns (schema v2) are populated, and `method.md` no longer lists them as pending.
+- [ ] Convergence at 0.05 / 0.025 / 0.0125 s is enforced for `fp_turbine_trip` and `fp_manual_scram`, and `Tolerance::numerical()` holds 2x the measured dt-halving differences with the table in `method.md`.
+- [ ] Baselines were regenerated once with a reasoned before/after table; no tolerance was widened beyond measurement.
