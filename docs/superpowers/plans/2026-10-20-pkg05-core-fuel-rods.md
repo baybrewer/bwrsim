@@ -1526,63 +1526,134 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ### Task 5: Fuel model envelope replaces the "core damage" verdict
 
 **Files:**
-- Modify: `crates/bwr-core/src/params.rs` (`FUEL_MODEL_T_MAX_C`, `UNCOVERED_ENVELOPE_S`)
-- Modify: `crates/bwr-core/src/sim.rs` (remove `core_damage`; add `uncovered_s`, envelope detection, alarm)
-- Modify: `crates/bwr-core/src/api.rs`, `ui/src/sim/types.ts`, `ui/src/sim/mock.ts`, UI components that show "CORE DAMAGE"
+- Modify: `crates/bwr-core/src/params.rs` (`FUEL_MODEL_T_MAX_C`, `UNCOVERED_ENVELOPE_S`, `CORE_COVERED_FRAC`) and `docs/model/parameters.csv` (their rows)
+- Modify: `crates/bwr-core/src/sim.rs` (remove the legacy damage-verdict field; add `uncovered_s`, `clad_t_step_max`, envelope detection, alarm)
+- Modify: `crates/bwr-core/src/api.rs`, `ui/src/sim/types.ts`, `ui/src/sim/mock.ts`
 - Modify: `crates/bwr-core/tests/core_transients.rs`
 
 **Interfaces:**
-- Consumes: `DomainError::FuelModelEnvelope { fuel_t_c, clad_t_c }`, `Sim::domain_errors: Vec<(f64, DomainError)>` (P3).
-- Produces: `Sim::uncovered_s`, `Sim::fuel_envelope_exceeded()`, `Snapshot.fuel_envelope_exceeded`, alarm id `fuel_envelope`.
+- Consumes: `DomainError::FuelModelEnvelope { fuel_t_c, clad_t_c }`, `Sim::domain_errors: Vec<(f64, DomainError)>` (P3); `Vessel::new(t, level_z, q, w_feed, t_feed, vent_open)` and `Vessel::core_coverage()` (P3/P4) for the low-inventory fixture.
+- Produces: `Sim::uncovered_s`, `Sim::clad_t_step_max`, `Sim::fuel_envelope_exceeded()`, `Snapshot.fuel_envelope_exceeded`, alarm id `fuel_envelope`, `CORE_COVERED_FRAC`.
+
+Detection semantics (core.md section 5, written in Task 1): the cladding check uses the plant-step endpoints, `clad_t_step_max = max(entry, exit)`, so an entry-state excursion latches even though the fast cladding node cools within the step; the uncovered timer accumulates continuous time with `core_coverage() < CORE_COVERED_FRAC`, resets on any covered step, and the limit is strict.
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `crates/bwr-core/tests/core_transients.rs`:
+Append to `crates/bwr-core/tests/core_transients.rs` (`DomainError` is already imported at the top of the file from Task 2):
 
 ```rust
-use bwr_core::domain::DomainError;
+use bwr_core::bop::LevelControlMode;
+use bwr_core::vessel::Vessel;
+
+fn envelope_errors(sim: &Sim) -> usize {
+    sim.domain_errors.iter().filter(|(_, e)| matches!(e, DomainError::FuelModelEnvelope { .. })).count()
+}
+
+/// Replace the vessel with a thermodynamically consistent low-inventory state built
+/// through the vessel constructor (mixture level at mid-core, same coolant temperature),
+/// and hold feed at zero so the level cannot recover on its own. No production hook.
+fn uncover_core(sim: &mut Sim) {
+    let t = sim.vessel.eos.t;
+    sim.vessel = Vessel::new(t, Z_CORE_BOTTOM + 0.5 * CORE_HEIGHT, RATED_POWER_W, 0.0, T_FW_RATED, false);
+    sim.apply(Command::SetLevelControl { mode: LevelControlMode::Manual });
+    sim.apply(Command::SetFcvManual { pos: 0.0 });
+    assert!(sim.vessel.core_coverage() < CORE_COVERED_FRAC, "fixture is not uncovered: {}", sim.vessel.core_coverage());
+}
+
+/// Put back a consistent full-inventory vessel at normal water level.
+fn recover_core(sim: &mut Sim) {
+    let t = sim.vessel.eos.t;
+    sim.vessel = Vessel::new(t, Z_NWL, RATED_POWER_W, STEAM_FLOW_RATED, T_FW_RATED, false);
+    assert!(sim.vessel.core_coverage() >= CORE_COVERED_FRAC);
+}
 
 #[test]
-fn hot_cladding_raises_fuel_model_envelope_once() {
+fn entry_state_cladding_excursion_latches_the_envelope_once() {
+    // Entry-state detection: the seeded cladding node cools well below the limit within
+    // one step (fast clad mode), so only the step-endpoint maximum can catch it.
     let mut sim = Sim::new(ScenarioName::FullPower);
     run(&mut sim, 1.0);
     assert!(!sim.fuel_envelope_exceeded());
     sim.core.clad_t = FUEL_MODEL_T_MAX_C + 1.0;
-    sim.core.fuel_t = FUEL_MODEL_T_MAX_C + 300.0;
     run(&mut sim, DT);
-    assert!(sim.fuel_envelope_exceeded());
-    let n = sim.domain_errors.iter().filter(|(_, e)| matches!(e, DomainError::FuelModelEnvelope { .. })).count();
+    assert!(sim.core.clad_t < FUEL_MODEL_T_MAX_C, "fixture check: the clad node cooled within the step to {}", sim.core.clad_t);
+    assert!(sim.fuel_envelope_exceeded(), "entry-state excursion must latch (core.md section 5)");
+    assert!((sim.clad_t_step_max - (FUEL_MODEL_T_MAX_C + 1.0)).abs() < 1e-9);
+    let n = envelope_errors(&sim);
     run(&mut sim, 1.0);
-    let n2 = sim.domain_errors.iter().filter(|(_, e)| matches!(e, DomainError::FuelModelEnvelope { .. })).count();
-    assert_eq!((n, n2), (1, 1), "envelope error recorded once");
+    assert_eq!((n, envelope_errors(&sim)), (1, 1), "envelope error recorded once");
     let s = sim.snapshot();
     assert!(s.fuel_envelope_exceeded);
     assert!(s.alarms.iter().any(|a| a.id == "fuel_envelope" && a.text == "FUEL THERMAL MODEL ENVELOPE EXCEEDED"));
-    assert!(s.alarms.iter().all(|a| !a.text.contains("CORE DAMAGE")), "core damage verdict must be gone");
+    assert!(s.alarms.iter().all(|a| !a.text.contains("DAMAGE")), "the damage verdict must be gone");
     assert!(s.unsupported.is_some(), "P3 unsupported flag must also be set");
 }
 
 #[test]
-fn prolonged_uncovery_raises_fuel_model_envelope() {
+fn sustained_cladding_exceedance_in_an_uncovered_hot_core_latches() {
+    // Post-step detection with a physically consistent fixture: an uncovered core
+    // (clad-coolant resistance at its 1/0.02 floor) with a hot fuel node keeps the
+    // cladding above the limit AFTER the thermal update, not only at entry.
     let mut sim = Sim::new(ScenarioName::FullPower);
     run(&mut sim, 1.0);
-    sim.uncovered_s = UNCOVERED_ENVELOPE_S - 2.0 * DT;
-    // A covered core resets the timer; an uncovered one accumulates it.
+    uncover_core(&mut sim);
+    sim.core.fuel_t = 1400.0;
+    sim.core.clad_t = 1400.0;
     run(&mut sim, DT);
-    assert_eq!(sim.uncovered_s, 0.0, "covered core must reset the timer");
-    sim.uncovered_s = UNCOVERED_ENVELOPE_S + DT;
-    sim.vessel_force_uncovered_for_test();
-    run(&mut sim, DT);
+    assert!(sim.core.clad_t > FUEL_MODEL_T_MAX_C, "fixture check: clad after the step is {}", sim.core.clad_t);
     assert!(sim.fuel_envelope_exceeded());
+    assert_eq!(envelope_errors(&sim), 1);
+}
+
+#[test]
+fn prolonged_uncovery_accumulates_resets_and_latches_once() {
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 1.0);
+    assert_eq!(sim.uncovered_s, 0.0, "covered at full power");
+    uncover_core(&mut sim);
+    let steps_to_limit = (UNCOVERED_ENVELOPE_S / DT).round() as usize;
+    // Just below the limit: accumulated, nothing raised.
+    for _ in 0..steps_to_limit - 1 {
+        sim.step(DT);
+        assert!(sim.vessel.core_coverage() < CORE_COVERED_FRAC, "fixture must stay uncovered at t={}", sim.time);
+    }
+    assert!((sim.uncovered_s - (UNCOVERED_ENVELOPE_S - DT)).abs() < 1e-6, "timer {}", sim.uncovered_s);
+    assert!(!sim.fuel_envelope_exceeded(), "below the limit");
+    // At the limit: the timer is a floating sum, so only its value is asserted here.
+    sim.step(DT);
+    assert!((sim.uncovered_s - UNCOVERED_ENVELOPE_S).abs() < 1e-6, "timer {}", sim.uncovered_s);
+    // Above the limit: raised once.
+    sim.step(DT);
+    assert!(sim.fuel_envelope_exceeded(), "above the limit");
+    run(&mut sim, 1.0);
+    assert_eq!(envelope_errors(&sim), 1, "latched once");
+    // Recovery with a consistent covered vessel resets the timer; the latch persists (P3).
+    recover_core(&mut sim);
+    sim.step(DT);
+    assert_eq!(sim.uncovered_s, 0.0, "covered core must reset the timer");
+    assert!(sim.fuel_envelope_exceeded());
+}
+
+#[test]
+fn brief_uncovery_resets_without_raising() {
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 1.0);
+    uncover_core(&mut sim);
+    run(&mut sim, 5.0);
+    assert!(sim.uncovered_s > 4.9 && sim.uncovered_s < 5.1, "timer {}", sim.uncovered_s);
+    recover_core(&mut sim);
+    sim.step(DT);
+    assert_eq!(sim.uncovered_s, 0.0);
+    assert!(!sim.fuel_envelope_exceeded());
 }
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --release -p bwr-core --test core_transients envelope 2>&1 | head -10`
-Expected: compile error `no method named fuel_envelope_exceeded` / `cannot find value FUEL_MODEL_T_MAX_C`.
+Run: `cargo test --release -p bwr-core --test core_transients envelope > /tmp/p5-t5-red.log 2>&1; echo exit=$?; grep -n "no method\|cannot find" /tmp/p5-t5-red.log`
+Expected: `exit=101`; compile error `no method named fuel_envelope_exceeded` / `cannot find value FUEL_MODEL_T_MAX_C`.
 
-- [ ] **Step 3: Parameters**
+- [ ] **Step 3: Parameters and their register rows**
 
 Append to `params.rs` core section:
 
@@ -1593,46 +1664,57 @@ pub const FUEL_MODEL_T_MAX_C: f64 = 1000.0;
 /// Continuous core-uncovered time after which the thermal model is outside
 /// its envelope (no post-dryout heat transfer modelled). ASSUMED (A-050).
 pub const UNCOVERED_ENVELOPE_S: f64 = 60.0;
+/// Core coverage fraction at or above which the core counts as covered (the
+/// uncovered timer and the low-coverage alarm share it). ASSUMED (A-050).
+pub const CORE_COVERED_FRAC: f64 = 0.999;
 ```
+
+`sim.rs` already compares `core_coverage()` with the literal `0.999` for the coverage alarm in `active_alarms()` (`grep -n "0.999" crates/bwr-core/src/sim.rs`); replace that literal with `CORE_COVERED_FRAC` so there is one definition.
+
+Append to `docs/model/parameters.csv`:
+
+```
+FUEL_MODEL_T_MAX_C,1000,degC,Cladding temperature above which the fuel thermal model is outside its envelope (indication not a damage limit),any,model,assumed,,none,none,A-050,crates/bwr-core/src/params.rs,raises DomainError::FuelModelEnvelope; checked on plant-step endpoints (core.md section 5)
+UNCOVERED_ENVELOPE_S,60,s,Continuous core-uncovered duration beyond which the thermal model is outside its envelope,any,model,assumed,,none,none,A-050,crates/bwr-core/src/params.rs,no post-dryout heat transfer modelled; strict limit
+CORE_COVERED_FRAC,0.999,-,Core coverage fraction at or above which the core counts as covered,any,model,assumed,,none,none,A-050,crates/bwr-core/src/params.rs,shared by the uncovered timer and the low-coverage alarm
+```
+
+(`none`/`none` intervals on `assumed` rows are allowed because A-050's Interval basis names these three as model-envelope choices without an interval.) Run `cargo test --release -p bwr-core --test register` (expected: all `ok`).
 
 - [ ] **Step 4: Engine changes in `sim.rs`**
 
-Remove the field `pub core_damage: bool,` from `Sim` and its initialiser `core_damage: false,` in `base()`. Add the field
+Locate the legacy damage verdict: `grep -n "damage" crates/bwr-core/src/sim.rs` (at the baseline: the `bool` field on `Sim`, its `false` initialiser in `base()`, the 1200 degC block in `protection()` that sets it and emits the event, and the alarm `add(...)` in `active_alarms()`). Remove the field and its initialiser. Add the fields
 
 ```rust
     /// Continuous time the core has been uncovered, s (envelope timer).
     pub uncovered_s: f64,
+    /// max(clad_t at step entry, clad_t at step exit) of the last plant step (envelope check).
+    pub clad_t_step_max: f64,
 ```
 
-initialised to `0.0` in `base()`.
+initialised to `0.0` and `0.0` in `base()`; `finalize_init` (P3) sets `clad_t_step_max = core.clad_t`.
 
-Add to `impl Sim` (P3's public `Sim::domain_error(e)` records the first occurrence of each variant and logs it; this package only adds the query and the test hook):
+Add to `impl Sim` (P3's public `Sim::domain_error(e)` records the first occurrence of each variant and logs it; this package only adds the query):
 
 ```rust
     pub fn fuel_envelope_exceeded(&self) -> bool {
         self.domain_errors.iter().any(|(_, e)| matches!(e, DomainError::FuelModelEnvelope { .. }))
     }
-
-    /// Test hook: drive the vessel level below the top of active fuel.
-    #[doc(hidden)]
-    pub fn vessel_force_uncovered_for_test(&mut self) {
-        self.vessel.level_z = Z_CORE_BOTTOM + 0.5 * CORE_HEIGHT;
-    }
 ```
 
-In `protection()`, replace the "Core damage" block
+In `step()`, record the entry cladding temperature before the core step and the endpoint maximum after it:
 
 ```rust
-        // Core damage.
-        if self.core.fuel_t > 1200.0 && !self.core_damage {
-            self.core_damage = true;
-            self.event("core_damage", "CORE DAMAGE: fuel temperature exceeded 1200 degC");
-        }
+        let clad_entry = self.core.clad_t;
+        let core_err = match self.core.step(dt, t_cool, cov) { /* unchanged P3 arms */ };
+        self.clad_t_step_max = clad_entry.max(self.core.clad_t);
 ```
-with
+
+In `protection()`, replace the 1200 degC block (the `if self.core.fuel_t > 1200.0 && ...` statement and its event) with
+
 ```rust
         // Fuel thermal model envelope (not a damage verdict; see docs/model/core.md section 5).
-        if self.core.clad_t > FUEL_MODEL_T_MAX_C || self.uncovered_s > UNCOVERED_ENVELOPE_S {
+        if self.clad_t_step_max > FUEL_MODEL_T_MAX_C || self.uncovered_s > UNCOVERED_ENVELOPE_S {
             self.domain_error(DomainError::FuelModelEnvelope { fuel_t_c: self.core.fuel_t, clad_t_c: self.core.clad_t });
         }
 ```
@@ -1640,25 +1722,19 @@ with
 In `step()`, immediately after `self.vessel.step(dt, &inputs)` (and the ledger record P2/P3 placed there), add:
 
 ```rust
-        let covered = self.vessel.core_coverage() >= 0.999;
+        let covered = self.vessel.core_coverage() >= CORE_COVERED_FRAC;
         self.uncovered_s = if covered { 0.0 } else { self.uncovered_s + dt };
 ```
 
-In `active_alarms()`, replace
+In `active_alarms()`, replace the legacy `add(...)` for the damage verdict with
 
-```rust
-        if self.core_damage {
-            add("core_damage", "CORE DAMAGE".into(), Severity::Trip);
-        }
-```
-with
 ```rust
         if self.fuel_envelope_exceeded() {
             add("fuel_envelope", "FUEL THERMAL MODEL ENVELOPE EXCEEDED".into(), Severity::Trip);
         }
 ```
 
-Add `use crate::domain::DomainError;` to the imports if absent.
+Add `use crate::domain::DomainError;` to the imports if absent. Afterwards `grep -n "damage" crates/bwr-core/src/sim.rs` must show only the comment "not a damage verdict".
 
 - [ ] **Step 5: API and UI**
 
@@ -1671,21 +1747,25 @@ Add `use crate::domain::DomainError;` to the imports if absent.
   fuelEnvelopeExceeded: boolean;
 ```
 
-Run: `grep -rn "CORE DAMAGE\|coreDamage\|core_damage" ui/src`
-For each hit in `ui/src/sim/mock.ts`: replace the alarm id `core_damage` with `fuel_envelope`, the text `CORE DAMAGE...` with `FUEL THERMAL MODEL ENVELOPE EXCEEDED`, rename any `coreDamage` hidden-state field to `fuelEnvelopeExceeded`, and emit `fuelEnvelopeExceeded: <that field>` at the top level of the mock snapshot next to `scramReason`. For hits in `ui/src/components/*`: replace the displayed string with `FUEL MODEL ENVELOPE` and read `s.fuelEnvelopeExceeded` instead of matching alarm text. If `grep` returns no component hits, only `mock.ts` changes.
+`ui/src/sim/mock.ts` holds no legacy damage string (verified at the baseline), so the edits are unconditional:
+
+1. In `blankSnapshot()`, directly after the line `scramReason: null,` add `fuelEnvelopeExceeded: false,` (top level of the returned object, matching the Rust field position).
+2. Reset/update policy for the demo: `loadScenario` rebuilds the snapshot from `blankSnapshot()` (the `const s = blankSnapshot();` in the scenario loader), which resets the flag to `false` on every scenario load, mirroring the engine's `LoadScenario` behaviour. In the per-tick alarm table (the array of `[id, text, severity, condition]` rows that contains `["scram", ...]`), add the row `["fuel_envelope", "FUEL THERMAL MODEL ENVELOPE EXCEEDED", "trip", s.fuelEnvelopeExceeded]`, and immediately before that table is evaluated set `s.fuelEnvelopeExceeded = s.fuelEnvelopeExceeded || s.neutronics.cladTempC > 1000;` (latching, demo-only; the mock is a UI demonstration, master "Keep Rust authoritative"). Leave the existing `["fuel", "FUEL TEMP HIGH", ...]` row as it is (it is an indication, not a verdict).
+
+No UI component renders a damage verdict at the baseline (`rg -n "DAMAGE" ui/src` is empty); if one appears from a later package, read `s.fuelEnvelopeExceeded` and show `FUEL MODEL ENVELOPE`.
 
 - [ ] **Step 6: Run tests, typecheck, build**
 
-Run: `cargo test --release -p bwr-core 2>&1 | grep -E "^test |test result"`
-Expected: all `ok`.
+Run: `set -o pipefail; cargo test --release -p bwr-core 2>&1 | tee /tmp/p5-t5.log | grep -E "^test |test result"`
+Expected: exit 0; all `ok`, including the four envelope tests and `register`.
 
-Run: `npm --prefix ui run typecheck && npm --prefix ui run build 2>&1 | tail -3`
-Expected: typecheck silent; build ends with `✓ built in ...`.
+Run: `npm --prefix ui run typecheck && npm --prefix ui run build > /tmp/p5-t5-ui.log 2>&1; echo exit=$?; tail -3 /tmp/p5-t5-ui.log`
+Expected: `exit=0`; typecheck silent; build ends with `✓ built in ...`.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/bwr-core/src/params.rs crates/bwr-core/src/sim.rs crates/bwr-core/src/api.rs crates/bwr-core/tests/core_transients.rs ui/src
+git add crates/bwr-core/src/params.rs crates/bwr-core/src/sim.rs crates/bwr-core/src/api.rs docs/model/parameters.csv crates/bwr-core/tests/core_transients.rs ui/src
 git commit -m "feat(core): fuel thermal model envelope replaces the 1200 degC core damage verdict
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -1696,37 +1776,58 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ### Task 6: Decay heat reference, fit tool, and finite irradiation history
 
 **Files:**
-- Create: `docs/model/decay-heat-reference.csv`
+- Modify: `docs/validation/findings.md` (F-nnn: reference retrieval outcome; fit-gate outcome if taken)
+- Create (retrieved branch only): `docs/model/decay-heat-reference.csv`
 - Rewrite: `tools/fit_decay_heat.py`
-- Modify: `crates/bwr-core/src/params.rs` (`DECAY_GROUPS` regenerated, `IRRADIATION_HISTORY_S`)
+- Modify: `crates/bwr-core/src/params.rs` (`DECAY_GROUPS` regenerated in the retrieved branch; `IRRADIATION_HISTORY_S`; `DECAY_FIT_MAX_REL_ERR` in the retrieved branch), `docs/model/parameters.csv` (their rows)
 - Modify: `crates/bwr-core/src/reactor.rs` (`DecayHeat::after_history`, tests)
 - Modify: `crates/bwr-core/src/sim.rs` (scenario initialisation)
-- Modify: `docs/model/sources.csv`, `README.md`
+- Modify: `docs/model/sources.csv` (retrieved branch), `docs/model/core.md` section 6, `README.md`
 
 **Interfaces:**
-- Produces: `DecayHeat::after_history(n: f64, irr_s: f64, cooled_s: f64) -> DecayHeat`, `IRRADIATION_HISTORY_S`.
+- Produces: `DecayHeat::after_history(n: f64, irr_s: f64, cooled_s: f64) -> DecayHeat`, `IRRADIATION_HISTORY_S`; retrieved branch also `DECAY_FIT_MAX_REL_ERR`.
 
-- [ ] **Step 1: Transcribe the reference table**
+The central numerical input of this task is a public reference table that this plan cannot transcribe (no edition of ANSI/ANS-5.1 or the textbook table was readable when the plan was written, and values are never typed from memory). Step 1 is therefore a bounded evidence task whose recorded outcome selects one of two explicit branches; neither branch is silent.
+
+- [ ] **Step 1: Bounded evidence task: identify and record the decay-heat reference**
+
+Time box: one working session, at most two hours. Try the candidates in order and stop at the first that can actually be opened and read page by page; never type values from memory or from a secondary quotation.
+
+1. ANSI/ANS-5.1 (2014, 2005 or 1979 edition): the table of total decay-heat fraction P/P0 for U-235 thermal fission after infinite irradiation (the "infinite operation" / 1e13 s column). A purchased or library copy only.
+2. A public NRC document that reproduces the ANS-5.1-1979 total-decay-heat table (search NRC ADAMS for "ANS-5.1" "decay heat" "fraction of operating power"). Use it only if the PDF opens and the table is legible and attributed.
+3. Todreas and Kazimi, Nuclear Systems Volume 1, 2nd ed. (S-STD-04, Chapter 3): the tabulated decay-heat values, if the chapter in hand contains a table and not only the 0.066 t^-0.2 approximation.
+
+Record the outcome in `docs/validation/findings.md` as the next free `F-nnn` entry: `F-nnn decay-heat reference: retrieved | unavailable`, with document id, edition/revision, table number, page, retrieval date, sha256 (if a file), and the reference-state definition exactly as the table states it: fissioning nuclide mix (U-235 thermal only; with or without the U-238 capture contribution), irradiation history (infinite or which finite value), normalisation (fraction of operating power), included contributions (fission products only; actinides; neutron capture in fission products), and the stated uncertainty. If a candidate was found but any of those five items is not stated, record `unavailable` with that reason: a table whose reference state is unknown is not a validation reference.
+
+Branch selection for every following step:
+
+- **retrieved**: add the document to `docs/model/sources.csv` (12 columns `id,document_id,title,revision,date,jurisdiction,url,section,retrieval_date,sha256,kind,notes`; `kind` `standard` or `textbook`; `section` = the table identifier; no `UNRETRIEVED` field, P1 rule), then Steps 1b-7 as written.
+- **unavailable**: no CSV and no fit. `DECAY_GROUPS` keeps its current values; its P1 row's `notes` becomes `refit deferred: no readable public reference table (F-nnn); fit target remains the 0.066 t^-0.2 approximation (S-STD-04)` (status stays `calibrated`). Steps 3-5 implement only `after_history` and `IRRADIATION_HISTORY_S`; the reference test is written in its `#[ignore]` form (Step 3) so the gap is recorded, never skipped silently; Step 6 uses the unavailable wording.
+
+- [ ] **Step 1b (retrieved branch): Transcribe the table and freeze it**
 
 Create `docs/model/decay-heat-reference.csv` with the header
 
 ```
-t_s,p_over_p0,source
+t_s,p_over_p0,source_id,table,page
 ```
 
-and at least 12 rows transcribed from ONE named public reference for total decay heat after infinite irradiation at constant power. Acceptable choices: the ANSI/ANS-5.1 (any public edition) total-decay-heat table, or the Todreas & Kazimi *Nuclear Systems I* decay-heat table that the previous `fit_decay_heat.py` docstring cited. The `source` column holds the sources.csv document ID plus table/figure number, for example `TK-NS1,Table 3-?` (replace `?` with the actual table number from the book in hand). Cover at least 1 s, 10 s, 100 s, 1000 s, 1 h, 1 day, 1 week, 30 days. Add the document to `docs/model/sources.csv` with the fields P1 requires (ID, title, revision/edition, date, URL or ISBN, pages, retrieval date, checksum if a file). Do not type values from memory: transcribe from the open document and record the page.
+and one row per table point (at least 12; include 1 s, 10 s, 100 s, 1000 s, 1 h, 1 day, 1 week and 30 days when the table has them). `source_id` is the sources.csv id; `table` and `page` identify the table and page. Transcription check: a second pass reads the CSV back against the open document row by row; record `transcription checked <date>, sha256 <value>` (`shasum -a 256 docs/model/decay-heat-reference.csv`) in the F-nnn entry. From this point the CSV is immutable: the fit tool only reads it, and no later step edits a value to improve a fit. A transcription error found later is a new findings entry with the corrected sha256, never a silent edit.
 
-- [ ] **Step 2: Rewrite `tools/fit_decay_heat.py`**
+- [ ] **Step 2 (retrieved branch): Rewrite `tools/fit_decay_heat.py`**
 
 ```python
 """Fit exponential decay-heat groups to a transcribed public reference curve.
 
 Usage:
-    python3 tools/fit_decay_heat.py docs/model/decay-heat-reference.csv [--groups 9] [--max-rel-err 0.05]
+    python3 tools/fit_decay_heat.py docs/model/decay-heat-reference.csv [--groups 9] [--max-rel-err 0.05] [--report PATH]
 
-Prints the DECAY_GROUPS block for crates/bwr-core/src/params.rs on stdout and a
-point-by-point comparison on stderr. Exits 1 if the maximum relative error of
-the fit against the reference points exceeds --max-rel-err.
+Reads the reference CSV (never writes it). Prints the DECAY_GROUPS block for
+crates/bwr-core/src/params.rs on stdout and a point-by-point residual table on
+stderr (and to --report when given). Exits 1 if the maximum relative error of
+the fit against the reference points exceeds --max-rel-err. An exit of 1 means
+the chosen basis cannot represent the reference to the gate; it never means the
+reference should be changed.
 """
 import argparse
 import csv
@@ -1738,9 +1839,10 @@ from scipy.optimize import nnls
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("csv", help="reference table with columns t_s,p_over_p0,source")
+    ap.add_argument("csv", help="reference table with columns t_s,p_over_p0,source_id,table,page")
     ap.add_argument("--groups", type=int, default=9)
     ap.add_argument("--max-rel-err", type=float, default=0.05)
+    ap.add_argument("--report", help="also write the residual table to this path")
     args = ap.parse_args()
 
     t, p, sources = [], [], set()
@@ -1748,7 +1850,7 @@ def main() -> int:
         for row in csv.DictReader(f):
             t.append(float(row["t_s"]))
             p.append(float(row["p_over_p0"]))
-            sources.add(row["source"])
+            sources.add(f'{row["source_id"]} {row["table"]}')
     if len(t) < 12:
         print(f"need at least 12 reference points, got {len(t)}", file=sys.stderr)
         return 1
@@ -1776,11 +1878,15 @@ def main() -> int:
         print(f"    ({ff:.6e}, {lam:.6e}),")
     print("];")
 
-    print(f"sum f = {f.sum():.5f}", file=sys.stderr)
+    lines = [f"groups={args.groups}  sum f = {f.sum():.5f}  max rel err = {err:.3%}"]
     for tt, pp, ff in zip(t, p, ref_fit):
-        print(f"t={tt:10.0f}  ref={pp:.5f}  fit={ff:.5f}  rel={ff / pp - 1:+.3%}", file=sys.stderr)
+        lines.append(f"t={tt:10.0f}  ref={pp:.5f}  fit={ff:.5f}  rel={ff / pp - 1:+.3%}")
+    print("\n".join(lines), file=sys.stderr)
+    if args.report:
+        with open(args.report, "w") as rep:
+            rep.write("\n".join(lines) + "\n")
     if err > args.max_rel_err:
-        print(f"fit error {err:.2%} exceeds {args.max_rel_err:.0%}", file=sys.stderr)
+        print(f"fit error {err:.2%} exceeds {args.max_rel_err:.0%} with {args.groups} groups (basis limitation; do not edit the reference)", file=sys.stderr)
         return 1
     return 0
 
@@ -1789,12 +1895,24 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-Run: `python3 tools/fit_decay_heat.py docs/model/decay-heat-reference.csv > /tmp/decay_groups.rs; echo exit=$?`
-Expected: `exit=0`, and `/tmp/decay_groups.rs` holds a 9-row `DECAY_GROUPS` block. If the exit code is 1, the transcription has an error or the reference needs more points; fix the CSV, do not loosen `--max-rel-err`.
+Run: `python3 tools/fit_decay_heat.py docs/model/decay-heat-reference.csv --groups 9 --report /tmp/decay_fit_9.txt > /tmp/decay_groups.rs; echo exit=$?`
+Expected: `exit=0` and `/tmp/decay_groups.rs` holds a 9-row `DECAY_GROUPS` block; `DECAY_FIT_MAX_REL_ERR` is then `0.05` and the `DECAY_GROUPS` row status `derived`.
+
+**Predeclared failure procedure** (`exit=1`): nine fixed log-spaced decay constants are not guaranteed to represent an arbitrary table to 5 %, and an error above 5 % is not evidence of a transcription error. The CSV is not touched. (1) Keep `/tmp/decay_fit_9.txt` (per-point residuals). (2) Rerun with `--groups 11`, then `--groups 13` (the basis changes, not the source; `DecayHeat::d` is `[f64; 9]` today, so a larger count changes that array length and the declared length of `DECAY_GROUPS` together, and `after_history` below uses `DECAY_GROUPS.len()`). (3) If 13 groups still exceed 5 %, take the group count with the smallest maximum error, set `DECAY_FIT_MAX_REL_ERR` to that error rounded up to the next 0.005, set the `DECAY_GROUPS` row status to `calibrated` with the measured error and group count in `notes`, and add a findings entry `F-nnn decay-heat fit: <err> % with <k> groups exceeds the 5 % gate; representation limited` so the limitation is visible wherever decay heat is cited. The Rust test (Step 3) asserts against `DECAY_FIT_MAX_REL_ERR`, so the gate is never loosened silently: the registered number plus the finding is the record. Never edit a reference value, remove a reference point, or adjust the weighting to pass.
 
 - [ ] **Step 3: Write the failing Rust tests**
 
-In `reactor.rs` `mod tests`, replace `decay_heat_curve` with:
+In `reactor.rs` `mod tests`, replace `decay_heat_curve` with the tests below. In the **unavailable** branch, `decay_reference` is omitted and the first test is written instead as
+
+```rust
+    #[test]
+    #[ignore = "F-nnn: decay-heat reference unavailable; DECAY_GROUPS remain the 0.066 t^-0.2 fit (S-STD-04)"]
+    fn decay_heat_matches_transcribed_reference_within_registered_error() {
+        panic!("F-nnn: no readable public decay-heat reference table; see docs/validation/findings.md");
+    }
+```
+
+(the findings.md convention: recorded and `#[ignore]`d with its id, never deleted). Retrieved branch:
 
 ```rust
     fn decay_reference() -> Vec<(f64, f64)> {
@@ -1811,12 +1929,15 @@ In `reactor.rs` `mod tests`, replace `decay_heat_curve` with:
     }
 
     #[test]
-    fn decay_heat_matches_transcribed_reference_within_5_percent() {
+    fn decay_heat_matches_transcribed_reference_within_registered_error() {
+        // The gate is the registered DECAY_FIT_MAX_REL_ERR: 0.05 when the fit met the
+        // 5 % target, or the recorded larger value (status calibrated + findings entry)
+        // when the predeclared failure path was taken. Either way the number is on record.
         let r = decay_reference();
         assert!(r.len() >= 12, "reference needs >= 12 points");
         for (t, p) in r {
             let got = DecayHeat::after_shutdown(t).power();
-            assert!((got / p - 1.0).abs() < 0.05, "t={t}: fit {got} vs reference {p}");
+            assert!((got / p - 1.0).abs() < DECAY_FIT_MAX_REL_ERR, "t={t}: fit {got} vs reference {p} (gate {DECAY_FIT_MAX_REL_ERR})");
         }
     }
 
@@ -1849,17 +1970,40 @@ In `reactor.rs` `mod tests`, replace `decay_heat_curve` with:
     }
 ```
 
-Run: `cargo test --release -p bwr-core --lib decay 2>&1 | head -10`
-Expected: compile error `no function or associated item named after_history`.
+Run: `cargo test --release -p bwr-core --lib decay > /tmp/p5-t6-red.log 2>&1; echo exit=$?; grep -n "no function\|cannot find" /tmp/p5-t6-red.log`
+Expected: `exit=101`; compile error `no function or associated item named after_history`.
 
-- [ ] **Step 4: Implement**
+- [ ] **Step 4: Implement, and register every constant touched (same task)**
 
-`params.rs`: replace the existing `DECAY_GROUPS` doc comment and array with the contents of `/tmp/decay_groups.rs`. Append after it:
+`params.rs`, retrieved branch: replace the existing `DECAY_GROUPS` doc comment and array with the contents of `/tmp/decay_groups.rs` and append
+
+```rust
+/// Maximum relative error of the DECAY_GROUPS fit at the reference points, as measured
+/// by tools/fit_decay_heat.py (0.05 when the 5 % gate was met; otherwise the recorded
+/// value with status calibrated and a findings entry). DERIVED.
+pub const DECAY_FIT_MAX_REL_ERR: f64 = 0.05;
+```
+
+Unavailable branch: `DECAY_GROUPS` is untouched. Both branches append:
 
 ```rust
 /// Irradiation time at rated power assumed before each scenario's cooling period, s (2 years). ASSUMED (A-052).
 pub const IRRADIATION_HISTORY_S: f64 = 6.31e7;
 ```
+
+`docs/model/parameters.csv`, both branches, append:
+
+```
+IRRADIATION_HISTORY_S,6.31e7,s,Irradiation time at rated power assumed before each scenario cooling period (2 years),scenario init,BWRX-300,assumed,,3.0e7,1.3e8,A-052,crates/bwr-core/src/params.rs,used by cold_shutdown and hot_standby via DecayHeat::after_history
+```
+
+Retrieved branch, also: update P1's `DECAY_GROUPS` row in place to `DECAY_GROUPS,<k> pairs (see params.rs),fraction;1/s,Decay-heat group amplitudes and decay constants,<reference state from the F-nnn entry>,reference table,<derived | calibrated>,<new source id>,,,A-053,params.rs,fit by tools/fit_decay_heat.py to decay-heat-reference.csv (sha256 <value>); max rel err <value> with <k> groups; F-nnn` and append
+
+```
+DECAY_FIT_MAX_REL_ERR,<0.05 or the recorded value>,-,Maximum relative error of the DECAY_GROUPS fit at the reference points,reference table points,derived,derived,,,,A-053,crates/bwr-core/src/params.rs,measured by tools/fit_decay_heat.py on <date>; gate of the decay-heat reference test
+```
+
+Unavailable branch, also: update the `DECAY_GROUPS` row `notes` as Step 1 states (F-nnn, refit deferred). Then `cargo test --release -p bwr-core --test register` (expected: all `ok`).
 
 `reactor.rs`, in `impl DecayHeat`, add after `after_shutdown`:
 
@@ -1867,7 +2011,7 @@ pub const IRRADIATION_HISTORY_S: f64 = 6.31e7;
     /// Decay heat after operating `irr_s` seconds at relative power `n`, then
     /// cooling for `cooled_s` seconds. `irr_s = f64::INFINITY` reproduces `after_shutdown`.
     pub fn after_history(n: f64, irr_s: f64, cooled_s: f64) -> Self {
-        let mut d = [0.0; 9];
+        let mut d = [0.0; DECAY_GROUPS.len()];
         for (i, (f, l)) in DECAY_GROUPS.iter().enumerate() {
             d[i] = f * n * (1.0 - (-l * irr_s).exp()) * (-l * cooled_s).exp();
         }
@@ -1875,22 +2019,27 @@ pub const IRRADIATION_HISTORY_S: f64 = 6.31e7;
     }
 ```
 
+(`DecayHeat.d` is declared `[f64; 9]` at the baseline; if the predeclared failure path changed the group count, change that declaration to `[f64; DECAY_GROUPS.len()]` in the same commit.)
+
 `sim.rs`: in `cold_shutdown()` replace `core.decay = DecayHeat::after_shutdown(30.0 * 86400.0);` with `core.decay = DecayHeat::after_history(1.0, IRRADIATION_HISTORY_S, 30.0 * 86400.0);` and in `hot_standby()` replace `DecayHeat::after_shutdown(2.0 * 86400.0)` with `DecayHeat::after_history(1.0, IRRADIATION_HISTORY_S, 2.0 * 86400.0)`.
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test --release -p bwr-core 2>&1 | grep -E "^test |test result"`
-Expected: all `ok`. If `plant::cold_shutdown_is_subcritical_and_rods_blocked` or `plant::startup_from_hot_standby_to_30_percent` changes outcome, the cause is the refit, not the history term (the history term lowers decay heat by < 10 %); investigate the refit before touching assertions.
+Run: `set -o pipefail; cargo test --release -p bwr-core 2>&1 | tee /tmp/p5-t6.log | grep -E "^test |test result"`
+Expected: exit 0; all `ok` (the unavailable branch shows the reference test as `ignored`). If `plant::cold_shutdown_is_subcritical_and_rods_blocked` or `plant::startup_from_hot_standby_to_30_percent` changes outcome, the cause is the refit, not the history term (the history term lowers decay heat by < 10 %); investigate the refit before touching assertions.
 
-- [ ] **Step 6: README wording**
+- [ ] **Step 6: Wording in core.md and README**
 
-In `README.md` table row "Decay heat", replace `9-group fit to the standard decay heat curve (7.7 % at shutdown, 1.3 % after 1 h)` with `9-group fit to a transcribed public decay-heat table (docs/model/decay-heat-reference.csv), with finite irradiation history`. In the "Fuel" row replace `core damage above 1200 °C` with `an explicit model envelope flag instead of a damage verdict`.
+Complete `docs/model/core.md` section 6 with the branch taken: the F-nnn id, the source id and table, the reference state, the group count and the measured maximum relative error with its gate (retrieved), or the sentence "Reference unavailable (F-nnn): the groups remain the fit to the 0.066 t^-0.2 approximation (S-STD-04); the 5 % gate is not claimed" (unavailable).
+
+In `README.md` table row "Decay heat", replace `9-group fit to the standard decay heat curve (7.7 % at shutdown, 1.3 % after 1 h)` with, retrieved: `<k>-group fit to a transcribed public decay-heat table (docs/model/decay-heat-reference.csv; max error <value>), with finite irradiation history`; unavailable: `9-group fit to the 0.066 t^-0.2 approximation (no public reference table retrieved, see docs/validation/findings.md), with finite irradiation history`. In the "Fuel" row replace `core damage above 1200 °C` with `an explicit model envelope flag instead of a damage verdict`.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add docs/model/decay-heat-reference.csv docs/model/sources.csv tools/fit_decay_heat.py crates/bwr-core/src/params.rs crates/bwr-core/src/reactor.rs crates/bwr-core/src/sim.rs README.md
-git commit -m "feat(core): decay heat fitted to a transcribed public reference with finite irradiation history
+git add docs/validation/findings.md docs/model/sources.csv docs/model/parameters.csv docs/model/core.md tools/fit_decay_heat.py crates/bwr-core/src/params.rs crates/bwr-core/src/reactor.rs crates/bwr-core/src/sim.rs README.md
+git add docs/model/decay-heat-reference.csv 2>/dev/null || true   # retrieved branch only
+git commit -m "feat(core): decay heat reference evidence task, fit gate, finite irradiation history
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -1959,8 +2108,8 @@ In `reactor.rs` `mod tests`, add (keep `xenon_peaks_after_shutdown`):
 
 - [ ] **Step 2: Run**
 
-Run: `cargo test --release -p bwr-core --lib xenon 2>&1 | grep -E "^test |test result"`
-Expected: 4 xenon tests `ok`. If `power_rise_from_50_to_100_percent_dips_xenon_first` fails, the model's burnout term is wrong; do not change the test threshold, investigate `Xenon::step`.
+Run: `set -o pipefail; cargo test --release -p bwr-core --lib xenon 2>&1 | tee /tmp/p5-t7.log | grep -E "^test |test result"`
+Expected: exit 0; 4 xenon tests `ok`. If `power_rise_from_50_to_100_percent_dips_xenon_first` fails, the model's burnout term is wrong; do not change the test threshold, investigate `Xenon::step`.
 
 - [ ] **Step 3: Commit**
 
@@ -2020,8 +2169,8 @@ fn full_power_with_stronger_void_coefficient_is_critical_with_fewer_rods_in() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --release -p bwr-core --test core_transients coeffs 2>&1 | head -10`
-Expected: compile error `cannot find type ReactivityCoeffs`.
+Run: `cargo test --release -p bwr-core --test core_transients coeffs > /tmp/p5-t8-red.log 2>&1; echo exit=$?; grep -n "cannot find" /tmp/p5-t8-red.log`
+Expected: `exit=101`; compile error `cannot find type ReactivityCoeffs`.
 
 - [ ] **Step 3: Implement `ReactivityCoeffs`**
 
@@ -2096,8 +2245,8 @@ Add `ReactivityCoeffs` to the `crate::reactor` import in `sim.rs`.
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test --release -p bwr-core 2>&1 | grep -E "^test |test result"`
-Expected: all `ok`; the `full_power_rod_insertion_fraction` test prints the fraction (run with `-- --nocapture` to see it) and it sits inside 5-25 %.
+Run: `set -o pipefail; cargo test --release -p bwr-core 2>&1 | tee /tmp/p5-t8.log | grep -E "^test |test result"`
+Expected: exit 0; all `ok`; the `full_power_rod_insertion_fraction` test prints the fraction (run with `-- --nocapture` to see it) and it sits inside 5-25 %.
 
 - [ ] **Step 6: Commit**
 
@@ -2118,38 +2267,167 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Produces: `Rods::shutdown_margin(&self, rho_other: f64, withdrawn: &[usize]) -> f64`, `Rods::strongest_rod(&self) -> usize`.
-- Consumes: `docs/model/parameters.csv` row `SDM_REQUIRED` (Task 1).
+- Consumes: `docs/model/parameters.csv` row `SDM_REQUIRED` (Task 1); core.md section 4 for the threshold's applicability (strongest-single-rod-out, cold xenon-free only) and the paired-rod case (`unavailable`).
 
 - [ ] **Step 1: Write the failing tests**
 
 Append to `crates/bwr-core/tests/core_transients.rs`:
 
 ```rust
-/// `SDM_REQUIRED` from parameters.csv (locked header; row found by `id`, columns by name) if its
-/// status is `confirmed`; None otherwise. Rows read here must not contain quoted commas.
-fn sdm_required() -> Option<f64> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/model/parameters.csv");
-    let text = std::fs::read_to_string(path).ok()?;
-    let mut lines = text.lines();
-    let header: Vec<&str> = lines.next()?.split(',').map(|s| s.trim()).collect();
-    let id_i = header.iter().position(|h| *h == "id")?;
-    let value_i = header.iter().position(|h| *h == "value")?;
-    let status_i = header.iter().position(|h| *h == "status")?;
-    for line in lines {
-        let cols: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-        if cols.get(id_i) == Some(&"SDM_REQUIRED") && cols.get(status_i) == Some(&"confirmed") {
-            return cols.get(value_i)?.parse().ok();
-        }
-    }
-    None
+/// Outcome of reading the SDM_REQUIRED row (locked header; row by `id`, columns by name).
+#[derive(Debug, PartialEq)]
+enum SdmRequirement {
+    Confirmed(f64),
+    Unavailable,
 }
 
-fn assert_sdm(label: &str, sdm: f64) {
-    println!("SDM {label}: {:.4} dk/k ({:.0} pcm)", sdm, sdm * 1e5);
-    match sdm_required() {
-        Some(req) => assert!(sdm >= req, "{label}: SDM {sdm} below sourced requirement {req}"),
-        None => assert!(sdm > 0.0, "{label}: SDM {sdm} not positive (SDM_REQUIRED unavailable)"),
+/// Strict reader: any I/O, header, row or value problem is an Err (and a test failure),
+/// never a silent downgrade. Only a well-formed `unavailable` row yields `Unavailable`.
+/// Rows read here must not contain quoted commas (P1 shape rule).
+fn parse_sdm_required(text: &str) -> Result<SdmRequirement, String> {
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().ok_or("empty parameters.csv")?.split(',').map(str::trim).collect();
+    let col = |name: &str| header.iter().position(|h| *h == name).ok_or_else(|| format!("missing column {name}"));
+    let (id_i, value_i, status_i) = (col("id")?, col("value")?, col("status")?);
+    let rows: Vec<Vec<&str>> = lines
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.split(',').map(str::trim).collect::<Vec<&str>>())
+        .filter(|c| c.get(id_i) == Some(&"SDM_REQUIRED"))
+        .collect();
+    let row = match rows.as_slice() {
+        [row] => row,
+        [] => return Err("no SDM_REQUIRED row".into()),
+        _ => return Err(format!("{} SDM_REQUIRED rows", rows.len())),
+    };
+    if row.len() != header.len() {
+        return Err(format!("SDM_REQUIRED row has {} fields, header has {}", row.len(), header.len()));
     }
+    let (value, status) = (row[value_i], row[status_i]);
+    match status {
+        "confirmed" => {
+            let v: f64 = value.parse().map_err(|e| format!("confirmed SDM_REQUIRED value {value:?} unparseable: {e}"))?;
+            if !(v.is_finite() && v > 0.0) {
+                return Err(format!("confirmed SDM_REQUIRED value {v} is not a positive finite margin"));
+            }
+            Ok(SdmRequirement::Confirmed(v))
+        }
+        "unavailable" => {
+            if !value.is_empty() {
+                return Err(format!("unavailable SDM_REQUIRED row carries a value {value:?}"));
+            }
+            Ok(SdmRequirement::Unavailable)
+        }
+        other => Err(format!("SDM_REQUIRED status {other:?} is neither confirmed nor unavailable")),
+    }
+}
+
+fn sdm_required() -> SdmRequirement {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/model/parameters.csv");
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+    parse_sdm_required(&text).unwrap_or_else(|e| panic!("parameters.csv SDM_REQUIRED: {e}"))
+}
+
+/// Gate logic, separated so it can be tested without the real register. `governed` says
+/// whether SDM_REQUIRED applies to the configuration (core.md section 4: the cold
+/// xenon-free strongest-single-rod-out case only). A confirmed requirement is applied
+/// to every governed case and never falls back to positivity; ungoverned cases and the
+/// unavailable requirement check positivity only.
+fn sdm_check(req: &SdmRequirement, governed: bool, sdm: f64) -> Result<&'static str, String> {
+    if !(sdm.is_finite() && sdm > 0.0) {
+        return Err(format!("SDM {sdm} not a positive finite margin"));
+    }
+    match (req, governed) {
+        (SdmRequirement::Confirmed(r), true) if sdm < *r => Err(format!("SDM {sdm} below sourced requirement {r}")),
+        (SdmRequirement::Confirmed(_), true) => Ok("meets sourced requirement"),
+        (SdmRequirement::Confirmed(_), false) => Ok("positive; sourced requirement not applicable to this configuration"),
+        (SdmRequirement::Unavailable, _) => Ok("positive; SDM_REQUIRED unavailable"),
+    }
+}
+
+fn assert_sdm(label: &str, sdm: f64, governed: bool) {
+    match sdm_check(&sdm_required(), governed, sdm) {
+        Ok(note) => println!("SDM {label}: {:.4} dk/k ({:.0} pcm): {note}", sdm, sdm * 1e5),
+        Err(e) => panic!("{label}: {e}"),
+    }
+}
+
+#[test]
+fn sdm_reader_fails_loudly_on_missing_or_malformed_rows() {
+    let hdr = "id,value,unit,definition,reference_state,source_design,status,source_ids,interval_lo,interval_hi,assumption_id,location,notes";
+    assert_eq!(parse_sdm_required(&format!("{hdr}\nSDM_REQUIRED,0.0038,dk/k,d,r,s,confirmed,S-08,,,,loc,n")), Ok(SdmRequirement::Confirmed(0.0038)));
+    assert_eq!(parse_sdm_required(&format!("{hdr}\nSDM_REQUIRED,,dk/k,d,r,s,unavailable,,none,none,,loc,n")), Ok(SdmRequirement::Unavailable));
+    let bad: Vec<(String, &str)> = vec![
+        (String::new(), "empty file"),
+        (hdr.to_string(), "header only"),
+        (format!("{hdr}\nOTHER,1,u,d,r,s,confirmed,,,,,l,n"), "missing row"),
+        (format!("{hdr}\nSDM_REQUIRED,0.004,u,d,r,s,confirmed,,,,,l,n\nSDM_REQUIRED,0.004,u,d,r,s,confirmed,,,,,l,n"), "duplicate row"),
+        (format!("{hdr}\nSDM_REQUIRED,abc,u,d,r,s,confirmed,,,,,l,n"), "unparseable confirmed value"),
+        (format!("{hdr}\nSDM_REQUIRED,NaN,u,d,r,s,confirmed,,,,,l,n"), "non-finite confirmed value"),
+        (format!("{hdr}\nSDM_REQUIRED,-0.01,u,d,r,s,confirmed,,,,,l,n"), "negative confirmed value"),
+        (format!("{hdr}\nSDM_REQUIRED,,u,d,r,s,confirmed,,,,,l,n"), "empty confirmed value"),
+        (format!("{hdr}\nSDM_REQUIRED,0.004,u,d,r,s,assumed,,,,,l,n"), "unexpected status"),
+        (format!("{hdr}\nSDM_REQUIRED,0.004,u,d,r,s,unavailable,,none,none,,l,n"), "unavailable row with a value"),
+        (format!("{hdr}\nSDM_REQUIRED,0.004,u,d,r,s,confirmed,,,,l"), "short row"),
+        ("id,unit,status\nSDM_REQUIRED,u,confirmed".to_string(), "missing value column"),
+    ];
+    for (text, why) in &bad {
+        let got = parse_sdm_required(text);
+        assert!(got.is_err(), "{why}: must be an error, got {got:?}");
+    }
+}
+
+#[test]
+fn confirmed_requirement_never_falls_back_to_positivity() {
+    let req = SdmRequirement::Confirmed(0.0038);
+    assert!(sdm_check(&req, true, 0.0030).is_err(), "below a confirmed requirement must fail");
+    assert!(sdm_check(&req, true, 0.0040).is_ok());
+    assert!(sdm_check(&req, false, 0.0030).is_ok(), "ungoverned configurations are positivity-only");
+    assert!(sdm_check(&SdmRequirement::Unavailable, true, 0.0001).is_ok());
+    for bad in [0.0, -0.01, f64::NAN, f64::INFINITY] {
+        assert!(sdm_check(&SdmRequirement::Unavailable, false, bad).is_err(), "{bad}");
+    }
+    // The real register must parse: a corrupted or missing row is a failure, not None.
+    let _ = sdm_required();
+}
+
+/// Independent construction of a configuration: explicit rod positions evaluated through
+/// the production reactivity path, compared with `shutdown_margin`.
+fn sdm_from_positions(withdrawn: &[usize], rho_other: f64) -> f64 {
+    let mut r = Rods::new(0.0);
+    for &i in withdrawn {
+        r.pos[i] = ROD_FULL_OUT;
+    }
+    -(RHO_EXCESS_COLD + rho_other + r.reactivity())
+}
+
+fn rods_by_descending_weight(rods: &Rods) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..N_RODS).collect();
+    order.sort_by(|&a, &b| rods.weights[b].partial_cmp(&rods.weights[a]).unwrap());
+    order
+}
+
+#[test]
+fn shutdown_margin_agrees_with_explicit_rod_configurations() {
+    let rods = Rods::new(0.0);
+    let strongest = rods.strongest_rod();
+    let order = rods_by_descending_weight(&rods);
+    assert_eq!(order[0], strongest);
+    let configs: Vec<(&str, Vec<usize>)> = vec![
+        ("all in", vec![]),
+        ("strongest out", vec![strongest]),
+        ("worst two out", vec![order[0], order[1]]),
+        ("weakest two out", vec![order[N_RODS - 1], order[N_RODS - 2]]),
+    ];
+    for (label, w) in &configs {
+        for rho_other in [0.0, -0.02, 0.01] {
+            let a = rods.shutdown_margin(rho_other, w);
+            let b = sdm_from_positions(w, rho_other);
+            assert!((a - b).abs() < 1e-12, "{label} rho_other {rho_other}: shutdown_margin {a} vs explicit positions {b}");
+        }
+    }
+    assert!(rods.shutdown_margin(0.0, &[strongest]) < rods.shutdown_margin(0.0, &[]), "withdrawing the strongest rod must reduce the margin");
+    assert!(rods.shutdown_margin(0.0, &[order[0], order[1]]) < rods.shutdown_margin(0.0, &[strongest]));
+    assert!(rods.shutdown_margin(0.0, &[order[N_RODS - 1], order[N_RODS - 2]]) > rods.shutdown_margin(0.0, &[order[0], order[1]]));
 }
 
 #[test]
@@ -2158,13 +2436,13 @@ fn shutdown_margin_cold_xenon_free() {
     let (d, v, m) = ReactivityCoeffs::default().feedback(20.0, 0.0, 20.0);
     let rho_other = d + v + m; // xenon-free: no xenon term
     assert!(rho_other.abs() < 1e-12, "cold clean feedback should be zero, got {rho_other}");
-    assert_sdm("all rods in", rods.shutdown_margin(rho_other, &[]));
+    assert_sdm("all rods in (not the governed case)", rods.shutdown_margin(rho_other, &[]), false);
     let strongest = rods.strongest_rod();
-    assert_sdm("strongest rod out", rods.shutdown_margin(rho_other, &[strongest]));
-    let mut order: Vec<usize> = (0..N_RODS).collect();
-    order.sort_by(|&a, &b| rods.weights[b].partial_cmp(&rods.weights[a]).unwrap());
-    assert_eq!(order[0], strongest);
-    assert_sdm("strongest pair out", rods.shutdown_margin(rho_other, &[order[0], order[1]]));
+    assert_sdm("strongest rod out (governed by SDM_REQUIRED when confirmed)", rods.shutdown_margin(rho_other, &[strongest]), true);
+    let order = rods_by_descending_weight(&rods);
+    // Generic worst-two-worth sensitivity on the assumed grid. NOT the plant paired-drive
+    // case: the BWRX-300 pair topology is not public (core.md section 4, findings F-nnn).
+    assert_sdm("worst two rods out (model sensitivity; paired-drive case unavailable)", rods.shutdown_margin(rho_other, &[order[0], order[1]]), false);
     // Consistency with the reactivity model: all-in SDM equals rod worth minus cold excess.
     assert!((rods.shutdown_margin(0.0, &[]) - (ROD_WORTH_TOTAL - RHO_EXCESS_COLD)).abs() < 1e-12);
 }
@@ -2184,10 +2462,12 @@ fn shutdown_margin_hot_with_equilibrium_xenon_is_larger_than_cold() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --release -p bwr-core --test core_transients shutdown_margin 2>&1 | head -10`
-Expected: compile error `no method named shutdown_margin`.
+Run: `cargo test --release -p bwr-core --test core_transients shutdown_margin > /tmp/p5-t9-red.log 2>&1; echo exit=$?; grep -n "no method" /tmp/p5-t9-red.log`
+Expected: `exit=101`; compile error `no method named shutdown_margin`.
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3: Implement, and record the paired-rod criterion**
+
+Add to `docs/validation/findings.md` the next free entry: `F-nnn SDM paired-rod case: unavailable. The pair-selection criterion (which FMCRDs share a hydraulic control unit or scram path, and therefore which pair the "applicable paired-rod unavailable" case means) is not stated in the public BWRX-300 documents reviewed (S-06; S-08 <sections checked>). The tests report a generic worst-two-worth sensitivity on the assumed grid, labelled as model evidence; no threshold is applied to it.` Replace `F-nnn` in the test comment above with the allocated id.
 
 In `impl Rods` (reactor.rs), add:
 
@@ -2215,14 +2495,14 @@ In `impl Rods` (reactor.rs), add:
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test --release -p bwr-core --test core_transients shutdown_margin -- --nocapture 2>&1 | grep -E "SDM|^test |test result"`
-Expected: three `SDM ...` lines printed (all-in about 0.07 dk/k, strongest-rod-out and pair-out smaller but positive), both tests `ok`.
+Run: `set -o pipefail; cargo test --release -p bwr-core --test core_transients sdm shutdown_margin confirmed_requirement -- --nocapture 2>&1 | tee /tmp/p5-t9.log | grep -E "SDM|^test |test result"`
+Expected: exit 0; three `SDM ...` lines printed with their applicability notes (all-in about 0.07 dk/k; strongest-rod-out and worst-two-out smaller but positive), and all five tests `ok` (`sdm_reader_fails_loudly_on_missing_or_malformed_rows`, `confirmed_requirement_never_falls_back_to_positivity`, `shutdown_margin_agrees_with_explicit_rod_configurations`, `shutdown_margin_cold_xenon_free`, `shutdown_margin_hot_with_equilibrium_xenon_is_larger_than_cold`).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/bwr-core/src/reactor.rs crates/bwr-core/tests/core_transients.rs
-git commit -m "feat(core): shutdown margin evidence for all-in, strongest-rod-out and pair-out
+git add crates/bwr-core/src/reactor.rs crates/bwr-core/tests/core_transients.rs docs/validation/findings.md
+git commit -m "feat(core): shutdown margin evidence (all-in, strongest-rod-out, worst-two sensitivity) with strict register gate
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -2243,13 +2523,37 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 //! Sensitivity of the full-power turbine-trip transient to reactivity coefficients.
 //! Usage: cargo run --release -p bwr-core --example sensitivity
 //! Mirrors the Package 2 turbine-trip validation case: trip at t = 5 s, observe 120 s.
+//! Every variant carries a support status; only `supported` rows are comparable, and
+//! unsupported rows print their reason instead of numbers.
 
 use bwr_core::api::Command;
 use bwr_core::reactor::ReactivityCoeffs;
 use bwr_core::sim::DT;
 use bwr_core::Sim;
 
+const SETTLE_S: f64 = 5.0;
+const OBSERVE_S: f64 = 120.0;
+/// Boundary-state steadiness limits: |n - 1| and |rho_total| after settling.
+const N_RESIDUAL_MAX: f64 = 0.01;
+const RHO_RESIDUAL_MAX: f64 = 5e-5;
+
+#[derive(Debug)]
+enum Status {
+    /// Steady boundary state, no domain error retained from initialisation or raised
+    /// during the run, every sampled metric finite at every step.
+    Supported,
+    /// Domain error retained from initialisation or raised during the run.
+    Unsupported { at_s: f64, reason: String },
+    /// A sampled metric became non-finite.
+    NonFinite { at_s: f64 },
+    /// Boundary state not steady.
+    NotSteady { n_residual: f64, rho_residual: f64 },
+}
+
 struct Outcome {
+    status: Status,
+    n_residual: f64,
+    rho_residual: f64,
     peak_power: f64,
     peak_power_t: f64,
     peak_pressure_mpa: f64,
@@ -2260,19 +2564,50 @@ struct Outcome {
 
 fn turbine_trip(coeffs: ReactivityCoeffs) -> Outcome {
     let mut sim = Sim::full_power_with(coeffs);
-    for _ in 0..(5.0 / DT) as usize {
+    let retained_init_errors = sim.domain_errors.clone();
+    for _ in 0..(SETTLE_S / DT).round() as usize {
         sim.step(DT);
     }
+    // Boundary state: residuals recorded, extrema seeded from the actual values (never zeros).
+    let n_residual = (sim.core.kin.n - 1.0).abs();
+    let rho_residual = sim.core.rho_total.abs();
+    let mut o = Outcome {
+        status: Status::Supported,
+        n_residual,
+        rho_residual,
+        peak_power: sim.core.kin.n,
+        peak_power_t: sim.time,
+        peak_pressure_mpa: sim.vessel.eos.p / 1e6,
+        min_level_cm: sim.vessel.level_nr_cm(),
+        scrammed: sim.scrammed,
+        final_power: f64::NAN,
+    };
+    if let Some((t, e)) = retained_init_errors.first().or(sim.domain_errors.first()) {
+        o.status = Status::Unsupported { at_s: *t, reason: e.reason() };
+        return o;
+    }
+    if n_residual > N_RESIDUAL_MAX || rho_residual > RHO_RESIDUAL_MAX {
+        o.status = Status::NotSteady { n_residual, rho_residual };
+        return o;
+    }
     sim.apply(Command::TripTurbine);
-    let mut o = Outcome { peak_power: 0.0, peak_power_t: 0.0, peak_pressure_mpa: 0.0, min_level_cm: f64::MAX, scrammed: false, final_power: 0.0 };
-    for _ in 0..(120.0 / DT) as usize {
+    for _ in 0..(OBSERVE_S / DT).round() as usize {
         sim.step(DT);
-        if sim.core.kin.n > o.peak_power {
-            o.peak_power = sim.core.kin.n;
+        if let Some((t, e)) = sim.domain_errors.first() {
+            o.status = Status::Unsupported { at_s: *t, reason: e.reason() };
+            return o;
+        }
+        let (n, p, l) = (sim.core.kin.n, sim.vessel.eos.p / 1e6, sim.vessel.level_nr_cm());
+        if !(n.is_finite() && p.is_finite() && l.is_finite()) {
+            o.status = Status::NonFinite { at_s: sim.time };
+            return o;
+        }
+        if n > o.peak_power {
+            o.peak_power = n;
             o.peak_power_t = sim.time;
         }
-        o.peak_pressure_mpa = o.peak_pressure_mpa.max(sim.vessel.eos.p / 1e6);
-        o.min_level_cm = o.min_level_cm.min(sim.vessel.level_nr_cm());
+        o.peak_pressure_mpa = o.peak_pressure_mpa.max(p);
+        o.min_level_cm = o.min_level_cm.min(l);
     }
     o.scrammed = sim.scrammed;
     o.final_power = sim.core.kin.n;
@@ -2288,22 +2623,33 @@ fn main() {
         ("doppler -25 %", ReactivityCoeffs { doppler: b.doppler * 0.75, ..b }),
         ("doppler +25 %", ReactivityCoeffs { doppler: b.doppler * 1.25, ..b }),
     ];
-    println!("{:<14} {:>8} {:>8} {:>9} {:>9} {:>6} {:>8}", "variant", "peak n", "t_peak", "peak MPa", "min lvl", "scram", "final n");
+    println!(
+        "{:<14} {:>11} {:>8} {:>8} {:>9} {:>9} {:>6} {:>8}  {}",
+        "variant", "status", "peak n", "t_peak", "peak MPa", "min lvl", "scram", "final n", "residuals / reason"
+    );
+    let mut excluded = 0;
     for (name, c) in variants {
         let o = turbine_trip(c);
-        println!(
-            "{:<14} {:8.3} {:8.2} {:9.3} {:9.1} {:>6} {:8.3}",
-            name, o.peak_power, o.peak_power_t, o.peak_pressure_mpa, o.min_level_cm, o.scrammed, o.final_power
-        );
+        match &o.status {
+            Status::Supported => println!(
+                "{:<14} {:>11} {:8.3} {:8.2} {:9.3} {:9.1} {:>6} {:8.3}  n_res {:.1e} rho_res {:.1e}",
+                name, "supported", o.peak_power, o.peak_power_t, o.peak_pressure_mpa, o.min_level_cm, o.scrammed, o.final_power, o.n_residual, o.rho_residual
+            ),
+            other => {
+                excluded += 1;
+                println!("{:<14} {:>11} {:>8} {:>8} {:>9} {:>9} {:>6} {:>8}  {:?}", name, "UNSUPPORTED", "-", "-", "-", "-", "-", "-", other);
+            }
+        }
     }
     println!("Coefficients are calibrated/assumed (docs/model/core.md section 3); this table is a sensitivity, not plant data.");
+    println!("Only `supported` rows are comparable; {excluded} variant(s) excluded from comparison.");
 }
 ```
 
 - [ ] **Step 2: Run**
 
-Run: `cargo run --release -p bwr-core --example sensitivity`
-Expected: a 5-row table; `nominal` row shows `scram false` and peak pressure below 7.4 MPa (consistent with `plant::turbine_trip_rides_through_on_bypass`). Copy the table into the commit body.
+Run: `cargo run --release -p bwr-core --example sensitivity > /tmp/p5-sensitivity.txt 2>&1; echo exit=$?; cat /tmp/p5-sensitivity.txt`
+Expected: `exit=0`; a 5-row table with a `status` column; the `nominal` row is `supported`, shows `scram false` and peak pressure below 7.4 MPa (consistent with `plant::turbine_trip_rides_through_on_bypass`), and prints its boundary residuals. A `nominal` row that is not `supported` is a defect in `full_power_with`: fix it, do not proceed. A +/-25 % variant that prints `UNSUPPORTED` is a legitimate finding: keep the row exactly as printed (its reason and time), record it in findings.md, and do not alter the variant or the limits to make it supported. The whole table, status column included, is what Task 11 copies into core.md.
 
 - [ ] **Step 3: Commit**
 
@@ -2311,67 +2657,92 @@ Expected: a 5-row table; `nominal` row shows `scram false` and peak pressure bel
 git add crates/bwr-core/examples/sensitivity.rs
 git commit -m "feat(core): reactivity coefficient sensitivity example for the turbine-trip transient
 
-<paste the table here>
+<paste /tmp/p5-sensitivity.txt here, status column included>
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 11: Baseline regeneration, register closure, and final verification
+### Task 11: Baseline regeneration (master protocol), register closure, and final verification
 
 **Files:**
-- Modify: `docs/validation/baseline/*.csv`, `docs/model/parameters.csv`, `docs/model/coverage.md`, `docs/model/core.md`
+- Create: `docs/validation/reports/<date>-pkg05.md`
+- Modify: `docs/validation/baseline/*.csv`, `docs/model/coverage.md`, `docs/model/core.md`
 
 **Interfaces:**
-- Consumes: P2's `examples/validation.rs` with its `--write` flag (see `docs/validation/method.md`).
+- Consumes: P2's `examples/validation.rs` (compare mode prints `PASS <case>` / `FAIL <case>` with one indented violation line per metric, the metrics, and a `convergence dt/2: N violation(s)` line per case; `--write` rewrites the baselines; see `docs/validation/method.md`).
 
-- [ ] **Step 1: Compare before and after**
+Master baseline regeneration protocol, in this order and nothing skipped: (1) compare-mode output saved complete to the report; (2) every changed metric classified; (3) the package's independent physical gates and the contract gates green BEFORE regeneration; (4) `--write` exactly once for the reviewed change set; (5) report and baselines committed together; then compare mode verified without any tolerance change. Each step below runs cargo unpiped or with `pipefail` so no failure is masked.
 
-Run: `cargo run --release -p bwr-core --example validation 2>&1 | tail -40`
-Expected: comparison violations only in metrics explained by this package (fuel temperature columns, early-second power after scram due to the run-in and rod-order change, decay-heat levels after the refit). Record each violated metric, its baseline value, and its new value in a table.
-
-- [ ] **Step 2: Regenerate baselines**
-
-Run: `cargo run --release -p bwr-core --example validation -- --write` (P2's baseline-writing flag, documented in `docs/validation/method.md`).
-Expected: baselines rewritten; a second plain run reports zero violations.
-
-- [ ] **Step 3: Close the register**
-
-Verify every constant touched in this package has a `parameters.csv` row: run
+- [ ] **Step 1: Independent gates before any regeneration**
 
 ```bash
-for n in GAP_RESISTANCE_K_PER_W CLAD_COOLANT_RESISTANCE_K_PER_W CLAD_HEAT_CAP_J_PER_K FUEL_MODEL_T_MAX_C UNCOVERED_ENVELOPE_S IRRADIATION_HISTORY_S SDM_REQUIRED DECAY_GROUPS; do grep -q "^$n," docs/model/parameters.csv && echo "ok $n" || echo "MISSING $n"; done
-cut -d, -f1 docs/model/parameters.csv | sort | uniq -d
-```
-
-Expected: eight `ok` lines and no duplicate ids. Update the `DECAY_GROUPS` row's `notes` with the maximum relative error printed by the fit tool.
-
-In `docs/model/coverage.md`, update the core/fuel/rods row: evidence = core.md; tests = `core_transients.rs` (list the test names) and the reactor unit tests; limitations = "no axial/channel model, no exposure dependence, no PCT/CPR, rod speeds assumed, SDM requirement unavailable unless sourced".
-
-Append to `docs/model/core.md` a "Measured results (Package 5)" section with: the rod insertion fraction printed by `full_power_rod_insertion_fraction`, the three SDM values, the sensitivity table, and the decay-fit maximum relative error.
-
-- [ ] **Step 4: Full verification**
-
-Run:
-
-```bash
-cargo test --release -p bwr-core 2>&1 | grep -E "test result"
+set -o pipefail; cargo test --release -p bwr-core 2>&1 | tee /tmp/p5-t11-tests.log | grep -E "test result"
 npm --prefix ui run typecheck
-npm --prefix ui run build 2>&1 | tail -2
-grep -rn "core_damage\|CORE DAMAGE\|FUEL_RESISTANCE\|fast_insert\|rods\.target\b" crates ui/src README.md; echo "grep exit=$?"
+npm --prefix ui run build > /tmp/p5-t11-build.log 2>&1; echo build_exit=$?
 ```
+Expected: every `test result:` line `ok` with exit 0 (this is where the package's physical gates run: `two_node_energy_identity_holds_each_step`, `two_node_transient_matches_an_independent_rk4_reference`, `two_node_update_is_stable_and_converges_for_every_step_size`, `rated_fuel_and_clad_temperatures_match_resistance_derivation`, the decay-heat reference test in the retrieved branch, the xenon tests, `shutdown_margin_agrees_with_explicit_rod_configurations`, the envelope tests, and P3's `conservation` tests); typecheck silent; `build_exit=0`. Stop on any failure: nothing is regenerated while a gate is red.
 
-Expected: every `test result:` line reads `ok`; typecheck silent; build `✓ built`; the grep prints nothing and `grep exit=1`.
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 2: Compare mode, complete output saved to the report**
 
 ```bash
-git add docs/validation/baseline docs/model/parameters.csv docs/model/coverage.md docs/model/core.md
+mkdir -p docs/validation/reports
+D=$(date +%Y-%m-%d)
+cargo run --release -p bwr-core --example validation > /tmp/p5-compare.log 2>&1; echo compare_exit=$?
+{ echo "# Package 5 baseline regeneration report ($D)"; echo; echo "## Compare mode before regeneration (complete output)"; echo; echo '```'; cat /tmp/p5-compare.log; echo '```'; } > "docs/validation/reports/$D-pkg05.md"
+```
+Expected: a non-zero `compare_exit` is normal at this point (cases that moved fail compare); the report holds every `PASS`/`FAIL` line and every violation line untruncated.
+
+- [ ] **Step 3: Classify every changed metric**
+
+Append to the report a section `## Classification` with one table row per violation line in the compare output (`case | metric | baseline | new | class | reason`). `class` is exactly one of:
+
+- `physical`: the reason names the mechanism: two-node thermal response (`fuel_t_c` and the first seconds of any scram transient); electric run-in plus the rods-before-kinetics order in the first seconds after a scram; decay-heat level in `cold_shutdown`/`hot_standby` from the finite irradiation history (both branches) and from the refit (retrieved branch only). The stuck-rod and scram re-assert changes have no effect without a fault and must not appear here.
+- `schema-population`: `clad_t_c`, `rods_min_pos`, `rods_max_pos` newly populated (byte-identical traces are not expected).
+- `numerical`: within the `convergence dt/2` band printed for that case in the same output.
+
+A violation that fits none of these is a defect: stop, fix it in a new commit, and restart this task from Step 1. No tolerance is adjusted at any point.
+
+- [ ] **Step 4: Regenerate exactly once, then verify compare mode**
+
+```bash
+cargo run --release -p bwr-core --example validation -- --write > /tmp/p5-write.log 2>&1; echo write_exit=$?
+cargo run --release -p bwr-core --example validation > /tmp/p5-compare-after.log 2>&1; echo compare_after_exit=$?
+grep -c "^PASS" /tmp/p5-compare-after.log; grep -c "^FAIL" /tmp/p5-compare-after.log
+```
+Expected: `write_exit=0`; `compare_after_exit=0`; the PASS count equals the number of standard cases and the FAIL count is 0 with no tolerance changed. Append `## After regeneration` with both counts and the `convergence dt/2` lines to the report. `--write` runs exactly once for this reviewed change set; if any later commit in this package changes physics, the whole task restarts from Step 1.
+
+- [ ] **Step 5: Close the register and the model record**
+
+```bash
+for n in Q_FUEL_RATED GAP_RESISTANCE_K_PER_W CLAD_COOLANT_RESISTANCE_K_PER_W CLAD_HEAT_CAP_J_PER_K FUEL_MODEL_T_MAX_C UNCOVERED_ENVELOPE_S CORE_COVERED_FRAC IRRADIATION_HISTORY_S SDM_REQUIRED DECAY_GROUPS; do grep -q "^$n," docs/model/parameters.csv && echo "ok $n" || echo "MISSING $n"; done
+cut -d, -f1 docs/model/parameters.csv | sort | uniq -d
+cargo test --release -p bwr-core --test register
+```
+Expected: ten `ok` lines (add `DECAY_FIT_MAX_REL_ERR` to the loop in the retrieved branch: eleven), no duplicate ids, every `register` test `ok`. Every row was written in its owning task (1, 4, 5, 6); nothing is added here.
+
+In `docs/model/coverage.md`, update the core/fuel/rods row: evidence = core.md; tests = `core_transients.rs` (list the test names) and the reactor unit tests; limitations = "no axial/channel model, no exposure dependence, no PCT/CPR, rod speeds assumed, SDM requirement unavailable unless sourced, paired-rod case unavailable, decay-heat reference <retrieved with max error ... | unavailable (F-nnn)>".
+
+Append to `docs/model/core.md` a "Measured results (Package 5)" section with: the rod insertion fraction printed by `full_power_rod_insertion_fraction`; the three SDM lines exactly as printed (each with its applicability note); the sensitivity table from `/tmp/p5-sensitivity.txt` including the status column; and the decay-heat outcome (branch, group count, measured maximum relative error and gate, or the unavailable finding).
+
+- [ ] **Step 6: Obsolete-symbol and wording checks (separate checks, source paths only)**
+
+```bash
+rg -n "pub fast_insert|pub scramming: bool|pub target: Vec<f64>|pub const FUEL_RESISTANCE" crates/bwr-core/src; echo "decl_exit=$?"
+rg -n "rods\.target\[|rods\.target\.|rods\.target,|rods\.target\)|rods\.target;|rods\.scramming[^(]|fast_insert" crates/bwr-core/src crates/bwr-core/tests crates/bwr-core/examples ui/src; echo "access_exit=$?"
+rg -n "FUEL_RESISTANCE" crates/bwr-core/src crates/bwr-core/tests crates/bwr-core/examples --glob '!params.rs'; echo "resistance_exit=$?"
+rg -n "DAMAGE" crates/bwr-core/src ui/src README.md; echo "visible_exit=$?"
+```
+Expected: every `*_exit=1` (no hits). Declarations and field accesses are checked separately from the method calls `rods.target(i)`, `rods.targets()` and `rods.scramming()`, which are valid. `FUEL_RESISTANCE` is allowed only inside `params.rs` doc comments (the historical note on `CLAD_COOLANT_RESISTANCE_K_PER_W`), hence the glob. The upper-case `DAMAGE` check is the user-visible wording gate; lower-case "not a damage verdict" comments are allowed.
+
+- [ ] **Step 7: Commit the report and the baselines together**
+
+```bash
+git add "docs/validation/reports/$D-pkg05.md" docs/validation/baseline docs/model/coverage.md docs/model/core.md
 git commit -m "chore(validation): regenerate baselines after Package 5 core refinements
 
-Before/after metric table:
-<paste the table from Step 1>
+Report: docs/validation/reports/$D-pkg05.md (compare output, classification, after-regeneration counts)
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -2392,6 +2763,19 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 | All-rods-in, strongest-rod, paired-rod, cold xenon-free SDM; sourced margin targets | 9 |
 | Stuck-rod fault honoured (master `Fault::RodStuck`) | 3 |
 | Trace schema v2 columns `clad_t_c`, `rods_min_pos`, `rods_max_pos` populated | 2, 4 |
-| Register, assumptions, applicability, baselines | 1, 11 |
+| Register, assumptions, applicability, baselines | 1, 4, 5, 6 (rows in owning tasks), 11 (report + baselines) |
 
 **Acceptance gate (verbatim):** Supported reactivity and shutdown behavior has reproducible evidence. Uncertain rod worth, feedback, and fuel limits cannot silently appear as confirmed plant performance.
+
+---
+
+## Master amendments
+
+Items this plan fixes beyond the master's text. The master dt rule already permits a package to add `last_error` to its own void-returning step owner, so `Rods.last_error` needs no amendment. The following should be appended to the master's `### P5: core, fuel, rods` section when the master is next revised (this plan does not edit the master):
+
+1. In the `Rods` struct comment, add `pub last_error: Option<DomainError>, // set by the void-returning step()/set_motor_target(); forwarded into Core.last_error by Core::step_rods`.
+2. Add the method `pub fn refresh_stuck(&mut self, mask: &[bool]); // Sim step 2: stuck rods are parked Idle (outstanding command dropped, TGT = POS)`.
+3. Change the `scram_hydraulic` comment to `every non-stuck rod with pos > 0 -> Scram (Sri rods become Scram; rods already in stay Idle)` and the `motor_run_in` comment to `every non-stuck rod with pos > 0 not already Scram -> MotorRunIn`.
+4. After the sentence about `Sim::scram()`, add: `While Sim.scrammed is latched, Sim::step re-asserts rods.scram_hydraulic() and rods.motor_run_in() after the stuck-mask refresh (step 2), so a rod freed from Fault::RodStuck resumes insertion; nothing is replayed after ResetScram.`
+5. Add to the params.rs line: `CORE_COVERED_FRAC = 0.999 (shared by the uncovered-envelope timer and the low-coverage alarm)`, `Q_FUEL_RATED = RATED_POWER_W * (1 - DIRECT_COOLANT_HEAT)` (pub, registered), and, retrieved branch only, `DECAY_FIT_MAX_REL_ERR`.
+6. Add `Sim.clad_t_step_max: f64` (max of entry and exit cladding temperature of the last plant step; the envelope check reads it, not `core.clad_t`).

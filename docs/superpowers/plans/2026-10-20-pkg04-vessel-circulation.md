@@ -653,13 +653,20 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `steam::compressed_liquid_rho`, `Sat.kappa_f`, `domain::DomainError`, Package 3's `pub const T_EOS_MIN: f64 = 1.0` and `pub const T_EOS_MAX: f64 = 349.5` in `vessel.rs` (not redeclared here), `Vessel.last_error`, `Vessel.exhausted`.
-- Produces (master contract): `pub enum Regime { Vented, Saturated, WaterSolid, GasBlanketed }`, `pub struct Eos { t, p, p_steam, p_gas, x, regime }`, `pub const R_AIR: f64 = 287.0`, `pub fn solve_eos(mass: f64, energy: f64, gas_mass: f64, vent_open: bool) -> Result<Eos, DomainError>`, `Vessel.gas_mass: f64`, `Vessel::steam_available(&self) -> bool`, `Snapshot.vessel.regime`.
+- Produces (master contract): `pub enum Regime { Vented, Saturated, WaterSolid, GasBlanketed }`, `pub struct Eos { t, p, p_steam, p_gas, x, regime }`, `pub const R_AIR: f64 = 287.0`, `pub fn solve_eos(mass: f64, energy: f64, gas_mass: f64, vent_open: bool) -> Result<Eos, DomainError>`, `Vessel.gas_mass: f64`, `Vessel::steam_available(&self) -> bool`, `Snapshot.vessel.regime`. P4 extensions (appended to the master in Step 8, same commit): `pub const DISSOLVED_GAS_CAPACITY_KG: f64 = 1.0`, `pub const REGIME_HYSTERESIS: f64 = 1.05`, `pub const P_EOS_MAX: f64 = 16.0e6`, `pub const GAS_BLANKET_ALARM_T_C: f64 = 90.0`, the zero-water endpoint, the vapour-domain rejection and the argument validation of section 1 of `vessel.md`.
+- Register rows in this task (Step 8): `R_AIR`, `DISSOLVED_GAS_CAPACITY_KG`, `REGIME_HYSTERESIS`, `P_EOS_MAX`, `GAS_BLANKET_ALARM_T_C`; assumptions `A-040`, `A-044`, `A-047`.
 
 - [ ] **Step 1: Write the failing unit tests in `vessel.rs`**
 
 Replace the existing `eos_roundtrip` test with:
 
 ```rust
+    /// Total gas charge that puts `p_gas` on a gas space of `v_gas` m3 at `t` degC
+    /// (the dissolved capacity exerts no pressure and is added on top).
+    fn gas_for(p_gas: f64, t: f64, v_gas: f64) -> f64 {
+        DISSOLVED_GAS_CAPACITY_KG + p_gas * v_gas / (R_AIR * (t + 273.15))
+    }
+
     #[test]
     fn eos_roundtrip_all_regimes() {
         // Saturated / vacuum (no gas) and vented at three temperatures.
@@ -670,41 +677,165 @@ Replace the existing `eos_roundtrip` test with:
             assert!((eos.t - t).abs() < 1e-3, "t {t} -> {}", eos.t);
             assert_eq!(eos.regime, Regime::Saturated);
             assert!((eos.p - eos.p_steam).abs() < 1.0, "no gas: p == p_steam");
+            // Dissolved gas only: no partial pressure, identical state.
+            let eos_d = solve_eos(m, e, 0.5 * DISSOLVED_GAS_CAPACITY_KG, false).unwrap();
+            assert_eq!(eos_d.p_gas, 0.0);
+            assert_eq!(eos_d.p, eos.p);
             let eos = solve_eos(m, e, 0.0, true).unwrap();
             assert_eq!(eos.regime, Regime::Vented);
         }
-        // Gas-blanketed: cold vessel with enough air for atmospheric pressure.
+        // Gas-blanketed: cold vessel with enough free air for atmospheric pressure.
         let m = 200_000.0;
-        let (_, _, v_liq) = state_at(40.0, m);
+        let (_, _, v_liq, _) = state_at(40.0, m);
         let v_gas = V_VESSEL_FLUID - v_liq;
-        let gas = (P_ATM - sat_t(40.0).p) * v_gas / (R_AIR * 313.15);
+        let gas = gas_for(P_ATM - sat_t(40.0).p, 40.0, v_gas);
         let eos = solve_eos(m, energy_for(m, 40.0), gas, false).unwrap();
         assert_eq!(eos.regime, Regime::GasBlanketed);
         assert!((eos.p - P_ATM).abs() < 500.0, "p = {}", eos.p);
         assert!(eos.p_gas > eos.p_steam);
         // Water-solid: more water than the vessel holds at saturation density.
         let m_solid = V_VESSEL_FLUID * sat_t(40.0).rho_f * 1.0001;
-        let eos = solve_eos(m_solid, energy_for(m_solid, 40.0), 0.0, false).unwrap();
+        let e_solid = energy_for(m_solid, 40.0);
+        let eos = solve_eos(m_solid, e_solid, 0.0, false).unwrap();
         assert_eq!(eos.regime, Regime::WaterSolid);
         assert_eq!(eos.x, 0.0);
         let expect = sat_t(40.0).p + 1.0e-4 / sat_t(40.0).kappa_f;
         assert!((eos.p - expect).abs() / expect < 0.02, "p = {} vs {expect}", eos.p);
-        // Water-solid beyond 2 x design pressure is a domain error.
+        // Dissolved gas does not block the water-solid branch; free gas does.
+        assert_eq!(solve_eos(m_solid, e_solid, DISSOLVED_GAS_CAPACITY_KG, false).unwrap().regime, Regime::WaterSolid);
+        assert!(matches!(
+            solve_eos(m_solid, e_solid, 1.5 * DISSOLVED_GAS_CAPACITY_KG, false),
+            Err(DomainError::PropertyOutOfRange { what, .. }) if what == "gas space volume"
+        ));
+        // Water-solid beyond P_EOS_MAX is a domain error.
         let m_over = V_VESSEL_FLUID * sat_t(40.0).rho_f * 1.02;
         assert!(matches!(
             solve_eos(m_over, energy_for(m_over, 40.0), 0.0, false),
-            Err(DomainError::PropertyOutOfRange { .. })
+            Err(DomainError::PropertyOutOfRange { what, .. }) if what == "total pressure"
+        ));
+        // Water-solid above the linear-compressibility domain is rejected.
+        let m_hot = V_VESSEL_FLUID * sat_t(320.0).rho_f * 1.00001;
+        assert!(matches!(
+            solve_eos(m_hot, energy_for(m_hot, 320.0), 0.0, false),
+            Err(DomainError::PropertyOutOfRange { what, .. }) if what == "water-solid temperature"
         ));
         // Energy outside the table is a domain error, not a clamp.
         assert!(matches!(solve_eos(m, energy_for(m, 1.0) - 1.0e9, 0.0, false), Err(DomainError::EosOutOfRange { .. })));
     }
 
     #[test]
+    fn solve_eos_rejects_invalid_arguments() {
+        // Master non-finite rule: each argument independently, naming the argument;
+        // negative gas is a property error; negative mass stays EosOutOfRange (P3).
+        let m = 200_000.0;
+        let e = energy_for(m, 200.0);
+        for &v in &[f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(solve_eos(v, e, 0.0, false), Err(DomainError::PropertyOutOfRange { what, .. }) if what == "mass"), "mass {v}");
+            assert!(matches!(solve_eos(m, v, 0.0, false), Err(DomainError::PropertyOutOfRange { what, .. }) if what == "energy"), "energy {v}");
+            assert!(matches!(solve_eos(m, e, v, false), Err(DomainError::PropertyOutOfRange { what, .. }) if what == "gas_mass"), "gas {v}");
+        }
+        assert!(matches!(solve_eos(m, e, -1.0, false), Err(DomainError::PropertyOutOfRange { what, .. }) if what == "gas_mass"));
+        assert!(matches!(solve_eos(-1.0, e, 0.0, false), Err(DomainError::EosOutOfRange { .. })));
+    }
+
+    #[test]
+    fn eos_outputs_are_finite() {
+        for &m in &[0.0, 10_000.0, 100_000.0, 200_000.0, V_VESSEL_FLUID * 990.0] {
+            for &t in &[5.0, 40.0, 100.0, 200.0, 300.0] {
+                for &g in &[0.0, 0.5, 5.0, 300.0] {
+                    for &vent in &[false, true] {
+                        if let Ok(e) = solve_eos(m, energy_for(m, t), g, vent) {
+                            assert!(
+                                e.t.is_finite() && e.p.is_finite() && e.p_steam.is_finite() && e.p_gas.is_finite() && e.x.is_finite(),
+                                "{e:?} at m={m} t={t} g={g}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eos_volume_closure() {
+        // Two-phase: mass * ((1 - x) v_f + x v_g) == V, including near x = 1.
+        for &(m, t) in &[(200_000.0, 40.0), (200_000.0, 287.0), (12_000.0, 287.0), (V_VESSEL_FLUID * 1000.0 * 0.999, 40.0)] {
+            let e = solve_eos(m, energy_for(m, t), 0.0, false).unwrap();
+            let s = sat_t(e.t);
+            let v = m * ((1.0 - e.x) * s.v_f() + e.x * s.v_g());
+            assert!((v - V_VESSEL_FLUID).abs() < 1e-6 * V_VESSEL_FLUID, "closure {v} at m={m} t={t} x={}", e.x);
+        }
+        // Water-solid: mass / rho(t, p - p_gas) == V with the same density model as update_level.
+        let m_solid = V_VESSEL_FLUID * sat_t(40.0).rho_f * 1.0005;
+        let e = solve_eos(m_solid, energy_for(m_solid, 40.0), 0.0, false).unwrap();
+        let v = m_solid / compressed_liquid_rho(e.t, e.p - e.p_gas);
+        assert!((v - V_VESSEL_FLUID).abs() < 1e-6 * V_VESSEL_FLUID, "water-solid closure {v}");
+        // Gas-bearing: p_gas is computed on the same liquid volume the closure implies.
+        let m = 200_000.0;
+        let (_, _, v_liq, _) = state_at(40.0, m);
+        let gas = gas_for(P_ATM, 40.0, V_VESSEL_FLUID - v_liq);
+        let e = solve_eos(m, energy_for(m, 40.0), gas, false).unwrap();
+        let v_gas = V_VESSEL_FLUID - m * (1.0 - e.x) * sat_t(e.t).v_f();
+        let p_gas = (gas - DISSOLVED_GAS_CAPACITY_KG) * R_AIR * (e.t + 273.15) / v_gas;
+        assert!((e.p_gas - p_gas).abs() < 1.0, "p_gas {} vs {p_gas}", e.p_gas);
+    }
+
+    #[test]
+    fn eos_rejects_superheated_vapour() {
+        // Below the saturated-vapour inventory V * rho_g(t) the state is superheated,
+        // which this EOS does not represent: rejected, never clamped to x = 1.
+        for &t in &[150.0, 287.0] {
+            let m_min = V_VESSEL_FLUID * sat_t(t).rho_g;
+            let ok = solve_eos(1.01 * m_min, energy_for(1.01 * m_min, t), 0.0, false).unwrap();
+            assert!(ok.x > 0.98 && ok.x <= 1.0, "x = {}", ok.x);
+            assert!(matches!(solve_eos(0.99 * m_min, energy_for(0.99 * m_min, t), 0.0, false), Err(DomainError::EosOutOfRange { .. })));
+        }
+        // 1 kg at 40 degC occupies 19.5 m3 as saturated vapour, not the vessel.
+        assert!(matches!(solve_eos(1.0, energy_for(1.0, 40.0), 0.0, false), Err(DomainError::EosOutOfRange { .. })));
+    }
+
+    #[test]
+    fn eos_zero_water_endpoint() {
+        let e = solve_eos(0.0, METAL_HEAT_CAP * 250.0, 0.0, false).unwrap();
+        assert!((e.t - 250.0).abs() < 1e-6 && e.p_steam == 0.0 && e.p == 0.0 && e.x == 1.0, "{e:?}");
+        let g = solve_eos(0.0, METAL_HEAT_CAP * 100.0, DISSOLVED_GAS_CAPACITY_KG + 100.0, false).unwrap();
+        let p_gas = 100.0 * R_AIR * 373.15 / V_VESSEL_FLUID;
+        assert!((g.p_gas - p_gas).abs() < 1.0 && g.p == g.p_gas && g.regime == Regime::GasBlanketed, "{g:?}");
+        assert_eq!(solve_eos(0.0, METAL_HEAT_CAP * 100.0, 0.0, true).unwrap().regime, Regime::Vented);
+        assert!(matches!(solve_eos(0.0, METAL_HEAT_CAP * 0.5, 0.0, false), Err(DomainError::EosOutOfRange { .. })));
+    }
+
+    #[test]
+    fn total_pressure_envelope_has_no_hidden_clamp() {
+        // P_EOS_MAX lies inside the saturation table, so sat_p never clamps for an
+        // accepted state, in any regime.
+        assert!(P_EOS_MAX < sat_t(T_EOS_MAX).p, "P_EOS_MAX {P_EOS_MAX} vs p_sat(T_EOS_MAX) {}", sat_t(T_EOS_MAX).p);
+        let (m, t) = (100_000.0, 300.0);
+        let (_, _, v_liq, _) = state_at(t, m);
+        let v_gas = V_VESSEL_FLUID - v_liq;
+        let p_sat = sat_t(t).p;
+        for (p_gas, ok) in [(P_EOS_MAX - p_sat - 2.0e4, true), (P_EOS_MAX - p_sat + 2.0e4, false)] {
+            match solve_eos(m, energy_for(m, t), gas_for(p_gas, t, v_gas), false) {
+                Ok(e) => {
+                    assert!(ok, "accepted p = {}", e.p);
+                    assert!(e.p <= P_EOS_MAX);
+                    assert!(((sat_p(e.p).p - e.p) / e.p).abs() < 1e-6, "sat_p clamped {} to {}", e.p, sat_p(e.p).p);
+                }
+                Err(DomainError::PropertyOutOfRange { what, value }) => {
+                    assert!(!ok && what == "total pressure" && value > P_EOS_MAX, "{what} {value}");
+                }
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn state_energy_is_monotonic_in_temperature() {
         // The bisection in solve_eos assumes total energy increases with temperature at
-        // fixed mass, across the two-phase / water-solid branch of state_at. Masses:
+        // fixed mass, across the zero-water, vapour-clamped, two-phase and water-solid
+        // branches of state_at. Masses: empty; vapour-clamped over most of the range;
         // two-phase throughout; water-solid below ~45 degC then two-phase; always solid.
-        for &m in &[150_000.0, 200_000.0, V_VESSEL_FLUID * 990.0, V_VESSEL_FLUID * 1000.5] {
+        for &m in &[0.0, 1_000.0, 150_000.0, 200_000.0, V_VESSEL_FLUID * 990.0, V_VESSEL_FLUID * 1000.5] {
             let mut prev = f64::MIN;
             let mut t = T_EOS_MIN;
             while t <= T_EOS_MAX {
@@ -742,19 +873,34 @@ In `vessel.rs`, replace the `Eos` struct, `energy_at`, `solve_eos`, and `energy_
 
 ```rust
 use crate::domain::DomainError;
-use crate::steam::{self, compressed_liquid_rho, sat_p, sat_t, Sat, P_ATM};
+use crate::steam::{self, compressed_liquid_rho, sat_p, sat_t, Sat, P_ATM, T_COMPRESSED_MAX};
 use serde::{Deserialize, Serialize};
 
 // `pub const T_EOS_MIN: f64 = 1.0;` and `pub const T_EOS_MAX: f64 = 349.5;` already
 // exist from Package 3 and are used below; do not redeclare them.
 
-/// Gas constant of air (noncondensable in the head), J/kg/K.
+/// Gas constant of air (noncondensable in the head), J/kg/K. A-040.
 pub const R_AIR: f64 = 287.0;
-/// Gas below this mass is treated as dissolved when the vessel goes water-solid, kg.
-pub const WATER_SOLID_GAS_TOLERANCE_KG: f64 = 1.0;
+/// Noncondensable gas held in solution: exerts no partial pressure and is not swept
+/// out, kg. ASSUMED (A-040): air solubility at 0.1 MPa is about 20 mg per kg of
+/// water, a few kg for the full inventory. A constant capacity, not Henry's law.
+pub const DISSOLVED_GAS_CAPACITY_KG: f64 = 1.0;
 /// Hysteresis ratio on p_gas / p_steam for the Saturated <-> GasBlanketed label
-/// (applied in Vessel::step; solve_eos itself is pure). ASSUMED, display only.
+/// (applied in Vessel::step; solve_eos itself is pure). ASSUMED (A-040), display only.
 pub const REGIME_HYSTERESIS: f64 = 1.05;
+/// Numerical limit on the total pressure in every regime, Pa: every `sat_p` lookup
+/// below it is inside the saturation table (`P_EOS_MAX < p_sat(T_EOS_MAX)` is a unit
+/// test). The design-pressure alarm (VESSEL_DESIGN_PRESSURE) is a separate,
+/// operational limit raised by the Sim.
+pub const P_EOS_MAX: f64 = 16.0e6;
+/// Water temperature above which a GasBlanketed vessel raises the Sim's
+/// `gas_blanket` warning, degC. ASSUMED (A-040): air is purged well before boiling.
+pub const GAS_BLANKET_ALARM_T_C: f64 = 90.0;
+
+/// Free (undissolved) gas mass, kg.
+fn free_gas(gas_mass: f64) -> f64 {
+    (gas_mass - DISSOLVED_GAS_CAPACITY_KG).max(0.0)
+}
 
 /// Derives per master r2 Derives rule (nested in Sim via Vessel.eos and placed in api.rs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -781,27 +927,48 @@ pub struct Eos {
     pub regime: Regime,
 }
 
-/// (total energy incl. metal, static quality, liquid volume) for water `mass` at `t`.
-fn state_at(t: f64, mass: f64) -> (f64, f64, f64) {
+/// (total energy incl. metal, quality, liquid volume, unconstrained quality) for
+/// water `mass` at `t`. The returned quality is clamped to 0..1 so the energy is
+/// defined everywhere (the bisection needs a total function); the unconstrained
+/// value is what solve_eos checks against the saturation-only domain.
+fn state_at(t: f64, mass: f64) -> (f64, f64, f64, f64) {
     let s = sat_t(t);
+    if mass <= 0.0 {
+        // Zero-water endpoint: metal energy only, nothing liquid.
+        return (METAL_HEAT_CAP * t, 1.0, 0.0, 1.0);
+    }
     let v = V_VESSEL_FLUID / mass;
+    let x_unc = (v - s.v_f()) / (s.v_g() - s.v_f());
     if v <= s.v_f() {
         // Water-solid: all liquid, slightly compressed. Pressure work on the liquid
-        // energy is neglected (A-P4-3).
-        return (mass * s.u_f() + METAL_HEAT_CAP * t, 0.0, V_VESSEL_FLUID);
+        // energy is neglected (A-042).
+        return (mass * s.u_f() + METAL_HEAT_CAP * t, 0.0, V_VESSEL_FLUID, x_unc);
     }
-    let x = ((v - s.v_f()) / (s.v_g() - s.v_f())).clamp(0.0, 1.0);
+    let x = x_unc.min(1.0);
     let v_liq = mass * (1.0 - x) * s.v_f();
-    (mass * (s.u_f() + x * (s.u_g() - s.u_f())) + METAL_HEAT_CAP * t, x, v_liq)
+    (mass * (s.u_f() + x * (s.u_g() - s.u_f())) + METAL_HEAT_CAP * t, x, v_liq, x_unc)
 }
 
 /// Solve temperature, pressures, quality and regime from water mass, total energy
-/// (water + metal), noncondensable gas mass and vent status.
+/// (water + metal), noncondensable gas mass and vent status. Pure.
+/// Envelope (docs/model/vessel.md section 1): arguments finite, `gas_mass >= 0`
+/// (PropertyOutOfRange naming the argument); `mass >= 0` and energy inside the
+/// 1..349.5 degC range (EosOutOfRange); volume-derived quality at most 1
+/// (EosOutOfRange: superheated vapour is not represented); total pressure at most
+/// P_EOS_MAX in every regime; water-solid only with no free gas and at most
+/// T_COMPRESSED_MAX. `mass == 0` is the zero-water endpoint.
 pub fn solve_eos(mass: f64, energy: f64, gas_mass: f64, vent_open: bool) -> Result<Eos, DomainError> {
-    if !(mass > 0.0) || !energy.is_finite() {
-        return Err(DomainError::EosOutOfRange { mass_kg: mass, energy_j: energy });
+    for (what, value) in [("mass", mass), ("energy", energy), ("gas_mass", gas_mass)] {
+        if !value.is_finite() {
+            return Err(DomainError::PropertyOutOfRange { what: what.into(), value });
+        }
     }
-    if energy < state_at(T_EOS_MIN, mass).0 || energy > state_at(T_EOS_MAX, mass).0 {
+    if gas_mass < 0.0 {
+        return Err(DomainError::PropertyOutOfRange { what: "gas_mass".into(), value: gas_mass });
+    }
+    // Valid mass domain: 0 <= mass (Package 3: a negative mass is EosOutOfRange);
+    // the upper end is set by the water-solid pressure check below.
+    if !(mass >= 0.0) || energy < state_at(T_EOS_MIN, mass).0 || energy > state_at(T_EOS_MAX, mass).0 {
         return Err(DomainError::EosOutOfRange { mass_kg: mass, energy_j: energy });
     }
     let (mut lo, mut hi) = (T_EOS_MIN, T_EOS_MAX);
@@ -814,27 +981,47 @@ pub fn solve_eos(mass: f64, energy: f64, gas_mass: f64, vent_open: bool) -> Resu
         }
     }
     let t = 0.5 * (lo + hi);
-    let (_, x, v_liq) = state_at(t, mass);
+    let (_, x, v_liq, x_unc) = state_at(t, mass);
     let s = sat_t(t);
     let t_k = t + 273.15;
+    let free = free_gas(gas_mass);
+
+    if mass == 0.0 {
+        // Zero-water endpoint (vessel.md section 2): metal temperature, no steam, the
+        // free gas alone sets the pressure. Diagnostic state; feed refills it.
+        let p_gas = free * R_AIR * t_k / V_VESSEL_FLUID;
+        if !(p_gas <= P_EOS_MAX) {
+            return Err(DomainError::PropertyOutOfRange { what: "total pressure".into(), value: p_gas });
+        }
+        let regime = if vent_open { Regime::Vented } else { Regime::GasBlanketed };
+        return Ok(Eos { t, p: p_gas, p_steam: 0.0, p_gas, x: 1.0, regime });
+    }
+    if x_unc > 1.0 {
+        // Less water than the saturated-vapour inventory V * rho_g(t): superheated
+        // vapour, outside the saturation-only EOS. Rejected, never clamped.
+        return Err(DomainError::EosOutOfRange { mass_kg: mass, energy_j: energy });
+    }
 
     if mass * s.v_f() >= V_VESSEL_FLUID {
-        if gas_mass > WATER_SOLID_GAS_TOLERANCE_KG {
-            return Err(DomainError::PropertyOutOfRange { what: "gas space volume".into(), value: 0.0 });
+        if free > 0.0 {
+            return Err(DomainError::PropertyOutOfRange { what: "gas space volume".into(), value: free });
+        }
+        if t > T_COMPRESSED_MAX {
+            return Err(DomainError::PropertyOutOfRange { what: "water-solid temperature".into(), value: t });
         }
         let p = s.p + (mass * s.v_f() - V_VESSEL_FLUID) / (V_VESSEL_FLUID * s.kappa_f);
-        if p > 2.0 * VESSEL_DESIGN_PRESSURE {
-            return Err(DomainError::PropertyOutOfRange { what: "water-solid pressure".into(), value: p });
+        if !(p <= P_EOS_MAX) {
+            return Err(DomainError::PropertyOutOfRange { what: "total pressure".into(), value: p });
         }
         return Ok(Eos { t, p, p_steam: s.p, p_gas: 0.0, x: 0.0, regime: Regime::WaterSolid });
     }
 
-    let v_gas = V_VESSEL_FLUID - v_liq;
-    let p_gas = gas_mass * R_AIR * t_k / v_gas;
-    if p_gas > 2.0 * VESSEL_DESIGN_PRESSURE {
-        return Err(DomainError::PropertyOutOfRange { what: "gas partial pressure".into(), value: p_gas });
-    }
+    let v_gas = V_VESSEL_FLUID - v_liq; // > 0 here: mass * v_f < V
+    let p_gas = free * R_AIR * t_k / v_gas;
     let p = s.p + p_gas;
+    if !(p <= P_EOS_MAX) {
+        return Err(DomainError::PropertyOutOfRange { what: "total pressure".into(), value: p });
+    }
     let regime = if vent_open {
         Regime::Vented
     } else if p_gas > s.p {
@@ -860,58 +1047,110 @@ Add to the `Vessel` struct (after `energy`):
     pub gas_mass: f64,
 ```
 
-In `Vessel::new`, change the struct literal and the initialisation tail:
+Replace the whole of `Vessel::new` with (the relaxation loop body is the baseline's, reproduced so nothing is left to inference; the thermodynamic pressure `drive` reads is set before the loop and the final head is taken from the finalised state):
 
 ```rust
+    pub fn new(t: f64, level_z: f64, q: f64, w_feed: f64, t_feed: f64, vent_open: bool) -> Self {
+        // Intended initial state: a vessel below 100 degC sits at atmospheric pressure
+        // under air, a hotter one at saturation pressure with no gas. p0 is the total
+        // pressure the relaxation loop and `drive` see; the gas charge below is chosen
+        // so that solve_eos reproduces it.
+        let sg = sat_t(t);
+        let p0 = sg.p.max(P_ATM);
+        let p_gas0 = p0 - sg.p;
+        let regime0 = if vent_open {
+            Regime::Vented
+        } else if p_gas0 > sg.p {
+            Regime::GasBlanketed
+        } else {
+            Regime::Saturated
+        };
         let mut v = Self {
             mass: 0.0,
             energy: 0.0,
             gas_mass: 0.0,
-            eos: Eos { t, p: P_ATM, p_steam: 0.0, p_gas: 0.0, x: 0.0, regime: Regime::Vented },
-            // ... remaining fields unchanged (core_flow, h_in, alpha_core, alpha_ch, core,
-            // level_z, collapsed_level_z, head_vent_open, vent_flow, heatup_rate, k_fric,
-            // drive_dp, exhausted: None, last_error: None)
+            eos: Eos { t, p: p0, p_steam: sg.p, p_gas: p_gas0, x: 0.0, regime: regime0 },
+            core_flow: CORE_FLOW_RATED,
+            h_in: steam::h_liquid(t),
+            alpha_core: 0.0,
+            alpha_ch: 0.0,
+            core: CoreTh::default(),
+            level_z,
+            collapsed_level_z: level_z,
+            head_vent_open: vent_open,
+            vent_flow: 0.0,
+            heatup_rate: 0.0,
+            k_fric: Self::calibrate_friction(),
+            drive_dp: 0.0,
+            exhausted: None,
+            last_error: None,
         };
-        // A vessel colder than 100 degC sits at atmospheric pressure under air;
-        // a hotter one is at saturation pressure with no gas.
-        let p0 = sat_t(t).p.max(P_ATM);
+        // Iterate flow, voids and inventory to a consistent state at p0.
         let s = sat_p(p0);
         let h_fw = steam::h_liquid(t_feed);
         for _ in 0..200 {
-            // ... unchanged relaxation loop ...
+            let w_rec = (v.core_flow - w_feed).max(0.0);
+            // Liquid returning to the downcomer is at the bulk vessel temperature.
+            let h_ret = steam::h_liquid(t.min(s.t));
+            v.h_in = if v.core_flow > 0.0 {
+                (w_rec * h_ret + w_feed.min(v.core_flow) * h_fw) / v.core_flow
+            } else {
+                h_ret
+            };
+            v.core = core_th(&s, v.core_flow, q, v.h_in);
+            let (a_ch, _) = chimney_th(&s, v.core_flow, &v.core);
+            v.alpha_core = v.core.alpha_avg;
+            v.alpha_ch = a_ch;
+            let (drive, phi) = v.drive(&s);
+            let w_new = if drive > 0.0 { (drive / (v.k_fric * phi)).sqrt() } else { W_MIN };
+            v.core_flow = 0.7 * v.core_flow + 0.3 * w_new.max(W_MIN);
         }
-        v.drive_dp = v.drive(&s).0;
-        // Inventory: liquid volume to reach the requested level, plus dome steam.
+        // Inventory: liquid volume to reach the requested level at the saturated-liquid
+        // density (the liquid is at p0 - p_gas0 = p_sat(t); vessel.md section 4), plus
+        // dome steam.
         let v_l = liquid_volume_below(level_z, v.alpha_core, v.alpha_ch);
-        let rho_l = compressed_liquid_rho(t, p0);
         let v_g = (V_VESSEL_FLUID - v_l).max(0.0);
-        let sg = sat_t(t);
-        v.mass = v_l * rho_l + v_g * sg.rho_g;
+        v.mass = v_l * sg.rho_f + v_g * sg.rho_g;
         v.energy = energy_for(v.mass, t);
-        v.gas_mass = if v_g > 0.0 && sg.p < P_ATM { (P_ATM - sg.p) * v_g / (R_AIR * (t + 273.15)) } else { 0.0 };
+        // Air charge whose free part gives p_gas0 on the gas space.
+        v.gas_mass = if v_g > 0.0 && p_gas0 > 0.0 {
+            DISSOLVED_GAS_CAPACITY_KG + p_gas0 * v_g / (R_AIR * (t + 273.15))
+        } else {
+            0.0
+        };
         // An invalid initial condition must stay visible (master: finalize_init retains
         // domain errors), so it is recorded, not panicked on; the fallback eos is the
-        // atmospheric placeholder set above.
+        // p0 placeholder set above, a usable liquid state.
         match solve_eos(v.mass, v.energy, v.gas_mass, vent_open) {
             Ok(e) => v.eos = e,
             Err(e) => v.last_error = Some(e),
         }
         v.update_level();
+        // Final head from the finalised state (what head_formula_matches_baseline_above_
+        // chimney_top recomputes); the loop converged the flow at p0, which equals the
+        // solved pressure to within the gas-charge rounding.
+        v.drive_dp = v.drive(&v.sat_for_core()).0;
         v
+    }
 ```
 
-(Delete the old `let s = if t < 100.0 { sat_p(P_ATM) } else { sat_t(t) };` and the old `rho_l`/`m_g` lines.) `Vessel::new` adds no settling; the scenario constructors in `sim.rs` are untouched by this task and still end with `Sim::finalize_init()`, which re-bases the ledger from the vessel built here and drains `vessel.last_error` into `domain_errors` at `t = 0.0`.
+`Vessel::new` adds no settling; the scenario constructors in `sim.rs` are untouched by this task and still end with `Sim::finalize_init()`, which re-bases the ledger from the vessel built here and drains `vessel.last_error` into `domain_errors` at `t = 0.0`.
 
 Replace `update_level`:
 
 ```rust
     fn update_level(&mut self) {
-        let rho_l = compressed_liquid_rho(self.eos.t, self.eos.p);
+        // One liquid-density model (vessel.md section 4): the liquid is at the
+        // water-only pressure p - p_gas, i.e. the saturated-liquid density in the
+        // two-phase regimes and the compressed density when water-solid.
+        let rho_l = compressed_liquid_rho(self.eos.t, self.eos.p - self.eos.p_gas);
         let v_l = self.mass * (1.0 - self.eos.x) / rho_l;
         self.level_z = level_from_volume(v_l, self.alpha_core, self.alpha_ch);
         self.collapsed_level_z = level_from_volume(v_l, 0.0, 0.0);
     }
 ```
+
+`drive`, `calibrate_friction`, `core_th` and `chimney_th` keep the baseline's `steam::rho_liquid(t)` (saturated-liquid density) for every column, which is the same model in the two-phase regimes; Task 5 does not introduce the compressed density into the head (the downcomer and core columns are evaluated at the same water-only pressure, so equal-temperature non-boiling columns have zero buoyancy, tested in Task 5).
 
 Replace `sat_for_core` and add `steam_available`:
 
@@ -937,10 +1176,24 @@ In `Vessel::step` (full replacement comes in Task 4) make the minimum edits so i
 
 - [ ] **Step 5: Update `sim.rs` call sites**
 
-Apply every row of the call-site table at the top of this plan. Add `use crate::vessel::{Regime, Vessel, VesselInputs};`. In `snapshot()` add `regime: v.eos.regime,` to the `api::Vessel` literal. In `active_alarms` add after the `solid` alarm:
+Apply every row of the call-site table at the top of this plan. Add `use crate::vessel::{Regime, Vessel, VesselInputs, GAS_BLANKET_ALARM_T_C};`. The P3 Task 5 step-6 block becomes exactly:
 
 ```rust
-        if self.vessel.eos.regime == Regime::GasBlanketed && self.vessel.eos.t > 90.0 {
+        // 6: isolation condensers: pure requests from the start-of-step state. The
+        // supply hint is the vessel's vapour inventory rate when the dome holds steam
+        // above atmospheric (Vessel::steam_available, label-independent), else 0;
+        // Package 7 replaces it with its allocation.
+        let h_fg = sat_p(p.max(P_ATM)).h_fg();
+        let w_steam_available =
+            if self.vessel.steam_available() { (self.vessel.mass * self.vessel.eos.x / dt).max(0.0) } else { 0.0 };
+        let ic_requests: Vec<IcRequest> = self.ic.iter().map(|t| t.request(dt, p, w_steam_available)).collect();
+        let q_ic: f64 = ic_requests.iter().map(|r| r.w_steam_in * h_fg).sum();
+```
+
+(only the `w_steam_available` line changes; the P3 `request`/`commit`, `ic_ratio` and step-17 drain lines are untouched). In `snapshot()` add `regime: v.eos.regime,` to the `api::Vessel` literal. In `active_alarms` add after the `solid` alarm:
+
+```rust
+        if self.vessel.eos.regime == Regime::GasBlanketed && self.vessel.eos.t > GAS_BLANKET_ALARM_T_C {
             add("gas_blanket", "NONCONDENSABLE GAS IN VESSEL HEAD".into(), Severity::Warning);
         }
 ```
@@ -974,16 +1227,63 @@ Trace schema v2 (Package 2 emits these as 0.0 "populated from Package 4"): in `c
 
 - [ ] **Step 7: Fix Package 3 call sites and run everything**
 
-Run: `grep -rn "solve_eos(" crates/bwr-core/tests crates/bwr-core/src` and change any two-argument call to `solve_eos(m, e, 0.0, false)`.
-Run: `cargo test --release -p bwr-core`
-Expected: all tests pass, including `eos_roundtrip_all_regimes`, `new_cold_vessel_is_vented_at_atmospheric`, and the unchanged `plant.rs` tests (cold shutdown still vented at `P_ATM`; hot standby and full power have `gas_mass = 0` and identical pressure).
+Run: `grep -rn "solve_eos(" crates/bwr-core/tests crates/bwr-core/src crates/bwr-core/examples` and change any two-argument call to `solve_eos(m, e, 0.0, false)`. The P3 assertion `matches!(solve_eos(m, f64::NAN), Err(DomainError::EosOutOfRange { .. }))` becomes `matches!(solve_eos(m, f64::NAN, 0.0, false), Err(DomainError::PropertyOutOfRange { what, .. }) if what == "energy")` (master non-finite rule).
+Run: `grep -rn "\.subcooled\|\.solid\b" crates/bwr-core/src crates/bwr-core/tests crates/bwr-core/examples; echo "exit=$?"`
+Expected: `exit=1` (no hits). Any hit is a call site missing from the table: fix it against the table before compiling.
+Run: `cargo test --release -p bwr-core > /tmp/p4t3.log 2>&1; echo "exit=$?"; grep -n "test result\|FAILED\|panicked" /tmp/p4t3.log`
+Expected: `exit=0`; all tests pass, including `eos_roundtrip_all_regimes`, `solve_eos_rejects_invalid_arguments`, `eos_outputs_are_finite`, `eos_volume_closure`, `eos_rejects_superheated_vapour`, `eos_zero_water_endpoint`, `total_pressure_envelope_has_no_hidden_clamp`, `new_cold_vessel_is_vented_at_atmospheric`, and the unchanged `plant.rs` tests (cold shutdown still vented at `P_ATM`; hot standby and full power have `gas_mass = 0` and identical pressure).
 Run: `npm --prefix ui run typecheck`
 Expected: exit 0.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 8: Register rows, master amendment and commit**
+
+Append to `docs/model/parameters.csv` (same task as the constants):
+
+```csv
+R_AIR,287.0,J/kg/K,specific gas constant of air (head noncondensable),-,physics,confirmed,SRC-STD-01,none,none,A-040,crates/bwr-core/src/vessel.rs,ideal gas
+DISSOLVED_GAS_CAPACITY_KG,1.0,kg,noncondensable gas held in solution (no partial pressure; not swept out),-,BWR-generic,assumed,,0.1,10.0,A-040,crates/bwr-core/src/vessel.rs,air solubility ~20 mg/kg water at 0.1 MPa gives a few kg for the full inventory; constant capacity not Henry's law
+REGIME_HYSTERESIS,1.05,-,p_gas/p_steam ratio band for the Saturated/GasBlanketed display label,-,numerical,assumed,,1.01,1.2,A-040,crates/bwr-core/src/vessel.rs,display and alarm only; no physics reads the label
+P_EOS_MAX,16.0e6,Pa,numerical total-pressure limit of the vessel EOS in every regime,-,numerical,derived,SRC-IAPWS-IF97,none,none,,crates/bwr-core/src/vessel.rs,below p_sat(T_EOS_MAX) so sat_p never clamps; the design-pressure alarm is VESSEL_DESIGN_PRESSURE
+GAS_BLANKET_ALARM_T_C,90.0,degC,water temperature above which a GasBlanketed head raises the gas_blanket warning,-,BWR-generic,assumed,,60.0,99.0,A-040,crates/bwr-core/src/vessel.rs,no public BWRX value; air should be purged before boiling
+```
+
+(`SRC-STD-01` is the Package 1 CODATA row; if its `section` does not cover the gas constant, add `R (molar gas constant) and M_air` to its notes in the same commit.) Append to the table in `docs/model/assumptions.md` (P1 schema `| Id | Title | Statement | Sensitivity treatment | Interval basis | Resolved by |`):
+
+```markdown
+| A-040 | Noncondensable gas in the vessel head | Air (`R_AIR` 287 J/kg/K), ideal gas at the water temperature; gas up to `DISSOLVED_GAS_CAPACITY_KG` (1 kg) is in solution with no partial pressure and is not swept out; a vessel holding free gas cannot be driven water-solid (`PropertyOutOfRange`), so filling a cold air-filled vessel solid is outside the envelope even with the vent open; the Saturated/GasBlanketed label carries a `REGIME_HYSTERESIS` band and the `gas_blanket` alarm fires above `GAS_BLANKET_ALARM_T_C`. | Dissolved capacity 0.1..10 kg; label band and alarm threshold are display-only. | DISSOLVED_GAS_CAPACITY_KG physical: 0.1 kg (dissolution negligible) to 10 kg (above the Henry's-law solubility of the full inventory at 0.1 MPa); REGIME_HYSTERESIS and GAS_BLANKET_ALARM_T_C none | Package 4 |
+| A-044 | Core boiling pressure | Boiling in the core is evaluated at the dome total pressure (`sat_for_core`); the downcomer hydrostatic head on the core inlet pressure (about 0.15 MPa at rated level) is neglected, under-predicting the core inlet saturation temperature by about 1 degC at 7.2 MPa. | None; documented bias. | no intervals | Package 4 |
+| A-047 | Air in-leakage | Air in-leakage into a sealed sub-atmospheric vessel is not modelled; a sealed vessel below 100 degC with no free gas sits at `p_sat(t)`. | None. | no intervals | Package 4 |
+```
+
+Append to the master plan `docs/superpowers/plans/2026-10-20-refinement-master.md`, at the end of its `### P4: vessel regimes and properties` section (same commit; later packages consume these names):
+
+```markdown
+P4 extensions (consumed by P7's IC request hint and by tests; appended by P4 Task 3):
+
+```rust
+// vessel.rs: Eos carries the partial pressures; `p == p_steam + p_gas` in every regime.
+pub struct Eos { pub t: f64, pub p: f64, pub p_steam: f64, pub p_gas: f64, pub x: f64, pub regime: Regime }
+pub const DISSOLVED_GAS_CAPACITY_KG: f64 = 1.0;  // gas up to this mass exerts no partial pressure
+pub const P_EOS_MAX: f64 = 16.0e6;               // numerical total-pressure limit, every regime; sat_p never clamps below it
+pub const GAS_BLANKET_ALARM_T_C: f64 = 90.0;
+// steam.rs
+pub const T_COMPRESSED_MAX: f64 = 300.0;         // linear-compressibility domain; water-solid states above it are rejected
+impl Vessel {
+    /// Dome holds steam above atmospheric pressure (label-independent). The IC supply hint at
+    /// step 6 is `if vessel.steam_available() { mass * x / dt } else { 0.0 }`.
+    pub fn steam_available(&self) -> bool;
+    pub fn friction_dp(&self) -> f64;   // k_fric * phi2 * W^2, for momentum-balance checks
+}
+```
+
+Transfer contract at step 8: `VesselInputs.w_steam` is a request for steam (water) mass. The vessel bounds it by the steam-space inventory and `w_liquid_out` by the liquid inventory; any binding cap is reported as `InventoryExhausted` with the deficit, and the ratio `flows.w_steam / requested` is the allocation ratio at step 9. Free noncondensable gas is swept out with the steam in the dome mass ratio, outside the water ledger and never counted against the request. `mass == 0` is a valid (zero-water) vessel state; a state with volume-derived quality above 1 is `EosOutOfRange`.
+```
+
+Run: `cargo test --release -p bwr-core --test register`
+Expected: exit 0.
 
 ```bash
-git add crates/bwr-core/src/vessel.rs crates/bwr-core/src/sim.rs crates/bwr-core/src/api.rs crates/bwr-core/src/validation.rs crates/bwr-core/tests ui/src/sim/types.ts ui/src/sim/mock.ts docs/validation/method.md
+git add crates/bwr-core/src/vessel.rs crates/bwr-core/src/sim.rs crates/bwr-core/src/api.rs crates/bwr-core/src/validation.rs crates/bwr-core/tests ui/src/sim/types.ts ui/src/sim/mock.ts docs/validation/method.md docs/model/parameters.csv docs/model/assumptions.md docs/superpowers/plans/2026-10-20-refinement-master.md
 git commit -m "feat(vessel): regimes, noncondensable gas and water-solid equation of state
 
 Replaces the 'below 100 degC is atmospheric' rule with Vented / Saturated /
@@ -1004,6 +1304,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: `ledger::BoundaryFlows`, `Vessel.last_error`.
 - Produces: `pub const VENT_BOILOFF_KGS_PER_K: f64 = 0.02` (moved from the inline `0.02`), `Vessel::step` returning `BoundaryFlows` with vented gas handled outside the water ledger.
+- Register rows in this task (Step 5): `VENT_BOILOFF_KGS_PER_K`, the `C_HEAD_VENT` notes update; assumptions `A-041`, `A-043`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1014,10 +1315,11 @@ Create `crates/bwr-core/tests/vessel_transients.rs`:
 
 use bwr_core::api::{Command, ScenarioName};
 use bwr_core::domain::DomainError;
+use bwr_core::ledger::{BoundaryFlows, Ledger};
 use bwr_core::params::*;
 use bwr_core::sim::DT;
 use bwr_core::steam::{self, sat_p, sat_t, P_ATM};
-use bwr_core::vessel::{Regime, Vessel, VesselInputs};
+use bwr_core::vessel::{Regime, Vessel, VesselInputs, DISSOLVED_GAS_CAPACITY_KG};
 use bwr_core::Sim;
 
 fn run(sim: &mut Sim, seconds: f64) {
@@ -1029,6 +1331,49 @@ fn run(sim: &mut Sim, seconds: f64) {
 
 fn inputs(q_core: f64, q_ic: f64, w_liquid_out: f64) -> VesselInputs {
     VesselInputs { q_core, q_ic, w_feed: 0.0, h_feed: 0.0, w_steam: 0.0, w_liquid_out }
+}
+
+/// "Nothing applied": every transfer in `f` is zero (field-wise, so this does not
+/// depend on `BoundaryFlows: PartialEq`).
+fn nothing_applied(f: &BoundaryFlows) -> bool {
+    f.w_feed == 0.0 && f.w_steam == 0.0 && f.w_vent == 0.0 && f.w_liquid_out == 0.0 && f.q_core == 0.0 && f.q_ic == 0.0 && f.q_loss == 0.0
+}
+
+#[test]
+fn step_rejects_invalid_arguments_unchanged() {
+    // Master dt and non-finite rules: table-driven over every argument; nothing is
+    // applied, the error names the argument, and the entry state is preserved.
+    let base = Vessel::new(sat_p(P_RATED).t, Z_NWL, RATED_POWER_W, STEAM_FLOW_RATED, T_FW_RATED, false);
+    let good = VesselInputs { q_core: 1.0e8, q_ic: 1.0e6, w_feed: 100.0, h_feed: 9.0e5, w_steam: 100.0, w_liquid_out: 5.0 };
+    let names = ["q_core", "q_ic", "w_feed", "h_feed", "w_steam", "w_liquid_out"];
+    let mut cases: Vec<(String, f64, VesselInputs)> = Vec::new();
+    for &b in &[f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for (i, name) in names.iter().enumerate() {
+            let mut inp = good.clone();
+            match i {
+                0 => inp.q_core = b,
+                1 => inp.q_ic = b,
+                2 => inp.w_feed = b,
+                3 => inp.h_feed = b,
+                4 => inp.w_steam = b,
+                _ => inp.w_liquid_out = b,
+            }
+            cases.push((format!("vessel input {name}"), DT, inp));
+        }
+        cases.push(("dt".into(), b, good.clone()));
+    }
+    cases.push(("dt".into(), 0.0, good.clone()));
+    cases.push(("dt".into(), -DT, good.clone()));
+    for (what, dt, inp) in cases {
+        let mut v = base.clone();
+        let flows = v.step(dt, &inp);
+        assert!(nothing_applied(&flows), "{what}: {flows:?}");
+        assert!(matches!(&v.last_error, Some(DomainError::PropertyOutOfRange { what: w, .. }) if *w == what), "{what}: {:?}", v.last_error);
+        assert!(v.mass == base.mass && v.energy == base.energy && v.gas_mass == base.gas_mass, "{what}: inventory changed");
+        assert!(v.eos.t == base.eos.t && v.eos.p == base.eos.p && v.eos.x == base.eos.x && v.eos.regime == base.eos.regime, "{what}: eos changed");
+        assert!(v.level_z == base.level_z && v.core_flow == base.core_flow && v.h_in == base.h_in && v.exhausted == base.exhausted, "{what}: state changed");
+        assert_eq!(v.vent_flow, 0.0, "{what}: a rejected step applies no vent flow");
+    }
 }
 
 #[test]
@@ -1141,10 +1486,175 @@ fn regime_boundaries_are_continuous_and_cross_once() {
     // (d) Gas-blanketed vessel driven toward water-solid leaves the envelope through
     //     the gas-space check, never by a silent branch switch.
     let mut v = Vessel::new(40.0, VESSEL_HEIGHT - 0.5, 0.0, 0.0, 40.0, false);
-    assert!(v.gas_mass > WATER_SOLID_GAS_TOLERANCE_KG);
+    assert!(v.gas_mass > DISSOLVED_GAS_CAPACITY_KG, "fixture must hold free gas: {}", v.gas_mass);
     let ch = regime_changes(&mut v, 50.0e6, |v| v.last_error.is_some() || v.eos.t > 120.0);
     assert!(ch.is_empty(), "unexpected relabel {ch:?}");
-    assert!(matches!(v.last_error, Some(DomainError::PropertyOutOfRange { .. })), "{:?}", v.last_error);
+    assert!(
+        matches!(&v.last_error, Some(DomainError::PropertyOutOfRange { what, .. }) if what == "total pressure" || what == "gas space volume"),
+        "{:?}",
+        v.last_error
+    );
+}
+
+#[test]
+fn water_solid_boundary_with_dissolved_gas_is_continuous() {
+    // Dissolved gas (<= DISSOLVED_GAS_CAPACITY_KG) exerts no pressure on either side
+    // of the water-solid boundary, so a finite-step crossing in each direction shows
+    // the same continuity as the no-gas case (c) above. No claim is made for free gas.
+    for &gas in &[0.0, 0.001, 0.5 * DISSOLVED_GAS_CAPACITY_KG, DISSOLVED_GAS_CAPACITY_KG] {
+        // Approach: heat a nearly full saturated vessel until it goes solid.
+        let mut v = Vessel::new(150.0, VESSEL_HEIGHT - 0.02, 0.0, 0.0, 150.0, false);
+        v.gas_mass = gas;
+        v.step(DT, &inputs(0.0, 0.0, 0.0));
+        assert_eq!(v.eos.regime, Regime::Saturated, "gas {gas}");
+        assert_eq!(v.eos.p_gas, 0.0, "gas {gas}: dissolved gas exerts no pressure");
+        let mut p_hist = vec![v.eos.p];
+        let mut cross = None;
+        let mut time = 0.0;
+        while cross.is_none() && time < 3600.0 {
+            let before = v.eos.regime;
+            v.step(DT, &inputs(50.0e6, 0.0, 0.0));
+            time += DT;
+            assert!(v.last_error.is_none(), "gas {gas}: {:?}", v.last_error);
+            p_hist.push(v.eos.p);
+            if before != v.eos.regime {
+                assert_eq!((before, v.eos.regime), (Regime::Saturated, Regime::WaterSolid));
+                cross = Some(p_hist.len() - 1);
+            }
+        }
+        let i = cross.expect("never went water-solid");
+        for _ in 0..20 {
+            v.step(DT, &inputs(50.0e6, 0.0, 0.0));
+            assert!(v.last_error.is_none(), "gas {gas}: {:?}", v.last_error);
+            p_hist.push(v.eos.p);
+        }
+        let jump = (p_hist[i] - p_hist[i - 1]).abs();
+        let after = (i + 1..p_hist.len()).map(|k| (p_hist[k] - p_hist[k - 1]).abs()).fold(0.0, f64::max);
+        assert!(jump <= 2.0 * after + 100.0, "gas {gas}: approach jump {jump} Pa vs {after} Pa/step after");
+        // Departure: remove heat until the vessel leaves the solid branch; the crossing
+        // step shows no jump beyond the steeper (solid) slope before it.
+        let mut p_hist = vec![v.eos.p];
+        let mut cross = None;
+        while cross.is_none() && p_hist.len() < 200_000 {
+            let before = v.eos.regime;
+            v.step(DT, &inputs(0.0, 50.0e6, 0.0));
+            assert!(v.last_error.is_none(), "gas {gas}: {:?}", v.last_error);
+            p_hist.push(v.eos.p);
+            if before != v.eos.regime {
+                assert_eq!((before, v.eos.regime), (Regime::WaterSolid, Regime::Saturated));
+                cross = Some(p_hist.len() - 1);
+            }
+        }
+        let i = cross.expect("never left water-solid");
+        let jump = (p_hist[i] - p_hist[i - 1]).abs();
+        let before = (i.saturating_sub(21)..i - 1).map(|k| (p_hist[k + 1] - p_hist[k]).abs()).fold(0.0, f64::max);
+        assert!(jump <= 2.0 * before + 100.0, "gas {gas}: departure jump {jump} Pa vs {before} Pa/step before");
+        assert_eq!(v.eos.p_gas, 0.0, "gas {gas}");
+    }
+}
+
+#[test]
+fn steam_space_cap_binds_and_reports_deficit() {
+    // Line plus vent demand beyond the steam space: the applied steam is exactly the
+    // steam space, the shortfall is reported in the same step, and the applied value is
+    // what the Sim's allocation ratio is built from.
+    let mut v = Vessel::new(sat_p(P_RATED).t, Z_NWL, RATED_POWER_W, STEAM_FLOW_RATED, T_FW_RATED, false);
+    v.head_vent_open = true;
+    let m_steam = v.mass * v.eos.x;
+    let req = 1.0e8;
+    let flows = v.step(DT, &VesselInputs { q_core: RATED_POWER_W, q_ic: 0.0, w_feed: 0.0, h_feed: 0.0, w_steam: req, w_liquid_out: 0.0 });
+    match &v.last_error {
+        Some(DomainError::InventoryExhausted { deficit_kg }) => {
+            let applied = (flows.w_steam + flows.w_vent) * DT;
+            assert!((applied - m_steam).abs() < 1e-6 * m_steam, "applied {applied} kg vs steam space {m_steam} kg");
+            assert!(flows.w_steam < req && flows.w_vent > 0.0, "{flows:?}");
+            let deficit = v.exhausted.expect("binding cap must set exhausted");
+            assert!((deficit - *deficit_kg).abs() < 1e-9);
+            let unmet = req * DT - flows.w_steam * DT + (flows.w_vent / flows.w_steam) * (req * DT - flows.w_steam * DT);
+            assert!((deficit - unmet).abs() < 1e-6 * unmet, "deficit {deficit} vs unmet {unmet}");
+        }
+        // Removing the whole steam space in one step with rated heat added can leave
+        // the remaining liquid flashing past the saturation envelope; that is the
+        // vapour-domain exit, nothing applied (vessel.md section 1).
+        Some(DomainError::EosOutOfRange { .. }) => assert!(nothing_applied(&flows) && v.exhausted.is_none()),
+        other => panic!("expected a reported shortfall or a domain exit, got {other:?}"),
+    }
+}
+
+#[test]
+fn final_drain_commits_bounded_flows() {
+    // Zero net heat: the bounded allocation commits down to exactly zero water, the
+    // deficit is reported at each binding cap, the metal energy is retained at the
+    // zero-water endpoint, and the ledger closes on the committed states.
+    let mut v = Vessel::new(sat_p(P_RATED).t, Z_NWL, 0.0, 0.0, T_FW_RATED, false);
+    let mut ledger = Ledger::new(v.mass, v.energy);
+    let m_liq = v.mass * (1.0 - v.eos.x);
+    // Step 1: an RWCU request beyond the liquid inventory takes exactly the liquid.
+    let f1 = v.step(DT, &inputs(0.0, 0.0, 1.0e7));
+    ledger.record(DT, &f1);
+    assert!(matches!(v.last_error, Some(DomainError::InventoryExhausted { .. })), "{:?}", v.last_error);
+    assert!((f1.w_liquid_out * DT - m_liq).abs() < 1e-6 * m_liq, "applied {} kg vs liquid {m_liq} kg", f1.w_liquid_out * DT);
+    let d1 = v.exhausted.expect("deficit");
+    assert!((d1 - (1.0e7 * DT - m_liq)).abs() < 1e-6 * 1.0e7 * DT, "deficit {d1}");
+    // What remains is the steam space plus the condensate of the flash (the removed
+    // liquid's flow work), a small fraction of the liquid that left.
+    assert!(v.mass * (1.0 - v.eos.x) < 0.02 * m_liq, "{:?} mass {}", v.eos, v.mass);
+    // Step 2: steam and liquid requests beyond both inventories take everything left:
+    // the zero-water endpoint commits with the metal energy retained.
+    let m2 = v.mass;
+    let f2 = v.step(DT, &VesselInputs { q_core: 0.0, q_ic: 0.0, w_feed: 0.0, h_feed: 0.0, w_steam: 1.0e7, w_liquid_out: 1.0e7 });
+    ledger.record(DT, &f2);
+    assert!(matches!(v.last_error, Some(DomainError::InventoryExhausted { .. })), "{:?}", v.last_error);
+    assert!(((f2.w_steam + f2.w_liquid_out) * DT - m2).abs() < 1e-6 * m2);
+    assert_eq!(v.mass, 0.0);
+    assert!(v.eos.p_steam == 0.0 && v.eos.x == 1.0 && v.eos.t.is_finite() && v.eos.t > 200.0, "{:?}", v.eos);
+    assert!(v.level_z.is_finite() && v.core_flow.is_finite() && v.core_coverage() == 0.0);
+    // Step 3: nothing more can be withdrawn; the deficit is the whole request.
+    let f3 = v.step(DT, &inputs(0.0, 0.0, 10.0));
+    ledger.record(DT, &f3);
+    assert_eq!(f3.w_liquid_out, 0.0);
+    assert!((v.exhausted.unwrap() - 10.0 * DT).abs() < 1e-9);
+    assert_eq!(v.mass, 0.0);
+    // Downstream conservation on the committed states.
+    assert!(ledger.mass_residual(v.mass).abs() < 1e-6 * m_liq, "mass residual {}", ledger.mass_residual(v.mass));
+    assert!(ledger.energy_residual(v.energy).abs() < 1e-6 * v.energy.abs(), "energy residual {}", ledger.energy_residual(v.energy));
+}
+
+#[test]
+fn rwcu_cap_keeps_setpoint_and_feeds_condenser_applied_flow() {
+    // Coupled cap/rejection regression (master step 9): an RWCU reject beyond the
+    // liquid inventory is bounded at the vessel; the operator setpoint is never
+    // rescaled; the condenser receives exactly the applied liquid transfer; and the
+    // step reports what happened. With rated heat in the step, the drain either
+    // commits (InventoryExhausted) or flashes past the saturation envelope
+    // (EosOutOfRange, nothing applied); both are asserted exactly.
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 5.0);
+    let req = 1.0e7;
+    sim.fw.rwcu_reject = req;
+    let hotwell0 = sim.cond.hotwell_mass;
+    let vessel0 = sim.vessel.mass;
+    sim.step(DT);
+    let f = sim.last_flows().clone();
+    assert_eq!(sim.fw.rwcu_reject, req, "allocation must not rescale the operator setpoint");
+    assert!(f.w_liquid_out < req, "{f:?}");
+    let gain = (sim.steam.w_tcv + sim.steam.w_bypass + f.w_liquid_out - f.w_feed) * DT;
+    let got = sim.cond.hotwell_mass - hotwell0;
+    assert!((got - gain).abs() < 1e-6 * gain.abs().max(1.0), "hotwell gained {got} kg vs applied {gain} kg");
+    let lost = (f.w_steam + f.w_vent + f.w_liquid_out - f.w_feed) * DT;
+    assert!((vessel0 - sim.vessel.mass - lost).abs() < 1e-6 * lost.abs().max(1.0), "vessel lost {} vs applied {lost}", vessel0 - sim.vessel.mass);
+    let err = sim.domain_errors.iter().map(|(_, e)| e.clone()).find(|e| matches!(e, DomainError::InventoryExhausted { .. } | DomainError::EosOutOfRange { .. }));
+    match err {
+        Some(DomainError::InventoryExhausted { .. }) => {
+            assert!(f.w_liquid_out > 0.0 && sim.vessel.mass * (1.0 - sim.vessel.eos.x) < 0.02 * vessel0, "committed drain: {f:?}");
+            println!("rwcu cap: committed, applied {} kg/s of {req}", f.w_liquid_out);
+        }
+        Some(DomainError::EosOutOfRange { .. }) => {
+            assert!(nothing_applied(&f) && sim.vessel.mass == vessel0, "rejected drain must apply nothing: {f:?}");
+            println!("rwcu cap: step rejected (vapour-domain exit), nothing applied");
+        }
+        other => panic!("expected InventoryExhausted or EosOutOfRange, got {other:?} in {:?}", sim.domain_errors),
+    }
 }
 
 #[test]
