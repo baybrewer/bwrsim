@@ -401,7 +401,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Create: `docs/model/parameters.csv`
 
 **Interfaces:**
-- Consumes: `source_id`s from Task 2; `A-nnn` ids defined in Task 7 (ids are fixed here; Task 7 writes their text).
+- Consumes: source `id`s (`S-*`) from Task 2; `A-nnn` ids defined in Task 7 (ids are fixed here; Task 7 writes their text).
 - Produces: the register that `tests/register.rs` checks and that every later package appends to.
 
 - [ ] **Step 1: Write the header and the 111 params.rs rows**
