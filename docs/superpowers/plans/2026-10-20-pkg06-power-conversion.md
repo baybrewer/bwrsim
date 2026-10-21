@@ -1563,7 +1563,7 @@ Add a provisional `bop_faults`:
             Command::SetCwPump { index, on } => {
                 if index < N_CW_PUMPS {
                     if on && self.has_fault(&Fault::CwPumpTrip { index }) {
-                        self.event("cw", format!("CW pump {} start blocked: pump tripped", index + 1));
+                        self.refuse("cw", format!("CW pump {} start blocked: pump tripped", index + 1));
                         return;
                     }
                     self.cond.cw_pumps[index] = on;
@@ -1571,11 +1571,25 @@ Add a provisional `bop_faults`:
             }
             Command::SetVacuumPump { on } => {
                 if on && self.has_fault(&Fault::VacuumPumpFailed) {
-                    self.event("vac_pump", "Vacuum pump start blocked: pump failed");
+                    self.refuse("vac_pump", "Vacuum pump start blocked: pump failed");
                     return;
                 }
                 self.cond.vacuum_pump = on;
             }
+```
+
+`refuse` is a package-local helper that raises the transient operator message **and** writes the locked-key log line (master log-line convention, key `command ignored`), so every refused command is visible in `Trace.events`:
+
+```rust
+    /// Refuse an operator command: operator message plus a `command ignored:` log line.
+    fn refuse(&mut self, id: &str, detail: impl Into<String>) {
+        let detail = detail.into();
+        self.log.push((self.time, format!("command ignored: {detail}")));
+        self.event(id, detail);
+    }
+```
+
+(If Package 2 already provides an equivalent helper for ignored commands, call that instead and delete this one; the log text must start with `command ignored:` either way.)
 ```
 
 Alarms in `active_alarms`:
@@ -1899,10 +1913,7 @@ Call `let (sf, cf, ff) = self.bop_faults();` once at the top of `Sim::step` and 
                     self.fw.cond_pumps[index] = on;
                 }
             }
-            Command::SetLevelControl { mode } => {
-                let (level, flow) = (self.level_cm(), self.steam.vessel_steam_flow());
-                self.fw.set_mode(mode, level, flow);
-            }
+            Command::SetLevelControl { mode } => self.fw.set_mode(mode),
             Command::SetHeaters { in_service } => {
                 if in_service && self.has_fault(&Fault::HeatersLost) {
                     self.event("fw", "Feedwater heaters unavailable");

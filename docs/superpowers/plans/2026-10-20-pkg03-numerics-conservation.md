@@ -1654,11 +1654,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `crates/bwr-core/src/sim.rs` (`cmd_is_finite`, `apply`)
+- Modify: `crates/bwr-core/src/vessel.rs` (non-finite input guard at the top of `step`)
 - Modify: `crates/bwr-core/tests/numerics.rs`
 
 **Interfaces:**
-- Consumes: `assert_finite` (Task 1), `IcTrain.pool_mass` (Task 5 makes an empty pool a true no-sink).
-- Produces: `fn cmd_is_finite(cmd: &Command) -> bool` (private to `sim.rs`); non-finite numeric commands are ignored with event id `cmd`.
+- Consumes: `assert_finite` (Task 1), `IcTrain.pool_mass` (Task 5 makes an empty pool a true no-sink), `Vessel.last_error` (Task 6).
+- Produces: `fn cmd_is_finite(cmd: &Command) -> bool` (private to `sim.rs`); non-finite numeric commands are ignored with event id `cmd` and text `Command ignored: non-finite value` (master non-finite inputs rule). `Vessel::step` treats a non-finite `VesselInputs` field as `DomainError::PropertyOutOfRange` (same rule for public step functions; `Kinetics::advance` already does this from Task 3).
 
 **Baseline defect (verified in code):** `f64::clamp` propagates NaN, so `SetSpeed { speed: NAN }` freezes `advance()` forever, and a NaN rod target or pressure setpoint poisons rod positions or the pressure regulator. (JSON cannot carry NaN, so this only reaches the engine from in-process callers such as tests and scripted cases, which is exactly where the validation runner lives.)
 
@@ -1737,6 +1738,18 @@ fn non_finite_commands_are_ignored() {
     assert!(sim.time > 0.0, "advance must not be frozen by a NaN speed");
     assert_finite(&sim.snapshot());
 }
+
+#[test]
+fn vessel_step_rejects_non_finite_inputs() {
+    use bwr_core::vessel::{Vessel, VesselInputs};
+    let mut v = Vessel::new(sat_p(P_RATED).t, Z_NWL, RATED_POWER_W, STEAM_FLOW_RATED, T_FW_RATED, false);
+    let (m0, e0) = (v.mass, v.energy);
+    let inp = VesselInputs { q_core: f64::NAN, q_ic: 0.0, w_feed: 0.0, h_feed: 0.0, w_steam: 0.0, w_liquid_out: 0.0 };
+    let flows = v.step(DT, &inp);
+    assert!(matches!(v.last_error, Some(DomainError::PropertyOutOfRange { .. })));
+    assert_eq!((v.mass, v.energy), (m0, e0), "nothing commits on a non-finite input");
+    assert_eq!(flows, bwr_core::ledger::BoundaryFlows::default());
+}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1766,11 +1779,28 @@ fn cmd_is_finite(cmd: &Command) -> bool {
 }
 ```
 
+In `crates/bwr-core/src/vessel.rs`, at the top of `Vessel::step` (before `let s0 = self.sat();`), add the public-step-function guard:
+
+```rust
+        // Master non-finite inputs rule: reject before anything commits.
+        let fields = [
+            ("q_core", inp.q_core), ("q_ic", inp.q_ic), ("w_feed", inp.w_feed),
+            ("h_feed", inp.h_feed), ("w_steam", inp.w_steam), ("w_liquid_out", inp.w_liquid_out),
+        ];
+        if let Some((what, value)) = fields.iter().find(|(_, v)| !v.is_finite()) {
+            self.last_error = Some(DomainError::PropertyOutOfRange { what: format!("vessel input {what}"), value: *value });
+            self.vent_flow = 0.0;
+            return BoundaryFlows::default();
+        }
+```
+
 At the top of `pub fn apply(&mut self, cmd: Command)`, before `match cmd {`:
 
 ```rust
         if !cmd_is_finite(&cmd) {
-            self.event("cmd", format!("Command ignored: non-finite value in {cmd:?}"));
+            // Master non-finite inputs rule: exact event text; detail goes to the log.
+            self.log.push((self.time, format!("ignored command: non-finite value in {cmd:?}")));
+            self.event("cmd", "Command ignored: non-finite value");
             return;
         }
 ```
@@ -1783,8 +1813,8 @@ Expected: all pass. Note the runtime of the two 1 h edge cases in the commit bod
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/bwr-core/src/sim.rs crates/bwr-core/tests/numerics.rs
-git commit -m "test(core): edge-state finiteness and non-finite command rejection
+git add crates/bwr-core/src/sim.rs crates/bwr-core/src/vessel.rs crates/bwr-core/tests/numerics.rs
+git commit -m "test(core): edge-state finiteness and non-finite input rejection
 
 Covers zero power/no steam/closed valves, isolated vessel with no heat
 sink, all steam paths closed at power, and NaN/inf command payloads

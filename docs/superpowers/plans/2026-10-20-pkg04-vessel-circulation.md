@@ -49,7 +49,7 @@ Call sites of the removed `Eos.subcooled` / `Eos.solid` booleans (all must be up
 | `vessel.rs` | `Eos` struct, `solve_eos` | new struct / new function |
 | `vessel.rs` | `Vessel::new` initial `eos: Eos { ..subcooled: true, solid: false }` | `Eos { t, p: P_ATM, p_steam: 0.0, p_gas: 0.0, x: 0.0, regime: Regime::Vented }` |
 | `vessel.rs` | `update_level` `if self.eos.subcooled { rho_liquid } else { sat_t.rho_f }` | `compressed_liquid_rho(self.eos.t, self.eos.p)` |
-| `vessel.rs` | `step` vent `!self.eos.subcooled`; `h_liq`; `w_steam = if subcooled {0}` | regime match (Task 4) |
+| `vessel.rs` | `step` vent `!self.eos.subcooled`; `h_liq`; `w_steam = if subcooled {0}` | steam-space composition split and cap, no regime match (Task 4) |
 | `vessel.rs` | `sat_for_core` | `sat_p(self.eos.p)` unconditionally |
 | `sim.rs` | `step`: `compute_flows(if self.vessel.eos.subcooled { P_ATM } else { p }, ...)` | `compute_flows(p, ...)` |
 | `sim.rs` | `step`: `let steam_avail = !self.vessel.eos.subcooled;` | `let steam_avail = self.vessel.steam_available();` |
