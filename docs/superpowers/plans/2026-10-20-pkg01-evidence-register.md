@@ -36,10 +36,12 @@ See master plan Global Constraints; in addition:
 
 ### CSV schemas (locked)
 
-`sources.csv` (12 columns):
+These headers are quoted verbatim in the master plan section "Locked CSV headers". Every reader (tests, later packages) looks columns up **by header name**, never by position, so a later package may append a column at the end without breaking anything. A later package may never rename, reorder, or remove one of these columns.
+
+`sources.csv` (12 columns; first column `id` as the master requires):
 
 ```
-source_id,document_id,title,revision,date,jurisdiction,url,section,retrieval_date,sha256,kind,notes
+id,document_id,title,revision,date,jurisdiction,url,section,retrieval_date,sha256,kind,notes
 ```
 
 `kind` is one of `vendor-proposal`, `regulator-assessment`, `accepted-methodology`, `standard`, `textbook`, `index-page`.
@@ -50,7 +52,7 @@ source_id,document_id,title,revision,date,jurisdiction,url,section,retrieval_dat
 id,value,unit,definition,reference_state,source_design,status,source_ids,interval_lo,interval_hi,assumption_id,location,notes
 ```
 
-Column meanings: `id` is the `pub const` name for `params.rs` constants, or `<file>.<name>` for hardcoded values elsewhere; `reference_state` is the plant state the value refers to (`rated`, `cold`, `HFP`, `-`); `source_design` is `BWRX-300`, `ESBWR`, `BWR-generic`, `physics`, `tuning`, `numerical`, or `ui-demo`; `interval_lo`/`interval_hi` give the sensitivity interval or `none` when the spec's "no defensible interval" case applies; `assumption_id` is required for `assumed` and `esbwr-estimate` rows.
+Column meanings: `id` is the `pub const` name for `params.rs` constants, or `<file>.<name>` for hardcoded values elsewhere; `reference_state` is the plant state the value refers to (`rated`, `cold`, `HFP`, `-`); `source_design` is `BWRX-300`, `ESBWR`, `BWR-generic`, `physics`, `tuning`, `numerical`, `shell` (Tauri shell timing), or `ui-demo`; `interval_lo`/`interval_hi` give the sensitivity interval or `none` when the spec's "no defensible interval" case applies; `assumption_id` is required for `assumed` and `esbwr-estimate` rows.
 
 `esbwr-applicability.csv` (10 columns):
 
@@ -163,19 +165,20 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Create: `docs/model/sources.csv`
 
 **Interfaces:**
-- Produces: `source_id` values `S-01`..`S-12`, `S-STD-01`..`S-STD-05`, `S-UK-01` referenced by `parameters.csv` and `esbwr-applicability.csv`.
+- Produces: `id` values `S-01`..`S-12`, `S-05S`, `S-STD-01`..`S-STD-05`, `S-UK-01`, and the per-chapter ids `S-CRN-<ch>`, `S-ESBWR-<ch>`, `S-UK-<ch>` referenced by `parameters.csv` and `esbwr-applicability.csv`.
 
 - [ ] **Step 1: Write the header and seed rows**
 
 Write `docs/model/sources.csv` with exactly this content (one line per row; `UNRETRIEVED` placeholders are replaced in Step 3):
 
 ```csv
-source_id,document_id,title,revision,date,jurisdiction,url,section,retrieval_date,sha256,kind,notes
+id,document_id,title,revision,date,jurisdiction,url,section,retrieval_date,sha256,kind,notes
 S-01,NRC-BWRX-INDEX,NRC BWRX-300 pre-application activities and topical report index,-,-,US,https://www.nrc.gov/facilities-safety/new-reactors/advanced-reactors/who-were-working-with/pre-application-activities/gvh-bwrx-300,-,UNRETRIEVED,UNRETRIEVED,index-page,entry point only; cite the documents it links
 S-02,NRC-CRN-INDEX,NRC Clinch River construction permit application and PSAR index,-,-,US,https://www.nrc.gov/facilities-safety/new-reactors/advanced-reactors/who-were-working-with/advanced-reactor-application-projects/tva-clinch-river-cpa,-,UNRETRIEVED,UNRETRIEVED,index-page,PSAR chapters are the primary US plant-level source
 S-03,GEV-GDA-LIB,GE Vernova BWRX-300 UK GDA document library,-,-,UK,https://www.gevernova.com/nuclear/uk-smr/documents-list,-,UNRETRIEVED,UNRETRIEVED,index-page,supplementary jurisdiction; check configuration differences before use
 S-04,NRC-ESBWR-INDEX,NRC ESBWR design certification index (DCD Rev. 10 and safety evaluation),-,-,US,https://www.nrc.gov/facilities-safety/new-reactors/large-light-water-reactors/design-certification-applications-for-new-reactors/esbwr,-,UNRETRIEVED,UNRETRIEVED,index-page,locate DCD Tier 2 chapters 4 5 6 7 9 10 14 15 16
-S-05,NUREG-1966-V2,Final Safety Evaluation Report related to the certification of the ESBWR Volume 2 Chapters 4 through 8,-,-,US,https://www.nrc.gov/regulations-legislation/nureg-series-publications/publications-prepared-by-nrc-staff/final-safety-evaluation-report-related-to-the-certification-of-the-economic-simplified-boiling-water/v2,-,UNRETRIEVED,UNRETRIEVED,regulator-assessment,also index the supplement
+S-05,NUREG-1966-V2,Final Safety Evaluation Report related to the certification of the ESBWR Volume 2 Chapters 4 through 8,-,-,US,https://www.nrc.gov/regulations-legislation/nureg-series-publications/publications-prepared-by-nrc-staff/final-safety-evaluation-report-related-to-the-certification-of-the-economic-simplified-boiling-water/v2,-,UNRETRIEVED,UNRETRIEVED,regulator-assessment,volume 2 PDF
+S-05S,NUREG-1966-S1,Final Safety Evaluation Report related to the certification of the ESBWR Supplement 1,-,-,US,https://www.nrc.gov/facilities-safety/new-reactors/large-light-water-reactors/design-certification-applications-for-new-reactors/esbwr,-,UNRETRIEVED,UNRETRIEVED,regulator-assessment,locate the supplement PDF via S-04 and replace this URL with the direct link
 S-06,005N9751,BWRX-300 General Description,UNRETRIEVED,UNRETRIEVED,US,https://www.gevernova.com/content/dam/gevernova-nuclear/global/en_us/documents/carbon-free-power/005N9751_Rev_BWRX-300_General_Description.pdf,-,UNRETRIEVED,UNRETRIEVED,vendor-proposal,source of the baseline CONFIRMED values; includes comparison with ESBWR
 S-07,NEDO-33910-A,BWRX-300 Reactor Pressure Vessel Isolation and Overpressure Protection,Rev. 2,UNRETRIEVED,US,https://www.nrc.gov/docs/ML2316/ML23167A086.pdf,-,UNRETRIEVED,UNRETRIEVED,accepted-methodology,integral isolation valves; no SRVs
 S-08,NEDO-33912-A,BWRX-300 Reactivity Control,Rev. 2,UNRETRIEVED,US,https://www.nrc.gov/docs/ML2304/ML23048A018.pdf,-,UNRETRIEVED,UNRETRIEVED,accepted-methodology,FMCRD arrangement; shutdown margin methodology
@@ -196,9 +199,21 @@ S-STD-05,IAPWS-IF97,IAPWS Industrial Formulation 1997 for the thermodynamic prop
 Run: `awk -F',' 'NF!=12{print NR": "NF" fields"}' docs/model/sources.csv`
 Expected: no output (every line has 12 fields).
 
-- [ ] **Step 3: Retrieve each PDF source and fill revision, date, retrieval date, and checksum**
+- [ ] **Step 3: Add one row per chapter-level document located through the index pages**
 
-For each of S-05, S-06, S-07, S-08, S-09, S-10, S-11, S-12 (and the DCD chapters located via S-04, added as new rows `S-ESBWR-04`, `S-ESBWR-05`, ... one per Tier 2 chapter):
+The spec asks for the latest applicable revisions of the Clinch River PSAR chapters, the GE UK GDA chapters, and the ESBWR DCD Tier 2 chapters. Index pages are not citable, so add one row per chapter PDF, with these fixed ids and the chapter list fixed here:
+
+| Id pattern | Located via | Chapters to add (one row each) | `kind` | `jurisdiction` |
+|---|---|---|---|---|
+| `S-CRN-04` .. `S-CRN-15` | S-02 | PSAR chapters 4 (reactor), 5 (RCS and connected systems), 6 (ESF), 7 (I&C), 9 (auxiliaries), 10 (steam and power conversion), 15 (transient analyses) | `vendor-proposal` | `US` |
+| `S-ESBWR-04` .. `S-ESBWR-16` | S-04 | DCD Rev. 10 Tier 2 chapters 4, 5, 6, 7, 9, 10, 14, 15, 16 | `vendor-proposal` (DCD) | `US` |
+| `S-UK-04` .. `S-UK-15` | S-03 | GDA chapters matching the PSAR list above where they exist; replace the seeded `S-UK-01` row with `S-UK-04` once the exact PDF is located | `vendor-proposal` | `UK` |
+
+Each new row uses the direct PDF URL (not the index URL), the revision and date printed on the cover, and gets its checksum in Step 4. A chapter that does not exist publicly gets `url` = `not-public`, `sha256` = `none`, and `notes` = `not available publicly on <date>`; it is never left out silently.
+
+- [ ] **Step 4: Retrieve each PDF source and fill revision, date, retrieval date, and checksum**
+
+For each of S-05, S-05S, S-06, S-07, S-08, S-09, S-10, S-11, S-12 and every `S-CRN-*`, `S-ESBWR-*`, `S-UK-*` row added in Step 3:
 
 ```bash
 mkdir -p ~/ai/bwrsim-sources
@@ -209,12 +224,12 @@ date +%Y-%m-%d
 
 Expected: a 64-hex-character digest followed by the path; today's date. Copy the digest into the `sha256` field, today's date into `retrieval_date`, and the revision and issue date printed on the document's cover into `revision` and `date`. Repeat per document. Source PDFs stay outside the repository (`~/ai/bwrsim-sources/` is not tracked); only the checksum is recorded. Index pages (S-01..S-04) keep `sha256` = `none` and get only `retrieval_date`.
 
-- [ ] **Step 4: Verify no `UNRETRIEVED` remains in a PDF row**
+- [ ] **Step 5: Verify no `UNRETRIEVED` remains in a PDF row and the shape still holds**
 
-Run: `grep -n UNRETRIEVED docs/model/sources.csv | grep -v index-page`
+Run: `grep -n UNRETRIEVED docs/model/sources.csv | grep -v index-page; awk -F',' 'NF!=12{print NR": "NF" fields"}' docs/model/sources.csv`
 Expected: no output. (Rows S-STD-02..04 use `none` for `sha256` because they are print books; their `retrieval_date` is the date the citation was verified.)
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add docs/model/sources.csv
@@ -240,20 +255,21 @@ Create `crates/bwr-core/tests/register.rs`:
 
 ```rust
 //! Enforces the parameter register: every `pub const` in params.rs has a row in
-//! docs/model/parameters.csv, every row has the locked 13-column shape, and
-//! every status is one of the six allowed values.
+//! docs/model/parameters.csv, every row has the same number of fields as the
+//! header, the locked columns exist, and every status is one of the six
+//! allowed values. Columns are looked up by header name, never by position,
+//! so later packages may append columns without touching this test.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 const PARAMS_RS: &str = include_str!("../src/params.rs");
 const ALLOWED_STATUS: [&str; 6] = ["confirmed", "derived", "calibrated", "esbwr-estimate", "assumed", "unavailable"];
-const COLUMNS: usize = 13;
-const COL_ID: usize = 0;
-const COL_STATUS: usize = 6;
-const COL_INTERVAL_LO: usize = 8;
-const COL_INTERVAL_HI: usize = 9;
-const COL_ASSUMPTION: usize = 10;
+/// Locked header (master plan "Locked CSV headers"); columns may be appended after these, never renamed.
+const LOCKED_COLUMNS: [&str; 13] = [
+    "id", "value", "unit", "definition", "reference_state", "source_design", "status",
+    "source_ids", "interval_lo", "interval_hi", "assumption_id", "location", "notes",
+];
 
 fn register_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/model/parameters.csv")
@@ -270,15 +286,41 @@ fn const_names() -> Vec<String> {
         .collect()
 }
 
-/// Data rows of parameters.csv (header skipped, blank lines ignored), split on commas.
-fn rows() -> Vec<Vec<String>> {
-    let text = std::fs::read_to_string(register_path())
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", register_path().display()));
-    text.lines()
-        .skip(1)
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| line.split(',').map(|field| field.trim().to_string()).collect())
-        .collect()
+/// A CSV register parsed by header name. Fields never contain commas (register rule).
+struct Register {
+    header: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
+
+impl Register {
+    fn load(path: &Path) -> Self {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+        let header: Vec<String> = lines
+            .next()
+            .expect("register has no header line")
+            .split(',')
+            .map(|f| f.trim().to_string())
+            .collect();
+        let rows = lines.map(|line| line.split(',').map(|f| f.trim().to_string()).collect()).collect();
+        Self { header, rows }
+    }
+
+    /// Column index by header name; panics with the header listed if absent.
+    fn col(&self, name: &str) -> usize {
+        self.header
+            .iter()
+            .position(|h| h == name)
+            .unwrap_or_else(|| panic!("column {name:?} missing from header {:?}", self.header))
+    }
+
+    fn get<'a>(&self, row: &'a [String], name: &str) -> &'a str {
+        row.get(self.col(name)).map(String::as_str).unwrap_or("")
+    }
+}
+
+fn parameters() -> Register {
+    Register::load(&register_path())
 }
 
 #[test]
@@ -290,30 +332,43 @@ fn params_rs_scan_finds_the_constants() {
 }
 
 #[test]
+fn header_contains_every_locked_column() {
+    let reg = parameters();
+    for name in LOCKED_COLUMNS {
+        assert!(reg.header.iter().any(|h| h == name), "locked column {name:?} missing from header {:?}", reg.header);
+    }
+    // Locked columns keep their relative order so hand-edited rows stay readable.
+    let positions: Vec<usize> = LOCKED_COLUMNS.iter().map(|n| reg.col(n)).collect();
+    assert!(positions.windows(2).all(|w| w[0] < w[1]), "locked columns were reordered: {positions:?}");
+}
+
+#[test]
 fn every_params_const_is_registered() {
-    let ids: HashSet<String> = rows().into_iter().map(|r| r[COL_ID].clone()).collect();
-    let missing: Vec<String> = const_names().into_iter().filter(|n| !ids.contains(n)).collect();
+    let reg = parameters();
+    let ids: HashSet<&str> = reg.rows.iter().map(|r| reg.get(r, "id")).collect();
+    let missing: Vec<String> = const_names().into_iter().filter(|n| !ids.contains(n.as_str())).collect();
     assert!(missing.is_empty(), "constants in params.rs with no parameters.csv row: {missing:?}");
 }
 
 #[test]
 fn every_row_has_valid_shape_and_status() {
-    let rows = rows();
-    assert!(!rows.is_empty(), "parameters.csv has no data rows");
+    let reg = parameters();
+    assert!(!reg.rows.is_empty(), "parameters.csv has no data rows");
+    let width = reg.header.len();
     let mut seen = HashSet::new();
-    for (i, r) in rows.iter().enumerate() {
+    for (i, r) in reg.rows.iter().enumerate() {
         let line = i + 2;
-        let id = r.get(COL_ID).cloned().unwrap_or_default();
-        assert_eq!(r.len(), COLUMNS, "line {line} ({id}): {} fields; fields must not contain commas", r.len());
+        let id = reg.get(r, "id").to_string();
+        assert_eq!(r.len(), width, "line {line} ({id}): {} fields but header has {width}; fields must not contain commas", r.len());
         assert!(seen.insert(id.clone()), "line {line}: duplicate id {id}");
-        let status = r[COL_STATUS].as_str();
+        let status = reg.get(r, "status");
         assert!(ALLOWED_STATUS.contains(&status), "line {line} ({id}): status {status:?} not in {ALLOWED_STATUS:?}");
         if status == "assumed" || status == "esbwr-estimate" {
-            assert!(r[COL_ASSUMPTION].starts_with("A-"), "line {line} ({id}): {status} rows need an assumption_id like A-001");
+            assert!(reg.get(r, "assumption_id").starts_with("A-"), "line {line} ({id}): {status} rows need an assumption_id like A-001");
         }
         if status == "unavailable" {
-            let lo = r[COL_INTERVAL_LO].as_str();
-            let hi = r[COL_INTERVAL_HI].as_str();
+            let lo = reg.get(r, "interval_lo");
+            let hi = reg.get(r, "interval_hi");
             let both_none = lo == "none" && hi == "none";
             let both_numeric = lo.parse::<f64>().is_ok() && hi.parse::<f64>().is_ok();
             assert!(both_none || both_numeric, "line {line} ({id}): unavailable rows need a numeric interval or none/none");
@@ -322,10 +377,12 @@ fn every_row_has_valid_shape_and_status() {
 }
 ```
 
+Later packages that read this register (P5 shutdown-margin test, P9 scenarios) copy the `Register` helper pattern and look rows up by `id` and columns by name, exactly as above.
+
 - [ ] **Step 2: Run it and confirm it fails because the register does not exist yet**
 
 Run: `cargo test --release -p bwr-core --test register 2>&1 | tail -20`
-Expected: `params_rs_scan_finds_the_constants ... ok`; `every_params_const_is_registered ... FAILED` and `every_row_has_valid_shape_and_status ... FAILED` with a panic message containing `cannot read` and `docs/model/parameters.csv`.
+Expected: `params_rs_scan_finds_the_constants ... ok`; `header_contains_every_locked_column ... FAILED`, `every_params_const_is_registered ... FAILED` and `every_row_has_valid_shape_and_status ... FAILED`, each with a panic message containing `cannot read` and `docs/model/parameters.csv`.
 
 - [ ] **Step 3: Commit the failing test**
 
@@ -348,6 +405,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Produces: the register that `tests/register.rs` checks and that every later package appends to.
 
 - [ ] **Step 1: Write the header and the 111 params.rs rows**
+
+This register covers only constants that exist at the reviewed baseline. **No placeholder rows are seeded for constants that later packages will introduce** (for example `KIN_EXCESS_MAX`, `SDM_REQUIRED`, `MAX_BACKLOG_S`, `N_IC_RETURN_VALVES`). When a package adds a `pub const` to `params.rs`, `every_params_const_is_registered` fails until that package appends the row in the same commit; that failure is the intended gate, not something to suppress. Hardcoded values that a package introduces outside `params.rs` are appended as `<file>.<name>` rows by that package (not test-enforced; checked at package review).
 
 Write `docs/model/parameters.csv` with the header line followed by these rows, exactly as given (the executor may correct a typo in a value only after checking `params.rs`; do not change statuses):
 
@@ -469,7 +528,7 @@ CW_PUMP_POWER,2.0e6,W,Electrical power per running circulating water pump,-,BWR-
 - [ ] **Step 2: Run the register tests**
 
 Run: `cargo test --release -p bwr-core --test register 2>&1 | tail -8`
-Expected: `test result: ok. 3 passed; 0 failed`.
+Expected: `test result: ok. 4 passed; 0 failed`.
 
 If `every_params_const_is_registered` lists a missing name, add that row (the scan is authoritative; the table above was transcribed by hand from `params.rs`).
 
@@ -523,7 +582,8 @@ reactor.sri_group,rods at |dx|=2 and |dy|=2,-,Select Rod Insert group (4 symmetr
 reactor.kinetics_substep,1.0e-3,s,Fixed kinetics substep,-,numerical,assumed,,none,none,A-016,reactor.rs step(),Package 3 makes adaptive
 reactor.htc_factor_floor,0.02,-,Floor on fuel-to-coolant heat transfer factor when uncovered,-,tuning,assumed,,none,none,A-005,reactor.rs step(),
 reactor.period_meter_tau,1.0,s,Period meter smoothing time constant,-,tuning,assumed,,0.5,3.0,A-017,kinetics.rs step(),
-kinetics.n_floor,1e-14,rel,Floor applied to neutron population after each implicit step,-,numerical,assumed,,none,none,A-016,kinetics.rs step(),hides nonpositive denominator; Package 3
+kinetics.n_floor,1e-14,rel,Floor applied to neutron population after each implicit step,-,numerical,assumed,,none,none,A-016,kinetics.rs step(),hides nonpositive denominator (master defect 2); Package 3
+kinetics.period_from_zero,ln(n1/n0) with n0=0,1/s,Period estimator divides by the previous population with no floor,-,numerical,assumed,,none,none,A-016,kinetics.rs step(),Kinetics::equilibrium(0.0) then step() gives infinite inv_period then NaN (master defect 12); Package 3
 ic.ua_pool_ref,100,degC,Pool temperature at which IC_TRAIN_RATED_W is defined,rated,ESBWR,esbwr-estimate,S-04,none,none,A-013,ic.rs ua(),
 ic.tube_lag,20,s,Tube drain/fill time constant,-,tuning,assumed,,5,60,A-013,ic.rs step(),
 ic.coverage_threshold,40,% pool level,Pool level below which tube coverage falls linearly to zero,-,tuning,assumed,,20,60,A-013,ic.rs step(),
@@ -582,7 +642,8 @@ bop.fw_heater_out_factor,0.65,-,Fraction of heating retained with HP heaters out
 bop.fw_temp_lag,180,s,Feedwater temperature time constant,-,tuning,assumed,,60,600,A-012,bop.rs Feedwater::step(),
 bop.fw_pump_heat,2.0,K,Temperature rise across running feed pumps,-,BWR-generic,assumed,,1,4,A-012,bop.rs Feedwater::step(),
 sim.DT,0.05,s,Fixed plant time step,-,numerical,assumed,,0.0125,0.1,A-016,sim.rs,convergence study in Package 3
-sim.max_steps_per_advance,4000,-,Step cap per advance call (accumulator zeroed when hit),-,numerical,assumed,,none,none,A-016,sim.rs advance(),silently drops time; Package 10
+sim.max_steps_per_advance,4000,-,Step cap per advance call (accumulator zeroed when hit),-,numerical,assumed,,none,none,A-016,sim.rs advance(),silently drops time (master defect 9); becomes MAX_STEPS_PER_ADVANCE with MAX_BACKLOG_S accounting in Package 10
+sim.downstream_requested_flows,steam and reject flows passed unbounded,-,Turbine condenser and feedwater consume requested not applied vessel outflows,-,numerical,assumed,,none,none,A-016,sim.rs step()/protection(),no transfer allocation (master defect 13); Package 3
 sim.speed_clamp,0.1..100,-,Simulation speed clamp,-,ui-demo,assumed,,none,none,A-019,sim.rs apply(),
 sim.scram_reset_delay,10,s,Minimum time after scram before reset is accepted,-,BWR-generic,assumed,,none,none,A-014,sim.rs apply(),
 sim.sri_power_threshold,0.4,rel,Power above which turbine trip / load rejection triggers Select Rod Insert,-,BWR-generic,assumed,,0.3,0.6,A-014,sim.rs protection(),
@@ -629,7 +690,7 @@ steam.sigma_form,0.2358*tau^1.256*(1-0.625*tau),N/m,Surface tension correlation,
 - [ ] **Step 2: Run the register tests**
 
 Run: `cargo test --release -p bwr-core --test register 2>&1 | tail -4`
-Expected: `test result: ok. 3 passed; 0 failed`.
+Expected: `test result: ok. 4 passed; 0 failed`.
 
 - [ ] **Step 3: Commit**
 
@@ -670,15 +731,15 @@ ui.mock.tsat_form,179.9*p^0.24,degC,Mock saturation temperature fit,-,ui-demo,as
 ui.history.TREND_WINDOW_S,600,s,Trend window,-,ui-demo,assumed,,none,none,A-019,ui/src/sim/history.ts,
 ui.history.MIN_SAMPLE_DT,1,s,Trend sampling interval (decimation),-,ui-demo,assumed,,none,none,A-019,ui/src/sim/history.ts,can hide sub-second excursions; Package 10
 ui.topbar.SPEEDS,1;2;5;10;30,x,Available simulation speeds,-,ui-demo,assumed,,none,none,A-019,ui/src/components/TopBar.tsx,
-tauri.tick_ms,20,ms,Background physics loop sleep,-,numerical,assumed,,none,none,A-016,src-tauri/src/lib.rs,
-tauri.emit_ms,100,ms,Snapshot emit interval,-,numerical,assumed,,none,none,A-016,src-tauri/src/lib.rs,
-tauri.max_real_dt,0.5,s,Cap on wall-clock dt per loop iteration,-,numerical,assumed,,none,none,A-016,src-tauri/src/lib.rs,
+tauri.tick_ms,20,ms,Background physics loop sleep between advance calls,-,shell,assumed,,10,50,A-016,src-tauri/src/lib.rs run(),commands apply only between advance calls; Package 10 defines the boundary rule
+tauri.emit_ms,100,ms,Snapshot emit cadence (10 Hz of 20 Hz physics),-,shell,assumed,,50,200,A-016,src-tauri/src/lib.rs run(),can hide sub-second excursions (master defect 10); Package 10 adds extrema
+tauri.max_real_dt,0.5,s,Wall-clock dt clamp dt.min(0.5) per loop iteration,-,shell,assumed,,none,none,A-016,src-tauri/src/lib.rs run(),discards wall-clock time after any stall over 0.5 s (master defect 11); removed in Package 10
 ```
 
 - [ ] **Step 2: Run the register tests and count rows**
 
 Run: `cargo test --release -p bwr-core --test register 2>&1 | tail -4 && wc -l docs/model/parameters.csv`
-Expected: `3 passed`; line count of at least `260` (header + 111 + 128 + 20).
+Expected: `4 passed`; line count of at least `262` (header + 111 + 130 + 20).
 
 - [ ] **Step 3: Commit**
 
@@ -723,7 +784,7 @@ Rule: every `assumed` or `esbwr-estimate` row in `parameters.csv` cites one of t
 | A-013 | Isolation condensers | 3 trains at 33.75 MWt each (ESBWR unit size); 1.5e6 kg pool per train; single lumped valve; 20 s tube lag; idle pool cooling without accounting. | Duty 20..45 MWt; pool mass re-derived from the 7-day claim. | Package 7 |
 | A-014 | Protection setpoints and alarms | All scram, isolation, trip, block, and alarm setpoints are BWR-generic; level setpoints L1..L8 relative to NWL; legacy SRM/IRM/APRM arrangement. | Cause-and-effect matrix with provenance. | Package 8 |
 | A-015 | House loads | 4 MW base plus per-pump loads. | Intervals in parameters.csv. | Package 6 |
-| A-016 | Numerical choices | 0.05 s plant step; 1 ms kinetics substep; 12 axial nodes; void lags 0.5/2 s; 1000 kg inventory floor; EOS bisection 1..349.5 degC; 4000-step advance cap. | Convergence at 0.05/0.025/0.0125 s; floors replaced by domain errors. | Package 3; 10 |
+| A-016 | Numerical and shell timing choices | 0.05 s plant step; 1 ms kinetics substep; 12 axial nodes; void lags 0.5/2 s; 1000 kg inventory floor; EOS bisection 1..349.5 degC; 4000-step advance cap; downstream components consume requested rather than applied vessel outflows; Tauri loop 20 ms tick, 100 ms emit, 0.5 s wall-clock clamp. | Convergence at 0.05/0.025/0.0125 s; floors replaced by domain errors; transfer allocation in Package 3; backlog accounting replaces the clamp in Package 10. | Package 3; 10 |
 | A-017 | Instrument indication models | SRM cps = n*2e10+3; IRM full scale 0.4*10^((range-10)/2); APRM = n; period meter 1 s filter; heatup-rate 30 s filter; no sensor lag, range, or failure. | Sensor models in Package 8. | Package 8 |
 | A-018 | Scenario initial conditions | Cold shutdown: 30 days decay; 40 degC; vented (reaching 40 degC needs a system not modelled). Hot standby: 2 days decay; 6.9 MPa; one feed pump. Full power: rods inserted to criticality then settled; xenon reset to equilibrium. | Verified in Package 9. | Package 9 |
 | A-019 | UI demonstration mock | Browser mock physics are not the simulator; constants are demo-only and never cited as plant behaviour. | None; mock is relabelled in Package 10. | Package 10 |
@@ -887,15 +948,35 @@ git commit -m "docs: link the model evidence register from the README
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
+- [ ] **Step 4: Prove the acceptance gate (hard barrier for Package 3)**
+
+The master dependency table makes Package 3 depend on **both** Package 1 and Package 2 acceptance gates: no physics change is made before the register exists and is enforced. The proof that Package 1's gate is passed is exactly this command on the committed tree:
+
+Run: `git status --porcelain docs/model crates/bwr-core/tests/register.rs && cargo test --release -p bwr-core --test register 2>&1 | tail -3`
+Expected: the `git status` line prints nothing (everything committed) and the test output ends with `test result: ok. 4 passed; 0 failed; 0 ignored`.
+
+Record the commit hash that produced this output in `docs/model/coverage.md` under a final line `Package 1 acceptance: <hash> on <date>`; Package 3's executor checks that line and re-runs the command before starting.
+
+```bash
+git add docs/model/coverage.md
+git commit -m "docs(model): record Package 1 acceptance gate
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
 ---
 
 ## Acceptance gate (verbatim from the spec)
 
 "A reviewer can trace every consequential behavior to evidence or an explicit assumption. Public descriptions, accepted methods, and confirmed numerical plant data are distinguished."
 
+This gate is a hard barrier: Package 3 (and everything after it) may not start until it passes together with Package 2's gate.
+
 Checklist for the reviewer:
 
-- [ ] `cargo test --release -p bwr-core --test register` passes.
+- [ ] `cargo test --release -p bwr-core --test register` passes (4 tests) on the committed tree, and `coverage.md` records the acceptance hash.
+- [ ] `register.rs` looks up every column by header name (`Register::col`), never by index.
+- [ ] Every chapter-level source (`S-CRN-*`, `S-ESBWR-*`, `S-UK-*`) has a direct PDF URL and checksum, or an explicit `not-public` note.
 - [ ] No `UNRETRIEVED` remains in a non-index row of `sources.csv`; every PDF row has a 64-character `sha256`.
 - [ ] Every `assumed`/`esbwr-estimate` row in `parameters.csv` cites an `A-nnn` that exists in `assumptions.md`.
 - [ ] No row was promoted to `confirmed` without a `source_ids` entry whose `sources.csv` row has a section and checksum.
