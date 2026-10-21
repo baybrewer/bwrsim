@@ -1,37 +1,46 @@
-# Package 7: Isolation Condensers and Shutdown Heat Removal — Implementation Plan
+# Package 7: Isolation Condensers and Shutdown Heat Removal — Implementation Plan (r2)
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Names and signatures come from `docs/superpowers/plans/2026-10-20-refinement-master.md` ("Shared interface contract", section P7); if this file and the master disagree, the master wins.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Names and signatures come from `docs/superpowers/plans/2026-10-20-refinement-master.md` r2 ("Shared interface contract", section P7, and the "Shared `Sim::step` order"); if this file and the master disagree, the master wins.
 
-**Goal:** Replace the single-valve, energy-only isolation condenser (IC) model with a per-train model that moves steam and condensate through explicit valves, tube inventory and a pool whose energy is conserved, so that heat removal is physically supplied, endurance claims are tied to stated conditions, and the lower temperature limit of IC cooling is a declared boundary rather than an accident of vessel heat loss.
+**Goal:** Replace the single-valve, energy-only isolation condenser (IC) model with a per-train model that moves steam and condensate through explicit valves, tube inventory and a pool whose energy is conserved, so that heat removal is physically supplied and bounded by what the vessel can give, endurance claims are tied to stated conditions, and the lower temperature limit of IC cooling is a declared boundary rather than an accident of vessel heat loss.
 
-**Architecture:** `ic.rs` becomes a mass-and-energy component: steam in through a normally-open steam valve, condensate held in tubes until one of two parallel normally-closed return valves opens, condensate back to the vessel at saturated-liquid enthalpy. The vessel sees two mass flows instead of a heat sink. `Sim` maps `Fault`s onto per-train availability, valve freezes and UA degradation every step, raises `DomainError::IcModelEnvelope` when a pool is exhausted while still loaded, and logs initiation events for ordering tests. Long-duration validation cases use a coarser time step after the first ten minutes with a convergence check.
+**Architecture:** `ic.rs` becomes a mass-and-energy component: steam in through a normally-open steam valve, condensate held in tubes (with its own enthalpy) until one of two parallel normally-closed return valves opens, condensate back to the vessel at the tube water's enthalpy. Each train produces a *requested* steam withdrawal; the vessel is the transfer-allocation point (master step 8) and `Sim` rescales each train to the *applied* value (step 9) so the ledger, the energy balance and the snapshot all see one number. `Sim` maps `Fault`s onto per-train availability, valve freezes and UA degradation through a `Copy` fault view, raises `DomainError::IcModelEnvelope` through `Sim::domain_error` when a pool is exhausted while still loaded, and logs initiation for ordering tests. Long-duration validation cases use `Case.dt_after_s` with a convergence check.
 
-**Tech Stack:** Rust 2021, serde, existing `bwr-core` modules from Packages 2–6 (`ledger`, `faults`, `validation`, `domain`, `vessel::Regime`), TypeScript mirror in `ui/src/sim/types.ts`, `mock.ts`, `PlantMimic.tsx`.
+**Tech Stack:** Rust 2021, serde, existing `bwr-core` modules from Packages 2–6 (`ledger`, `faults`, `validation`, `domain`, `vessel::Regime`, `bop::EnergyBalance`), TypeScript mirror in `ui/src/sim/types.ts`, `mock.ts`, `PlantMimic.tsx`.
 
 **Spec:** Package 7 of `docs/superpowers/plans/2026-10-20-existing-systems-refinement.md`.
 
 ## Global Constraints
 
-Everything in the master plan's "Global Constraints" section applies. Package-specific restatements from the spec:
+Everything in the master plan's "Global Constraints" section applies, including the Derives rule. Package-specific restatements from the spec:
 
 - "Do not scale dimensions, inventory, flow, decay-heat removal capacity, or timing by electrical output alone."
 - "Include a justified sensitivity treatment for noncondensable gas degradation. Do not invent exact design performance or purge behavior."
 - "Run unattended cooling tests to 72 hours and seven days where these durations match the selected source claim. Specify initial operating history, credited trains, makeup, and external services."
 - "If complete cold-shutdown cooling requires an unimplemented system, document that boundary instead of attributing its function to ICS or arbitrary vessel heat loss."
-- "GE's public BWRX general description identifies integral RPV isolation valves, elimination of conventional safety relief valves, and dry containment as distinguishing features." and "The NRC/CNSC containment evaluation report also notes that IC function and reactor connections differ despite design heritage." — ESBWR IC material is a shared-concept source only.
+- "GE's public BWRX general description identifies integral RPV isolation valves, elimination of conventional safety relief valves, and dry containment as distinguishing features." and "The NRC/CNSC containment evaluation report also notes that IC function and reactor connections differ despite design heritage." ESBWR IC material is a shared-concept source only.
 - No new crate or npm dependencies.
-- Every new constant gets a `docs/model/parameters.csv` row.
+- Every new constant gets a `docs/model/parameters.csv` row (13 locked columns: `id,value,unit,definition,reference_state,source_design,status,source_ids,interval_lo,interval_hi,assumption_id,location,notes`); P1's `tests/register.rs` fails the build until the row exists.
+- Every consumer of a transfer uses the applied (post-allocation) value.
 
 **Acceptance gate (verbatim from the spec):** "Heat removal is physically supplied and conserved; endurance claims identify conditions and evidence. Shutdown scenarios remain valid through their declared endpoint."
 
-## Assumed state at start of this package
+## Assumed state at start of this package (check before Task 1)
 
-- P2: `Sim.ledger: Ledger`, `Vessel::step(..) -> BoundaryFlows`, `Sim.log: Vec<(f64, String)>`, `Sim.faults`, `Sim::set_fault`, `validation::{Case, run_case, standard_cases, Trace, Tolerance}`, `examples/validation.rs` with `--write-baseline` and compare modes, `.github/workflows/validate.yml`.
-- P3: `domain::DomainError` with `IcModelEnvelope { train, reason }` variant declared; `Sim.domain_errors: Vec<(f64, DomainError)>`; `IcTrain::step` currently returns `IcStep { q_removed, w_condensate_return, energy_to_pool, pool_boiloff_kg }` and takes `(dt, t_sat, steam_available, h_fg)`; pool overshoot bug fixed.
-- P4: `vessel::Regime`, `Eos.regime`, `Vessel::sat()`.
-- P6: `Fault::CwPumpTrip`, `Fault::FeedPumpTrip`, `Fault::BypassUnavailable` honoured; `Sim.balance: EnergyBalance` with `q_ic_w`.
+```bash
+cd /Users/jim/ai/bwrsim
+grep -n "IcModelEnvelope" crates/bwr-core/src/domain.rs
+grep -n "pub fn domain_error" crates/bwr-core/src/sim.rs
+grep -n "pub fn find_fault\|pub faults: Vec<Fault>" crates/bwr-core/src/sim.rs
+grep -n "pub fn step(&mut self, dt: f64, t_sat: f64, h_fg: f64, steam_available: bool)" crates/bwr-core/src/ic.rs
+grep -n "dt_after_s\|operator: Operator" crates/bwr-core/src/validation.rs | head -3
+grep -n "ic_heat_w_0\|ic_pool_kg_0\|ic_return_pos_0\|t_coolant_c" crates/bwr-core/src/validation.rs | head -4
+grep -n "w_ic_steam\|h_ic_return" crates/bwr-core/src/ledger.rs
+grep -n "pub enum Regime" crates/bwr-core/src/vessel.rs
+grep -n "storage_w\|q_ic_w" crates/bwr-core/src/bop.rs
+```
 
-Check these with `grep -n "IcModelEnvelope" crates/bwr-core/src/domain.rs` and `grep -n "pub fn step" crates/bwr-core/src/ic.rs` before Task 1; if a name differs, fix it in that package's file first (one-line commit), not here.
+Every grep must hit. If one does not, the owning package (P2 ledger/validation, P3 domain/ic interim, P4 regime, P6 balance) is incomplete; fix it there in a one-line commit, not here. Known state from those plans: `BoundaryFlows` already carries `w_ic_steam`, `w_ic_return`, `h_ic_return` (zero before this package) and `q_ic`; `Ledger::record` already counts `w_ic_return` in `mass_in_kg`, `w_ic_steam` in `mass_out_kg`, `q_ic` in `energy_out_j`, and fills `integrated["ic_steam_kg"|"ic_return_kg"|"ic_j"]`; the interim `IcStep` has `pool_cooling_w`; `Sim::domain_error` dedups by variant and logs `DOMAIN: <reason>`; the trace schema is v2 with 59 columns and the three IC per-train column triplets emitted as `0.0`/`valve_pos` until this package; the runner regenerates baselines with `--write`.
 
 ## Names introduced by this package (beyond the master contract)
 
@@ -40,19 +49,21 @@ Check these with `grep -n "IcModelEnvelope" crates/bwr-core/src/domain.rs` and `
 | `IC_TUBE_CAPACITY_KG` | `params.rs` | Condensate that fills one train's tubes and drain line, kg. ASSUMED 5 000. |
 | `IC_DRAIN_TAU_S` | `params.rs` | Drain time constant through an open return valve, s. ASSUMED 20. |
 | `IC_POOL_MASS_TOTAL` | `params.rs` | Total pool water for all trains, kg. DERIVED from the 7-day claim (Task 1). |
-| `IC_POOL_MASS` | `params.rs` | Per-train bay, `IC_POOL_MASS_TOTAL / N_IC_TRAINS as f64`. |
-| `IC_POOL_COOLING_W` | `params.rs` | Credited pool cooling system duty, W. ASSUMED 0. |
+| `IC_POOL_MASS` | `params.rs` | Per-train bay, `IC_POOL_MASS_TOTAL / N_IC_TRAINS as f64` (replaces the 1.5e6 ASSUMED value). |
+| `IC_POOL_COOLING_W` | `params.rs` | Credited pool cooling system duty, W. ASSUMED 0. Replaces P3's `POOL_IDLE_COOLING_K_PER_S`, which is deleted. |
 | `IC_POOL_T_AMBIENT` | `params.rs` | Floor for an idle pool's temperature, degC. ASSUMED 40. |
-| `CP_WATER`, `H_FG_ATM` | `ic.rs` | 4186 J/kgK, 2.257e6 J/kg (IAPWS at 100 degC). |
 | `IcTrain.steam_valve_cmd_open: bool` | `ic.rs` | Set by `Sim` from `Fault::IcSteamValveClosed`. |
 | `IcTrain.return_valve_stuck: [bool; N_IC_RETURN_VALVES]` | `ic.rs` | Set by `Sim` from `Fault::IcReturnValveStuck`. |
-| `IcTrain::envelope_exceeded(&self, t_sat: f64) -> bool` | `ic.rs` | Pool empty while in service and steam is hotter than 100 degC. |
-| `IcStep.pool_cooling_w: f64` | `ic.rs` | Fifth field: energy leaving the pool to the (uncredited) cooling system this step. |
-| `VesselInputs.{w_ic_steam, w_ic_return, h_ic_return}` | `vessel.rs` | Replace `VesselInputs.q_ic`. |
-| `BoundaryFlows.{w_ic_steam, w_ic_return}` | `ledger.rs` | Added; `q_ic` kept and now equals `w_ic_steam*h_g - w_ic_return*h_ic_return`. |
-| `Case.dt_after_s: Option<(f64, f64)>` | `validation.rs` | `(from_t, dt)`: after `from_t` seconds of sim time use `dt` instead of the run dt. |
-| `DT_LONG` | `validation.rs` | 0.5 s, the coarse step for long cases. |
-| `docs/validation/results/*.csv` | repo | Tables written by tests when `BWR_WRITE_RESULTS=1`. |
+| `IcTrain::envelope_exceeded(&self, t_sat: f64) -> bool` | `ic.rs` | Pool empty while in service and steam hotter than the boiling pool. |
+| `IcTrain::tube_h(&self) -> f64` | `ic.rs` | Specific enthalpy of the tube condensate, J/kg (`tube_energy / tube_mass`). |
+| `IcFaults { unavailable, steam_closed, return_stuck, degradation }` | `sim.rs` | `#[derive(Clone, Copy, Debug, Default)]` fault view built per train by `Sim::ic_faults(&self, train) -> IcFaults` (mirrors P6's `bop_faults`). |
+| `Sim.ic_envelope_raised: Vec<bool>` | `sim.rs` | Private, one per train; prevents re-raising after the first depletion. Reset in `Sim::base`. |
+| `Sim::cw_pumps_all_off(&self) -> bool` | `sim.rs` | Public test helper. |
+| `DT_LONG` | `validation.rs` | 0.5 s, the coarse step used by `dt_after_s` for long cases. |
+| `--long` | `examples/validation.rs` | Includes cases with `duration_s > 86400` in a runner invocation. |
+| `docs/validation/results/{ic-availability,ic-degradation,ic-inadvertent,ic-endurance}.csv` | repo | Written by tests when `BWR_WRITE_RESULTS=1` (master file list). |
+
+Master names used unchanged: `N_IC_RETURN_VALVES`, `IcTrain` fields, `IcStep { q_removed, w_steam_in, w_condensate_return, h_condensate_return, energy_to_pool, pool_boiloff_kg, pool_cooling_w }`, `IcTrain::in_service`, `IcTrain::step(dt, p_vessel, w_steam_available)`, `VesselInputs { q_core, w_ic_steam, w_ic_return, h_ic_return, w_feed, h_feed, w_steam, w_liquid_out }`, `BoundaryFlows.{w_ic_steam, w_ic_return, h_ic_return, q_ic}`, `Case.dt_after_s`, `Sim::domain_error`, `Sim::find_fault`, trace columns `ic_heat_w_i`, `ic_pool_kg_i`, `ic_return_pos_i`, `t_coolant_c`.
 
 ---
 
@@ -65,39 +76,42 @@ Check these with `grep -n "IcModelEnvelope" crates/bwr-core/src/domain.rs` and `
 - Test: `crates/bwr-core/src/ic.rs` (unit test `derived_pool_mass_covers_seven_days_to_100c`)
 
 **Interfaces:**
-- Consumes: `reactor::DecayHeat::after_history(n, irr_s, cooled_s)` (P5), `vessel::energy_for(mass, t)`, `Sim::new(ScenarioName::FullPower)`.
-- Produces: constants `N_IC_RETURN_VALVES`, `IC_TUBE_CAPACITY_KG`, `IC_DRAIN_TAU_S`, `IC_POOL_MASS_TOTAL`, `IC_POOL_MASS`, `IC_POOL_COOLING_W`, `IC_POOL_T_AMBIENT` used by every later task.
+- Consumes: `reactor::DecayHeat::after_history(n, irr_s, cooled_s)` (P5), `vessel::energy_for(mass, t)`, `Sim::new(ScenarioName::FullPower)`, `ic::H_FG_ATM` (P3).
+- Produces: constants `N_IC_RETURN_VALVES`, `IC_TUBE_CAPACITY_KG`, `IC_DRAIN_TAU_S`, `IC_POOL_MASS_TOTAL`, `IC_POOL_MASS`, `IC_POOL_COOLING_W`, `IC_POOL_T_AMBIENT`; assumption ids `A-020`..`A-029`; applicability ids `E-07`..`E-09`; source id `S-ESBWR-05`.
 
-- [ ] **Step 1: Record the sources this package relies on**
-
-Run and paste the checksums into `docs/model/sources.csv` using the column order Package 1 created:
+- [ ] **Step 1: Record the sources**
 
 ```bash
 cd /Users/jim/ai/bwrsim && mkdir -p /tmp/bwr-src && cd /tmp/bwr-src
 curl -sSLo esbwr-dcd-r10-ch5.pdf "https://www.nrc.gov/docs/ML1410/ML14104A929.pdf"
-curl -sSLo bwrx-general-description.pdf "https://www.gevernova.com/content/dam/gevernova-nuclear/global/en_us/documents/carbon-free-power/005N9751_Rev_BWRX-300_General_Description.pdf"
+curl -sSLo 005N9751.pdf "https://www.gevernova.com/content/dam/gevernova-nuclear/global/en_us/documents/carbon-free-power/005N9751_Rev_BWRX-300_General_Description.pdf"
 curl -sSLo nedo-33934-r2.pdf "https://www.nrc.gov/docs/ML2607/ML26077A383.pdf"
 curl -sSLo nrc-cnsc-containment.pdf "https://www.nrc.gov/docs/ML2209/ML22091A201.pdf"
 shasum -a 256 *.pdf
 ```
 
-If the DCD chapter URL has moved, find "ESBWR DCD Revision 10 Tier 2 Chapter 5" from the NRC ESBWR index linked in the spec and record the URL you actually used. Rows to add (fill `retrieved` with today's date and `sha256` from the command):
+If the DCD chapter URL has moved, locate "ESBWR DCD Revision 10 Tier 2 Chapter 5" from source `S-04` and record the URL actually used. In `docs/model/sources.csv` (12 columns `id,document_id,title,revision,date,jurisdiction,url,section,retrieval_date,sha256,kind,notes`):
+
+- Add one row:
 
 ```
-SRC-IC-01,ESBWR DCD Tier 2 Rev. 10 Ch. 5 (5.4.6 Isolation Condenser System),10,2014-04,US NRC,<url>,5.4.6,<retrieved>,<sha256>,vendor design document accepted in certification
-SRC-IC-02,BWRX-300 General Description 005N9751,Rev. per file,<date on cover>,GE Hitachi,<url>,ICS section,<retrieved>,<sha256>,vendor description
-SRC-IC-03,NEDO-33934 Safety Strategy Rev. 2,2,<date on cover>,US NRC ADAMS ML26077A383,<url>,ICS and decay heat removal,<retrieved>,<sha256>,vendor topical report
-SRC-IC-04,NRC/CNSC joint report on BWRX-300 containment evaluation method,-,2022-03,US NRC ADAMS ML22091A201,<url>,IC function differences,<retrieved>,<sha256>,regulator assessment
+S-ESBWR-05,ESBWR-DCD-T2-CH5,ESBWR Design Control Document Tier 2 Chapter 5 (Reactor Coolant System and Connected Systems),Rev. 10,2014-04,US,<url used>,5.4.6 Isolation Condenser System,<today>,<sha256>,vendor-design-certified,shared-concept source for IC valve arrangement and pool boil-off; not a BWRX value source
 ```
+
+- Fill `revision`, `date`, `retrieval_date`, `sha256` on the existing rows `S-06` (005N9751), `S-09` (NRC/CNSC containment), `S-10` (NEDO-33934) if they still read `UNRETRIEVED`, and set their `section` cells to the ICS section/page you read (for `S-10` record the page that states the number of IC trains and the passive cooling duration).
+
+Run: `awk -F',' 'NF!=12{print NR": "NF" fields"}' docs/model/sources.csv`
+Expected: no output.
 
 - [ ] **Step 2: Write the subsystem specification**
 
-Create `docs/model/isolation-condensers.md` with exactly this content (fill the two `<...>` numbers in Step 6):
+Create `docs/model/isolation-condensers.md` with exactly this content (the two `<value>` cells are filled in Step 6):
 
-```markdown
+````markdown
 # Isolation Condenser System (ICS) — model specification
 
 Package 7 of the refinement program. Status words follow `docs/model/parameters.csv`.
+Assumptions are `A-020`..`A-029` in `docs/model/assumptions.md`.
 
 ## Function modelled
 
@@ -115,48 +129,67 @@ boiling point.
 
 | Item | Value | Status | Source / assumption |
 |---|---|---|---|
-| Trains | `N_IC_TRAINS` = 3 | assumed (to verify) | SRC-IC-02 / SRC-IC-03 state the number of trains; executor confirms and updates status to `confirmed` with the page reference, or leaves `assumed` with A-IC-01 |
-| Steam supply valve per train | 1, normally open | shared concept | SRC-IC-01 5.4.6; A-IC-02 |
-| Condensate return valves per train | `N_IC_RETURN_VALVES` = 2 in parallel, normally closed | shared concept | SRC-IC-01 5.4.6 describes parallel return valves; SRC-IC-04 notes BWRX connections differ; A-IC-02 |
-| Rated duty per train | `IC_TRAIN_RATED_W` = 33.75 MW at 7.2 MPa with a boiling pool | esbwr-estimate | ESBWR IC unit duty. **Not a BWRX value.** Sensitivity ±30 % (Task 7 results) |
-| Pool water, all trains | `IC_POOL_MASS_TOTAL` = <value> kg | derived | 1.10 x (7-day decay energy after 2 y at rated + vessel stored energy 287.7 -> 100 degC) / h_fg(100 degC). A-IC-03 |
-| Pool water per train | `IC_POOL_MASS` = total / 3 | assumed split | separate bays assumed; a shared pool would change the 1- and 2-train results. A-IC-04 |
-| Tube/drain condensate capacity | `IC_TUBE_CAPACITY_KG` = 5 000 kg | assumed | A-IC-05 |
-| Drain time constant | `IC_DRAIN_TAU_S` = 20 s | assumed | A-IC-06 |
-| Valve stroke | `IC_VALVE_STROKE` = 15 s | assumed | A-IC-07 |
-| Idle pool floor | `IC_POOL_T_AMBIENT` = 40 degC | assumed | A-IC-08 |
+| Trains | `N_IC_TRAINS` = 3 | assumed (to verify) | S-06 / S-10 state the number of trains; executor records the page in `S-10.section` and promotes the row to `confirmed`, or leaves `assumed` with A-020 |
+| Steam supply valve per train | 1, normally open | shared concept | S-ESBWR-05 5.4.6; E-07; A-021 |
+| Condensate return valves per train | `N_IC_RETURN_VALVES` = 2 in parallel, normally closed | shared concept | S-ESBWR-05 5.4.6 describes parallel return valves; S-09 notes BWRX connections differ; E-07; A-021 |
+| Rated duty per train | `IC_TRAIN_RATED_W` = 33.75 MW at 7.2 MPa with a boiling pool | esbwr-estimate | ESBWR IC unit duty (E-08). **Not a BWRX value.** Sensitivity ±30 % reported in `results/ic-availability.csv` |
+| Pool water, all trains | `IC_POOL_MASS_TOTAL` = <value> kg | derived | 1.10 x (7-day decay energy after 2 y at rated + vessel stored energy 287.7 -> 100 degC) / h_fg(100 degC). A-022 |
+| Pool water per train | `IC_POOL_MASS` = total / 3 | assumed split | separate bays assumed; a common pool would improve the 1- and 2-train results. A-023 |
+| Tube/drain condensate capacity | `IC_TUBE_CAPACITY_KG` = 5 000 kg | assumed | A-024 |
+| Drain time constant | `IC_DRAIN_TAU_S` = 20 s | assumed | A-025 |
+| Valve stroke | `IC_VALVE_STROKE` = 15 s | assumed | A-026 |
+| Idle pool floor | `IC_POOL_T_AMBIENT` = 40 degC | assumed | A-027 |
 
 ## Equations (per train, each step)
 
+Symbols: `p` vessel pressure, `T_sat = T_sat(p)`, `h_f, h_g, h_fg` at `p`, `T_pool`,
+`m_tube` and `E_tube` the tube condensate mass and enthalpy content, `h_tube = E_tube / m_tube`,
+`T_tube = T(h_tube)` on the liquid line.
+
 - Valves move linearly at `1/IC_VALVE_STROKE` per second toward their commands; a
   stuck valve or an unavailable train does not move.
-- Condensing surface fraction `f_surf = 1 - tube_mass / IC_TUBE_CAPACITY_KG`.
-  With return valves closed the tubes flood and condensation stops; this is the
-  mechanism that keeps a standby train idle.
-- Pool coverage `cov = clamp(pool_level_pct / 40, 0, 1)`.
-- Duty `q = UA * ua_factor * max(T_sat - T_pool, 0) * steam_valve_pos * f_surf * cov`,
-  bounded by what the pool can absorb this step. `UA = IC_TRAIN_RATED_W / (T_sat(7.2 MPa) - 100)`.
-- Steam in `w_steam_in = q / h_fg(p_vessel)`; condensate drains at
-  `w_return = sqrt(max(return_valve_pos)) * tube_mass / IC_DRAIN_TAU_S`.
-- Vessel: mass `-w_steam_in + w_return`; energy `-w_steam_in*h_g + w_return*h_f`
-  (condensate subcooling neglected, A-IC-09). Vessel + tubes + pool close exactly.
-- Pool: sensible heating to 100 degC, then boil-off at `H_FG_ATM`; no overshoot.
-  Energy leaving to the cooling system is `IC_POOL_COOLING_W` (0).
+- Condensing surface fraction `f_surf = 1 - m_tube / IC_TUBE_CAPACITY_KG`. With the
+  return valves closed the tubes flood and condensation stops: that is what keeps a
+  standby train idle.
+- Pool coverage `cov = clamp(pool_level_pct / 40, 0, 1)`; `UA = IC_TRAIN_RATED_W / (T_sat(7.2 MPa) - 100)`;
+  `UA_eff = UA * ua_factor * steam_valve_pos * cov`.
+- Tube water cooling to the pool: `q_cool = min(UA_eff * (T_tube - T_pool)+, m_tube * CP_WATER * (T_tube - T_pool)+ / dt)`.
+  This is the only heat path when no steam is available; it is bounded by the
+  energy stored in the tube water and never continues through a lag.
+- Condensation (requires `w_steam_available > 0`): `w_in = min(UA_eff * f_surf * (T_sat - T_pool)+ / h_fg, w_steam_available, (pool capacity/dt - q_cool)/h_fg)`;
+  `q_cond = w_in * h_fg`. `w_in` is the train's REQUESTED withdrawal; the vessel
+  allocates and `Sim` rescales the train to the applied value.
+- Drain: `w_return = min(sqrt(max(return_valve_pos)) * m_tube / IC_DRAIN_TAU_S, m_tube/dt + w_in)` at enthalpy `h_tube`.
+- Tubes: `dm_tube = w_in - w_return`; `dE_tube = w_in*h_f - w_return*h_tube - q_cool`.
+- Pool: `q_removed = q_cond + q_cool` (sensible heating to 100 degC, then boil-off
+  at `H_FG_ATM`, no overshoot); cooling to the uncredited system `IC_POOL_COOLING_W`.
+- Vessel (applied values): mass `-w_in + w_return`; energy `-w_in*h_g + w_return*h_tube`.
+  Identity: `w_in*h_g - w_return*h_tube = q_removed + dE_tube/dt` so vessel + tubes + pool
+  close exactly; `BoundaryFlows.q_ic` is DERIVED from the two mass flows.
 - Noncondensable degradation: `ua_factor = 1 - pct/100` from a test-level fault.
-  No purge or accumulation dynamics (A-IC-10).
+  No purge or accumulation dynamics (A-029).
 
-## Initiation and control (ASSUMED, see protection.csv when Package 8 lands)
+## Initiation and control (ASSUMED; protection.csv rows in Package 8)
 
 Automatic open of all available trains' return valves on `IC_HIGH_PRESSURE`, L2,
 or MSIV isolation at power. Latched: valves stay commanded open until the operator
 closes them. Manual `SetIcTrain` is honoured in both directions; a command to an
-unavailable train is rejected with an operator message.
+unavailable train is rejected with an operator message and a log line.
+
+## Transfer allocation
+
+The IC trains run at master step 6 and request steam. The vessel (step 8) bounds all
+outflows together; at step 9 `Sim` multiplies every train's `w_steam_in` and `heat`
+by `flows.w_ic_steam / requested`. The ratio is 1.0 except in the step in which
+`InventoryExhausted` is raised; in that step the pools have already absorbed the
+requested energy, and the difference `(requested - applied) * h_fg * dt` is a known,
+flagged discrepancy confined to that step (A-028).
 
 ## Lower temperature limit (declared boundary)
 
-An IC can only reject heat while `T_sat(p_vessel) > T_pool`. With a boiling pool
-the vessel cannot be cooled below about 100 degC by the ICs; afterwards the pool
-cools only by the uncredited cooling system. Therefore:
+An IC can only reject heat while `T_sat(p) > T_pool`. With a boiling pool the vessel
+cannot be cooled below about 100 degC by the ICs; afterwards the pool cools only by
+the uncredited cooling system. Therefore:
 
 - Cold shutdown below 100 degC requires a shutdown cooling system that is not
   implemented. The `ColdShutdown` scenario starts at 40 degC as an **assumed
@@ -170,53 +203,56 @@ Case `fp_scram_ic_7d`: scram and MSIV closure at t = 5 s from rated power with
 equilibrium xenon after 2 y at rated power, 3 trains credited, no makeup, no pool
 cooling, no AC power assumed or needed. Reported: pool fraction at 72 h and 7 d,
 vessel temperature at 7 d, peak pressure. The 7-day figure is the simulator's own
-result under these assumptions, not a reproduction of the vendor claim.
+result under these assumptions, not a reproduction of the vendor claim (S-10).
 
 ## Results tables
 
 Written by `tests/ic_transients.rs` with `BWR_WRITE_RESULTS=1` into
-`docs/validation/results/ic-availability.csv`, `ic-degradation.csv`, `ic-endurance.csv`.
-```
+`docs/validation/results/ic-availability.csv`, `ic-degradation.csv`,
+`ic-inadvertent.csv`, `ic-endurance.csv`.
+````
 
-- [ ] **Step 3: Add assumption entries**
+- [ ] **Step 3: Add assumption rows**
 
-Append to `docs/model/assumptions.md`:
+Append to the table in `docs/model/assumptions.md` (P1 columns `| id | title | content | sensitivity | package |`):
 
 ```markdown
-- A-IC-01 Three IC trains. Public GE descriptions state three; executor records the page or leaves assumed.
-- A-IC-02 One normally-open steam supply valve and two parallel normally-closed return valves per train (ESBWR arrangement adopted as a shared concept; BWRX connection differences noted in SRC-IC-04 do not change the valve function modelled).
-- A-IC-03 Pool inventory derived from 7-day decay energy plus vessel stored energy to 100 degC with 10 % margin. Sensible capacity of a cold pool (40 -> 100 degC, about +11 %) is not credited.
-- A-IC-04 Pool water split equally into separate bays, one per train. A common pool would make 1- and 2-train endurance better than reported.
-- A-IC-05 Tube and drain condensate capacity 5 000 kg per train.
-- A-IC-06 Drain time constant 20 s through an open return valve; either parallel valve passes full drain flow.
-- A-IC-07 Valve stroke 15 s.
-- A-IC-08 Idle pool cools no lower than 40 degC and only via the uncredited cooling term.
-- A-IC-09 Condensate returns at saturated-liquid enthalpy at vessel pressure (subcooling neglected: conservative for vessel energy, slightly optimistic for return water reactivity).
-- A-IC-10 Noncondensable degradation is a fixed UA multiplier set by a test fault; no accumulation or purge dynamics.
+| A-020 | IC train count | Three trains. Public GE descriptions state three; the executor records the page in S-10 or leaves this assumed. | 2..4 trains; see results/ic-availability.csv | Package 7 |
+| A-021 | IC valve arrangement | One normally-open steam supply valve and two parallel normally-closed condensate return valves per train (ESBWR arrangement adopted as a shared concept, E-07; BWRX connection differences in S-09 do not change the valve function modelled). Either return valve passes full drain flow. | 1 vs 2 return valves | Package 7 |
+| A-022 | IC pool inventory | Derived from 7-day decay energy (2 y at rated) plus vessel stored energy to 100 degC with 10 % margin, divided by h_fg at 100 degC. Sensible capacity of a cold pool (40 -> 100 degC, about +11 %) is not credited. | see results/ic-endurance.csv | Package 7 |
+| A-023 | IC pool split | Pool water split equally into separate bays, one per train. A common pool would make 1- and 2-train endurance better than reported. | shared vs separate | Package 7 |
+| A-024 | IC tube inventory | Tube and drain condensate capacity 5 000 kg per train; condensing surface falls linearly with flooding. | 2 000..10 000 kg | Package 7 |
+| A-025 | IC drain time constant | 20 s through an open return valve. | 10..60 s | Package 7 |
+| A-026 | IC valve stroke | 15 s for steam and return valves. | 5..30 s | Package 7 |
+| A-027 | IC pool idle floor | Idle pool cools no lower than 40 degC and only via the uncredited cooling term IC_POOL_COOLING_W (0 W). | 20..50 degC; 0..2 MW | Package 7 |
+| A-028 | IC allocation discrepancy | In the single step in which the vessel cannot supply the requested IC steam, the pools absorb the requested rather than the applied energy; the difference is flagged by InventoryExhausted and confined to that step. | none | Package 7 |
+| A-029 | IC noncondensable treatment | Degradation is a fixed UA multiplier set by a test fault; no accumulation or purge dynamics. | 0..50 % | Package 7 |
 ```
 
 - [ ] **Step 4: Add applicability rows**
 
-Append to `docs/model/esbwr-applicability.csv` (Package 1 column order: esbwr_source, target_subsystem, bwrx_evidence, differences, adaptation, limits, test, classification):
+Append to `docs/model/esbwr-applicability.csv` (10 columns `id,esbwr_source,esbwr_section,target_subsystem,bwrx_evidence,differences,adaptation,applicability_limits,test,classification`):
 
 ```
-"DCD Tier 2 5.4.6 ICS arrangement",isolation condensers,"SRC-IC-02 ICS description","BWRX integral RPV isolation valves; IC connections differ (SRC-IC-04)","valve function and count adopted; no containment heat-removal role","no containment or IC-line-break modelling",ic_transients::parallel_return_valve_redundancy,shared concept
-"DCD Tier 2 5.4.6 IC unit duty 33.75 MWt",isolation condensers,"none public for BWRX","BWRX thermal power 870 vs 4500 MWt; train count 3 vs 4","used as per-train duty with +/-30 % sensitivity","not a BWRX performance claim",ic_transients::capacity_sensitivity,provisional numerical estimate
-"DCD Tier 2 5.4.6 pool boil-off and gravity return",isolation condensers,"SRC-IC-03 7-day passive cooling claim","pool geometry unknown; inventory derived not copied","pool mass derived from energy integral",none,ic::derived_pool_mass_covers_seven_days_to_100c,adapted model
-"DCD Tier 2 6.2 containment heat removal by PCCS/IC pools",isolation condensers,"SRC-IC-04","BWRX dry containment; ICs do not serve containment","not used",n/a,n/a,inapplicable
+E-07,DCD Rev 10 Tier 2,Ch 5.4.6 ICS valve arrangement,Isolation condensers,S-06;S-10,BWRX integral RPV isolation valves; IC connections differ (S-09),Valve function and count adopted; no containment heat-removal role,No containment or IC-line-break modelling,ic_transients.rs::stuck_return_valve_is_held_and_parallel_valve_carries_the_train,shared concept
+E-08,DCD Rev 10 Tier 2,Ch 5.4.6 IC unit duty 33.75 MWt,Isolation condensers,none public for BWRX,BWRX thermal power 870 vs 4500 MWt; 3 vs 4 trains,Used as per-train duty with +/-30 % sensitivity,Not a BWRX performance claim,ic_transients.rs::train_availability_matrix,provisional numerical estimate
+E-09,DCD Rev 10 Tier 2,Ch 5.4.6 pool boil-off and gravity return; Ch 6.2 PCCS pools,Isolation condensers,S-10 7-day passive cooling claim,Pool geometry unknown; BWRX dry containment: ICs serve no containment function,Pool mass derived from energy integral; containment role not used,Containment heat removal inapplicable,ic::tests::derived_pool_mass_covers_seven_days_to_100c,adapted model
 ```
 
-- [ ] **Step 5: Write the failing pool-inventory test**
+Run: `awk -F',' 'NF!=10{print NR": "NF" fields"}' docs/model/esbwr-applicability.csv`
+Expected: no output.
 
-Append to the `#[cfg(test)] mod tests` block in `crates/bwr-core/src/ic.rs` (create the block if absent):
+- [ ] **Step 5: Write the failing pool-inventory test and the constants**
+
+Append inside the `#[cfg(test)] mod tests` block of `crates/bwr-core/src/ic.rs`:
 
 ```rust
     #[test]
     fn derived_pool_mass_covers_seven_days_to_100c() {
         use crate::api::ScenarioName;
         use crate::reactor::DecayHeat;
-        use crate::vessel::energy_for;
         use crate::sim::Sim;
+        use crate::vessel::energy_for;
         let irr = 2.0 * 365.25 * 86400.0;
         let dt = 60.0;
         let mut e_decay = 0.0;
@@ -241,68 +277,64 @@ Append to the `#[cfg(test)] mod tests` block in `crates/bwr-core/src/ic.rs` (cre
     }
 ```
 
-Add the constants to `crates/bwr-core/src/params.rs`, replacing the IC block. Use `0.0` for the total so the test fails and prints the required value:
+Replace the IC block in `crates/bwr-core/src/params.rs` with (`0.0` for the total so the test fails and prints the required value):
 
 ```rust
 // ---------------------------------------------------------------- isolation condensers
-/// Number of isolation condenser trains. ASSUMED (to verify). A-IC-01.
+/// Number of isolation condenser trains. ASSUMED (to verify). A-020.
 pub const N_IC_TRAINS: usize = 3;
-/// Parallel condensate return valves per train. Shared concept (ESBWR). A-IC-02.
+/// Parallel condensate return valves per train. Shared concept (ESBWR, E-07). A-021.
 pub const N_IC_RETURN_VALVES: usize = 2;
 /// Heat removal per train at rated pressure with a boiling pool, W.
-/// ESBWR-ESTIMATE (ESBWR IC unit 33.75 MWt). Not a BWRX value; sensitivity +/-30 %.
+/// ESBWR-ESTIMATE (ESBWR IC unit 33.75 MWt, E-08). Not a BWRX value; sensitivity +/-30 %.
 pub const IC_TRAIN_RATED_W: f64 = 33.75e6;
-/// Valve stroke time, s. ASSUMED. A-IC-07.
+/// Valve stroke time for steam and return valves, s. ASSUMED. A-026.
 pub const IC_VALVE_STROKE: f64 = 15.0;
-/// Condensate held in one train's tubes and drain line when flooded, kg. ASSUMED. A-IC-05.
+/// Condensate held in one train's tubes and drain line when flooded, kg. ASSUMED. A-024.
 pub const IC_TUBE_CAPACITY_KG: f64 = 5_000.0;
-/// Drain time constant through an open return valve, s. ASSUMED. A-IC-06.
+/// Drain time constant through an open return valve, s. ASSUMED. A-025.
 pub const IC_DRAIN_TAU_S: f64 = 20.0;
-/// Total IC pool water, all trains, kg. DERIVED by ic::tests::derived_pool_mass_covers_seven_days_to_100c. A-IC-03.
+/// Total IC pool water, all trains, kg. DERIVED by ic::tests::derived_pool_mass_covers_seven_days_to_100c. A-022.
 pub const IC_POOL_MASS_TOTAL: f64 = 0.0;
-/// Pool water per train (separate bays). ASSUMED split. A-IC-04.
+/// Pool water per train (separate bays). ASSUMED split. A-023.
 pub const IC_POOL_MASS: f64 = IC_POOL_MASS_TOTAL / N_IC_TRAINS as f64;
-/// Credited pool cooling system duty, W. ASSUMED 0 (no system credited).
+/// Credited pool cooling system duty, W. ASSUMED 0 (no system credited). A-027.
 pub const IC_POOL_COOLING_W: f64 = 0.0;
-/// Floor for an idle pool temperature, degC. ASSUMED. A-IC-08.
+/// Floor for an idle pool temperature, degC. ASSUMED. A-027.
 pub const IC_POOL_T_AMBIENT: f64 = 40.0;
-```
-
-Add at the top of `ic.rs` (outside the test module):
-
-```rust
-/// Liquid water specific heat used for the pool, J/kgK.
-pub const CP_WATER: f64 = 4186.0;
-/// Latent heat at atmospheric pressure (IAPWS, 100 degC), J/kg.
-pub const H_FG_ATM: f64 = 2.257e6;
 ```
 
 - [ ] **Step 6: Run the test, read the required mass, set the constant**
 
-Run: `cargo test --release -p bwr-core derived_pool_mass -- --nocapture`
-Expected: FAIL with `IC_POOL_MASS_TOTAL = 0 must lie in 1.10..1.15 x <N> kg` and the `eprintln` line above it.
+Run: `cargo test --release -p bwr-core --lib derived_pool_mass -- --nocapture`
+Expected: FAIL with `IC_POOL_MASS_TOTAL = 0 must lie in 1.10..1.15 x <N> kg` and the `eprintln` line above it. (`--lib` because `sim.rs` still compiles against the interim `IcTrain`; nothing else is touched yet.)
 
 Set `IC_POOL_MASS_TOTAL` to the printed `1.10x` value rounded up to the nearest 1 000 kg. Fill the same number into the `<value>` cell of `isolation-condensers.md`.
 
-Run: `cargo test --release -p bwr-core derived_pool_mass`
+Run: `cargo test --release -p bwr-core --lib derived_pool_mass`
 Expected: PASS.
 
-- [ ] **Step 7: Add parameter rows**
+- [ ] **Step 7: Parameter rows**
 
-Append to `docs/model/parameters.csv` (Package 1 column order: name, value, unit, definition, reference_state, source_design, status, source_id, assumption_id, sensitivity):
+In `docs/model/parameters.csv` (13 columns), **update** the existing rows `N_IC_TRAINS`, `IC_TRAIN_RATED_W`, `IC_VALVE_STROKE`, `IC_POOL_MASS` and **append** the new ones. Final rows:
 
 ```
-N_IC_TRAINS,3,-,isolation condenser trains,-,BWRX-300,assumed,SRC-IC-02,A-IC-01,2..4
-N_IC_RETURN_VALVES,2,-,parallel condensate return valves per train,-,ESBWR,esbwr-estimate,SRC-IC-01,A-IC-02,1..2
-IC_TRAIN_RATED_W,33.75e6,W,heat removal per train with boiling pool,7.2 MPa,ESBWR,esbwr-estimate,SRC-IC-01,-,+/-30 %
-IC_VALVE_STROKE,15,s,IC valve full stroke,-,none,assumed,-,A-IC-07,5..30
-IC_TUBE_CAPACITY_KG,5000,kg,condensate to flood tubes and drain line,-,none,assumed,-,A-IC-05,2000..10000
-IC_DRAIN_TAU_S,20,s,drain time constant,-,none,assumed,-,A-IC-06,10..60
-IC_POOL_MASS_TOTAL,<value>,kg,pool water all trains,-,derived,derived,SRC-IC-03,A-IC-03,see ic-endurance.csv
-IC_POOL_MASS,<value>/3,kg,pool water per train,-,derived,assumed split,-,A-IC-04,-
-IC_POOL_COOLING_W,0,W,credited pool cooling,-,none,assumed,-,-,0..2e6
-IC_POOL_T_AMBIENT,40,degC,idle pool floor,-,none,assumed,-,A-IC-08,20..50
+N_IC_TRAINS,3,-,Number of isolation condenser trains,-,BWRX-300,assumed,S-06;S-10,2,4,A-020,params.rs,README lists as unconfirmed; promote when S-10 page recorded
+N_IC_RETURN_VALVES,2,-,Parallel condensate return valves per train,-,ESBWR,esbwr-estimate,S-ESBWR-05,1,2,A-021,params.rs,E-07 shared concept
+IC_TRAIN_RATED_W,33.75e6,W,Heat removal per train with a boiling pool,7.2 MPa,ESBWR,esbwr-estimate,S-ESBWR-05,23.6e6,43.9e6,A-020,params.rs,E-08; +/-30 % sensitivity in results/ic-availability.csv
+IC_VALVE_STROKE,15,s,IC steam and return valve full stroke,-,BWR-generic,assumed,,5,30,A-026,params.rs,
+IC_TUBE_CAPACITY_KG,5000,kg,Condensate to flood one train's tubes and drain line,-,none,assumed,,2000,10000,A-024,params.rs,
+IC_DRAIN_TAU_S,20,s,Drain time constant through an open return valve,-,none,assumed,,10,60,A-025,params.rs,
+IC_POOL_MASS_TOTAL,<value>,kg,IC pool water all trains,-,derived,derived,S-10,none,none,A-022,params.rs,1.10 x (7 d decay energy + vessel stored energy to 100 degC)/h_fg(100 degC)
+IC_POOL_MASS,<value>/3,kg,IC pool water per train,-,derived,assumed,,none,none,A-023,params.rs,equal split into separate bays
+IC_POOL_COOLING_W,0,W,Credited IC pool cooling duty,-,none,assumed,,0,2e6,A-027,params.rs,replaces ic.POOL_IDLE_COOLING_K_PER_S
+IC_POOL_T_AMBIENT,40,degC,Idle IC pool temperature floor,-,none,assumed,,20,50,A-027,params.rs,
 ```
+
+Delete the `ic.POOL_IDLE_COOLING_K_PER_S` row P3 added (the constant is removed in Task 2). Keep `ic.ua_pool_ref`, `ic.CP_WATER`, `ic.H_FG_ATM`, `ic.POOL_BOIL_T` rows as P3 left them.
+
+Run: `cargo test --release -p bwr-core --test register`
+Expected: PASS (every `pub const` in `params.rs` has a row).
 
 - [ ] **Step 8: Commit**
 
@@ -315,76 +347,117 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 2: Per-train valves, tube inventory and conserved pool in `ic.rs`
+### Task 2: Per-train valves, tube inventory with enthalpy, conserved pool, bounded withdrawal
 
 **Files:**
 - Modify: `crates/bwr-core/src/ic.rs` (full rewrite below)
 - Test: `crates/bwr-core/src/ic.rs` unit tests
 
 **Interfaces:**
-- Consumes: `steam::sat_p`, `steam::P_ATM`, `params::*`.
-- Produces: `IcTrain` (master fields plus `steam_valve_cmd_open`, `return_valve_stuck`), `IcStep { q_removed, w_condensate_return, energy_to_pool, pool_boiloff_kg, pool_cooling_w }`, `IcTrain::in_service()`, `IcTrain::step(dt, p_vessel, t_sat, steam_available) -> IcStep`, `IcTrain::envelope_exceeded(t_sat)`, `IcTrain::pool_level_pct()`.
+- Consumes: `steam::{sat_p, h_liquid, t_from_h_liquid, P_ATM}`, `params::*`.
+- Produces: `IcTrain` (master fields plus `steam_valve_cmd_open`, `return_valve_stuck`), `IcStep` (master's seven fields, `#[derive(Clone, Copy, Debug, Default)]`), `IcTrain::in_service()`, `IcTrain::step(dt, p_vessel, w_steam_available) -> IcStep`, `IcTrain::envelope_exceeded(t_sat)`, `IcTrain::tube_h()`, `IcTrain::pool_level_pct()`. `POOL_IDLE_COOLING_K_PER_S` is deleted; `CP_WATER`, `H_FG_ATM`, `POOL_BOIL_T` stay.
 
 - [ ] **Step 1: Write the failing unit tests**
 
-Replace the test module in `crates/bwr-core/src/ic.rs` with (keep `derived_pool_mass_covers_seven_days_to_100c` from Task 1 inside it):
+Replace the test module in `crates/bwr-core/src/ic.rs` with the following (keep `derived_pool_mass_covers_seven_days_to_100c` from Task 1 inside it; delete P3's interim tests that call the four-argument `step`):
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::steam::sat_p;
+    use crate::steam::{h_liquid, sat_p};
 
     const DT: f64 = 0.05;
-    fn rated() -> (f64, f64) {
-        let s = sat_p(P_RATED);
-        (s.p, s.t)
+    const INF: f64 = f64::INFINITY;
+    fn rated_p() -> f64 {
+        P_RATED
     }
-    fn run(tr: &mut IcTrain, seconds: f64, p: f64, t: f64) -> IcStep {
+    fn run(tr: &mut IcTrain, seconds: f64, p: f64, w_avail: f64) -> IcStep {
         let mut last = IcStep::default();
         for _ in 0..(seconds / DT) as usize {
-            last = tr.step(DT, p, t, true);
+            last = tr.step(DT, p, w_avail);
         }
         last
     }
 
     #[test]
-    fn flooded_tubes_with_closed_return_valves_remove_nothing() {
-        let (p, t) = rated();
+    fn standby_train_is_idle() {
         let mut tr = IcTrain::new();
-        tr.pool_t = 100.0;
+        tr.pool_t = POOL_BOIL_T;
         assert!((tr.tube_mass - IC_TUBE_CAPACITY_KG).abs() < 1e-9, "standby tubes start flooded");
-        let out = run(&mut tr, 60.0, p, t);
+        // Tube water sits at pool temperature after hours of standby: no sensible heat path either.
+        tr.tube_energy = tr.tube_mass * h_liquid(POOL_BOIL_T);
+        let out = run(&mut tr, 60.0, rated_p(), INF);
         assert_eq!(out.q_removed, 0.0);
-        assert_eq!(tr.w_steam_in, 0.0);
+        assert_eq!(out.w_steam_in, 0.0);
         assert!(!tr.in_service());
     }
 
     #[test]
     fn opening_return_valves_drains_tubes_and_reaches_rated_duty() {
-        let (p, t) = rated();
         let mut tr = IcTrain::new();
-        tr.pool_t = 100.0;
+        tr.pool_t = POOL_BOIL_T;
         tr.cmd_open = true;
-        let out = run(&mut tr, 300.0, p, t);
+        let out = run(&mut tr, 300.0, rated_p(), INF);
         assert!(tr.in_service());
         assert!(tr.tube_mass < 0.2 * IC_TUBE_CAPACITY_KG, "tubes drained: {}", tr.tube_mass);
         let rel = out.q_removed / IC_TRAIN_RATED_W;
         assert!(rel > 0.8 && rel < 1.05, "duty {rel} of rated");
-        let w_in = tr.w_steam_in;
-        assert!((out.w_condensate_return - w_in).abs() < 0.05 * w_in, "return {} vs in {}", out.w_condensate_return, w_in);
+        assert!((out.w_condensate_return - out.w_steam_in).abs() < 0.05 * out.w_steam_in);
+        assert!((out.w_steam_in - tr.w_steam_in).abs() < 1e-12);
+        let s = sat_p(rated_p());
+        assert!(out.h_condensate_return <= s.h_f + 1.0 && out.h_condensate_return > h_liquid(POOL_BOIL_T));
+    }
+
+    #[test]
+    fn requested_withdrawal_never_exceeds_available_steam() {
+        let mut tr = IcTrain::new();
+        tr.pool_t = POOL_BOIL_T;
+        tr.cmd_open = true;
+        run(&mut tr, 300.0, rated_p(), INF);
+        let unlimited = tr.w_steam_in;
+        assert!(unlimited > 5.0);
+        let cap = 0.25 * unlimited;
+        let out = tr.step(DT, rated_p(), cap);
+        assert!((out.w_steam_in - cap).abs() < 1e-9, "requested {} vs available {cap}", out.w_steam_in);
+        assert!((out.q_removed - cap * sat_p(rated_p()).h_fg()).abs() < 1e-3 * out.q_removed + 1.0);
+    }
+
+    #[test]
+    fn no_steam_limits_heat_to_tube_water_energy_without_lag() {
+        let p = rated_p();
+        let s = sat_p(p);
+        let mut tr = IcTrain::new();
+        tr.pool_t = POOL_BOIL_T;
+        tr.cmd_open = true;
+        run(&mut tr, 300.0, p, INF);
+        assert!(tr.heat > 0.8 * IC_TRAIN_RATED_W);
+        // Steam supply disappears: refill the tubes with hot condensate to make the bound visible.
+        tr.tube_mass = IC_TUBE_CAPACITY_KG;
+        tr.tube_energy = tr.tube_mass * s.h_f;
+        let releasable = tr.tube_mass * CP_WATER * (s.t - POOL_BOIL_T);
+        let first = tr.step(DT, p, 0.0);
+        assert_eq!(first.w_steam_in, 0.0);
+        assert!(first.q_removed < tr.heat.max(first.q_removed) + 1.0);
+        assert!(first.q_removed * DT <= releasable, "first step released more than the tube water holds");
+        let mut total = first.energy_to_pool;
+        for _ in 0..(600.0 / DT) as usize {
+            total += tr.step(DT, p, 0.0).energy_to_pool;
+        }
+        assert!(total <= releasable * (1.0 + 1e-9), "total {total} > releasable {releasable}");
+        assert!(tr.heat < 1.0e3, "heat must die out, not persist through a lag: {}", tr.heat);
+        assert!(tr.tube_h() <= h_liquid(POOL_BOIL_T) + 1.0);
     }
 
     #[test]
     fn parallel_return_valve_redundancy() {
-        let (p, t) = rated();
         let mut both = IcTrain::new();
-        both.pool_t = 100.0;
+        both.pool_t = POOL_BOIL_T;
         both.cmd_open = true;
         let mut one = both.clone();
         one.return_valve_stuck[0] = true;
-        let q_both = run(&mut both, 300.0, p, t).q_removed;
-        let q_one = run(&mut one, 300.0, p, t).q_removed;
+        let q_both = run(&mut both, 300.0, rated_p(), INF).q_removed;
+        let q_one = run(&mut one, 300.0, rated_p(), INF).q_removed;
         assert_eq!(one.return_valve_pos[0], 0.0, "stuck valve never moved");
         assert!(one.return_valve_pos[1] > 0.99);
         assert!((q_one - q_both).abs() < 0.01 * q_both, "one valve {q_one} vs both {q_both}");
@@ -392,99 +465,112 @@ mod tests {
 
     #[test]
     fn unavailable_train_valves_do_not_move() {
-        let (p, t) = rated();
         let mut tr = IcTrain::new();
         tr.available = false;
         tr.cmd_open = true;
-        tr.pool_t = 100.0;
-        let out = run(&mut tr, 120.0, p, t);
+        tr.pool_t = POOL_BOIL_T;
+        let out = run(&mut tr, 120.0, rated_p(), INF);
         assert_eq!(tr.return_valve_pos, [0.0; N_IC_RETURN_VALVES]);
         assert_eq!(out.q_removed, 0.0);
+        assert_eq!(out.w_steam_in, 0.0);
     }
 
     #[test]
     fn closed_steam_valve_removes_nothing() {
-        let (p, t) = rated();
         let mut tr = IcTrain::new();
-        tr.pool_t = 100.0;
+        tr.pool_t = POOL_BOIL_T;
+        tr.tube_energy = tr.tube_mass * h_liquid(POOL_BOIL_T);
         tr.cmd_open = true;
         tr.steam_valve_cmd_open = false;
-        let out = run(&mut tr, 120.0, p, t);
+        let out = run(&mut tr, 120.0, rated_p(), INF);
         assert!(tr.steam_valve_pos < 1e-9);
         assert_eq!(out.q_removed, 0.0);
+        assert_eq!(out.w_steam_in, 0.0);
         assert!(!tr.in_service());
     }
 
     #[test]
     fn degradation_scales_duty() {
-        let (p, t) = rated();
         let mut a = IcTrain::new();
-        a.pool_t = 100.0;
+        a.pool_t = POOL_BOIL_T;
         a.cmd_open = true;
         let mut b = a.clone();
         b.ua_factor = 0.5;
-        let qa = run(&mut a, 300.0, p, t).q_removed;
-        let qb = run(&mut b, 300.0, p, t).q_removed;
+        let qa = run(&mut a, 300.0, rated_p(), INF).q_removed;
+        let qb = run(&mut b, 300.0, rated_p(), INF).q_removed;
         assert!((qb / qa - 0.5).abs() < 0.03, "ratio {}", qb / qa);
     }
 
     #[test]
     fn pool_energy_closes_through_boiling() {
-        let (p, t) = rated();
         let mut tr = IcTrain::new();
-        tr.pool_t = 40.0;
+        tr.pool_t = IC_POOL_T_AMBIENT;
         tr.pool_mass = 20_000.0; // small pool so it boils within the test
         tr.cmd_open = true;
-        let m0 = tr.pool_mass;
-        let t0 = tr.pool_t;
-        let mut e_in = 0.0;
-        let mut boiloff = 0.0;
-        let mut e_cool = 0.0;
+        let (m0, t0) = (tr.pool_mass, tr.pool_t);
+        let (mut e_in, mut boiloff, mut e_cool) = (0.0, 0.0, 0.0);
         for _ in 0..(1200.0 / DT) as usize {
-            let o = tr.step(DT, p, t, true);
+            let o = tr.step(DT, rated_p(), INF);
             e_in += o.energy_to_pool;
             boiloff += o.pool_boiloff_kg;
             e_cool += o.pool_cooling_w * DT;
-            assert!(tr.pool_t <= 100.0 + 1e-9, "pool overshoot {}", tr.pool_t);
+            assert!(tr.pool_t <= POOL_BOIL_T + 1e-9, "pool overshoot {}", tr.pool_t);
             assert!(tr.pool_mass >= 0.0);
         }
-        assert!(tr.pool_t > 99.99, "pool should be boiling");
+        assert!(tr.pool_t > POOL_BOIL_T - 1e-6, "pool should be boiling");
         assert!(boiloff > 0.0);
-        let sensible = m0 * CP_WATER * (100.0 - t0);
-        let expected = sensible + boiloff * H_FG_ATM + e_cool;
+        let expected = m0 * CP_WATER * (POOL_BOIL_T - t0) + boiloff * H_FG_ATM + e_cool;
         assert!((e_in - expected).abs() < 1e-6 * expected, "e_in {e_in} vs {expected}");
         assert!((m0 - boiloff - tr.pool_mass).abs() < 1e-6);
     }
 
     #[test]
-    fn empty_pool_stops_duty_and_flags_envelope() {
-        let (p, t) = rated();
+    fn vessel_tubes_pool_identity_holds_each_step() {
+        // q_removed + dE_tube/dt == w_in*h_g - w_return*h_return (what the vessel will see).
+        let p = rated_p();
+        let s = sat_p(p);
         let mut tr = IcTrain::new();
-        tr.pool_t = 100.0;
+        tr.pool_t = 60.0;
+        tr.cmd_open = true;
+        for _ in 0..(400.0 / DT) as usize {
+            let e_before = tr.tube_energy;
+            let o = tr.step(DT, p, INF);
+            let lhs = o.q_removed * DT + (tr.tube_energy - e_before);
+            let rhs = (o.w_steam_in * s.h_g - o.w_condensate_return * o.h_condensate_return) * DT;
+            assert!((lhs - rhs).abs() < 1e-6 * rhs.abs().max(1.0), "lhs {lhs} rhs {rhs}");
+        }
+    }
+
+    #[test]
+    fn empty_pool_stops_duty_and_flags_envelope() {
+        let p = rated_p();
+        let t_sat = sat_p(p).t;
+        let mut tr = IcTrain::new();
+        tr.pool_t = POOL_BOIL_T;
         tr.pool_mass = 50.0;
         tr.cmd_open = true;
         let mut last = IcStep::default();
         for _ in 0..(600.0 / DT) as usize {
-            last = tr.step(DT, p, t, true);
+            last = tr.step(DT, p, INF);
             assert!(tr.pool_mass >= 0.0);
             assert!(last.q_removed * DT <= last.energy_to_pool + 1e-6);
         }
         assert_eq!(tr.pool_mass, 0.0);
         assert_eq!(last.q_removed, 0.0);
-        assert!(tr.envelope_exceeded(t));
-        assert!(!tr.envelope_exceeded(90.0), "no demand below pool boiling point");
+        assert!(tr.envelope_exceeded(t_sat));
+        assert!(!tr.envelope_exceeded(90.0), "no demand below the pool boiling point");
     }
 
     #[test]
-    fn no_removal_without_steam_or_below_pool_temperature() {
+    fn below_pool_temperature_removes_nothing() {
         let mut tr = IcTrain::new();
         tr.cmd_open = true;
         tr.tube_mass = 0.0;
-        let o = tr.step(DT, 101_325.0, 60.0, false);
+        tr.tube_energy = 0.0;
+        tr.pool_t = POOL_BOIL_T;
+        let o = tr.step(DT, sat_p(crate::steam::sat_t(90.0).p).p, INF);
         assert_eq!(o.q_removed, 0.0);
-        tr.pool_t = 100.0;
-        let o = tr.step(DT, sat_p(90.0_f64.max(1.0)).p, 90.0, true);
-        assert_eq!(o.q_removed, 0.0);
+        assert_eq!(o.w_steam_in, 0.0);
     }
 
     // derived_pool_mass_covers_seven_days_to_100c from Task 1 stays here.
@@ -493,8 +579,8 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --release -p bwr-core ic::tests`
-Expected: compile errors (`IcStep: Default` missing, `steam_valve_cmd_open`, `return_valve_stuck`, `in_service`, `envelope_exceeded` not found, `step` arity).
+Run: `cargo test --release -p bwr-core --lib ic::tests`
+Expected: compile errors (`steam_valve_cmd_open`, `return_valve_stuck`, `tube_energy`, `in_service`, `envelope_exceeded`, `tube_h` not found; `step` takes 4 arguments; `IcStep` has no field `w_steam_in`).
 
 - [ ] **Step 3: Rewrite `ic.rs`**
 
@@ -508,29 +594,37 @@ Replace everything above the test module in `crates/bwr-core/src/ic.rs` with:
 //! line; with the parallel condensate return valves closed the tubes flood and
 //! condensation stops (standby). Opening either return valve drains the condensate
 //! back to the vessel by gravity and exposes the condensing surface.
+//! The train REQUESTS steam; the vessel allocates (master step 8) and `Sim` rescales
+//! the train to the applied value (step 9).
 //! Specification: docs/model/isolation-condensers.md.
 
 use crate::params::*;
-use crate::steam::{sat_p, P_ATM};
+use crate::steam::{h_liquid, sat_p, t_from_h_liquid, P_ATM};
 
-/// Liquid water specific heat used for the pool, J/kgK.
+/// Liquid water specific heat used for the pool and tube water, J/kgK.
 pub const CP_WATER: f64 = 4186.0;
 /// Latent heat at atmospheric pressure (IAPWS, 100 degC), J/kg.
 pub const H_FG_ATM: f64 = 2.257e6;
+/// Pool boiling point at atmospheric pressure, degC (pool assumed vented).
+pub const POOL_BOIL_T: f64 = 100.0;
 
 /// Heat transfer UA per train, W/K (rated duty at 7.2 MPa with a boiling pool).
 fn ua() -> f64 {
-    IC_TRAIN_RATED_W / (sat_p(P_RATED).t - 100.0)
+    IC_TRAIN_RATED_W / (sat_p(P_RATED).t - POOL_BOIL_T)
 }
 
-/// What one train did in one step.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// What one train did in one step. `w_steam_in` is the REQUESTED withdrawal.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct IcStep {
-    /// Heat taken from reactor steam, W (= w_steam_in * h_fg).
+    /// Heat delivered to the pool, W (condensation + tube water cooling).
     pub q_removed: f64,
+    /// Steam requested from the vessel, kg/s.
+    pub w_steam_in: f64,
     /// Condensate returned to the vessel, kg/s.
     pub w_condensate_return: f64,
-    /// Energy absorbed by the pool this step, J (sensible + latent + cooling).
+    /// Enthalpy of the returned condensate, J/kg (tube water enthalpy).
+    pub h_condensate_return: f64,
+    /// Energy absorbed by the pool this step, J (= q_removed * dt).
     pub energy_to_pool: f64,
     /// Pool water boiled off this step, kg.
     pub pool_boiloff_kg: f64,
@@ -556,9 +650,11 @@ pub struct IcTrain {
     pub ua_factor: f64,
     /// Condensate held in tubes and drain line, kg.
     pub tube_mass: f64,
-    /// Heat removed from reactor steam, W.
+    /// Enthalpy content of the tube condensate, J (energy-balance storage term).
+    pub tube_energy: f64,
+    /// Heat delivered to the pool, W (rescaled to applied by Sim).
     pub heat: f64,
-    /// Steam drawn from the vessel, kg/s.
+    /// Steam drawn from the vessel, kg/s: requested after `step`, applied after Sim rescales.
     pub w_steam_in: f64,
     /// Condensate returned to the vessel, kg/s.
     pub w_condensate_return: f64,
@@ -567,7 +663,8 @@ pub struct IcTrain {
 }
 
 impl IcTrain {
-    /// Standby train at pressure: steam valve open, return valves closed, tubes flooded.
+    /// Standby train at pressure: steam valve open, return valves closed, tubes
+    /// flooded with condensate at pool temperature.
     pub fn new() -> Self {
         Self {
             steam_valve_pos: 1.0,
@@ -578,6 +675,7 @@ impl IcTrain {
             available: true,
             ua_factor: 1.0,
             tube_mass: IC_TUBE_CAPACITY_KG,
+            tube_energy: IC_TUBE_CAPACITY_KG * h_liquid(IC_POOL_T_AMBIENT),
             heat: 0.0,
             w_steam_in: 0.0,
             w_condensate_return: 0.0,
@@ -588,6 +686,15 @@ impl IcTrain {
 
     pub fn pool_level_pct(&self) -> f64 {
         self.pool_mass / IC_POOL_MASS * 100.0
+    }
+
+    /// Specific enthalpy of the tube condensate, J/kg.
+    pub fn tube_h(&self) -> f64 {
+        if self.tube_mass > 1.0 {
+            self.tube_energy / self.tube_mass
+        } else {
+            h_liquid(self.pool_t)
+        }
     }
 
     fn return_open(&self) -> f64 {
@@ -602,7 +709,7 @@ impl IcTrain {
     /// The model cannot supply the demanded heat removal: pool exhausted while
     /// the train is in service and the steam is hotter than the boiling pool.
     pub fn envelope_exceeded(&self, t_sat: f64) -> bool {
-        self.pool_mass <= 0.0 && self.in_service() && t_sat > 100.0
+        self.pool_mass <= 0.0 && self.in_service() && t_sat > POOL_BOIL_T
     }
 
     fn move_valves(&mut self, dt: f64) {
@@ -621,46 +728,63 @@ impl IcTrain {
         }
     }
 
-    /// Advance one step. `p_vessel` and `t_sat` are the reactor pressure (Pa) and
-    /// steam temperature (degC); `steam_available` is false when the vessel has no
-    /// steam space. Returns what the train did.
-    pub fn step(&mut self, dt: f64, p_vessel: f64, t_sat: f64, steam_available: bool) -> IcStep {
+    /// Advance one step. `p_vessel` is reactor pressure (Pa); `w_steam_available`
+    /// is the vessel's allocation hint (kg/s it can supply this step; `f64::INFINITY`
+    /// when inventory is adequate, `0.0` when there is no steam space). The train
+    /// never requests more than that.
+    pub fn step(&mut self, dt: f64, p_vessel: f64, w_steam_available: f64) -> IcStep {
         self.move_valves(dt);
         let s = sat_p(p_vessel.max(P_ATM));
         let h_fg = s.h_fg();
-
-        // Condensing duty, limited by flooded tubes, pool coverage and pool capacity.
-        let f_surf = (1.0 - self.tube_mass / IC_TUBE_CAPACITY_KG).clamp(0.0, 1.0);
         let coverage = (self.pool_level_pct() / 40.0).clamp(0.0, 1.0);
-        let dt_drive = if steam_available && self.available { (t_sat - self.pool_t).max(0.0) } else { 0.0 };
-        let mut q = ua() * self.ua_factor * dt_drive * self.steam_valve_pos * f_surf * coverage;
-        let pool_capacity_j = if self.pool_t < 100.0 {
-            self.pool_mass * CP_WATER * (100.0 - self.pool_t) + self.pool_mass * H_FG_ATM
+        let ua_eff = if self.available { ua() * self.ua_factor * self.steam_valve_pos * coverage } else { 0.0 };
+
+        // Pool capacity this step: sensible to boiling plus latent heat of all of it.
+        let pool_capacity_j = (self.pool_mass * CP_WATER * (POOL_BOIL_T - self.pool_t)).max(0.0) + self.pool_mass * H_FG_ATM;
+
+        // Tube water cooling: the only path when no steam is available; bounded by the
+        // energy stored in the tube water, never carried by a lag.
+        let t_tube = t_from_h_liquid(self.tube_h());
+        let dt_tube = (t_tube - self.pool_t).max(0.0);
+        let q_cool_cap = if self.tube_mass > 1.0 { self.tube_mass * CP_WATER * dt_tube / dt } else { 0.0 };
+        let q_cool = (ua_eff * dt_tube).min(q_cool_cap).min(pool_capacity_j / dt).max(0.0);
+
+        // Condensation: requested steam withdrawal.
+        let f_surf = (1.0 - self.tube_mass / IC_TUBE_CAPACITY_KG).clamp(0.0, 1.0);
+        let dt_cond = (s.t - self.pool_t).max(0.0);
+        let w_in = if w_steam_available > 0.0 && h_fg > 0.0 {
+            let q_cond_max = (pool_capacity_j / dt - q_cool).max(0.0);
+            (ua_eff * f_surf * dt_cond / h_fg).min(w_steam_available).min(q_cond_max / h_fg).max(0.0)
         } else {
-            self.pool_mass * H_FG_ATM
+            0.0
         };
-        q = q.min(pool_capacity_j / dt).max(0.0);
+        let q_cond = w_in * h_fg;
 
-        // Tube inventory: condensate in from the steam side, out through the return valves.
-        let w_in = q / h_fg;
-        let w_out = (self.return_open().sqrt() * self.tube_mass / IC_DRAIN_TAU_S).min(self.tube_mass / dt + w_in);
-        self.tube_mass = (self.tube_mass + (w_in - w_out) * dt).clamp(0.0, IC_TUBE_CAPACITY_KG);
-        self.heat = q;
-        self.w_steam_in = w_in;
-        self.w_condensate_return = w_out;
+        // Drain through the open return valves at the tube water enthalpy.
+        let h_ret = self.tube_h();
+        let w_out = (self.return_open().sqrt() * self.tube_mass / IC_DRAIN_TAU_S).min(self.tube_mass / dt + w_in).max(0.0);
 
-        // Pool: sensible heating to 100 degC, then boil-off; no overshoot.
-        let cooling_w = if self.pool_t > IC_POOL_T_AMBIENT { IC_POOL_COOLING_W } else { 0.0 };
+        // Tube inventory and enthalpy.
+        self.tube_mass = (self.tube_mass + (w_in - w_out) * dt).max(0.0);
+        self.tube_energy += (w_in * s.h_f - w_out * h_ret - q_cool) * dt;
+        if self.tube_mass < 1.0 {
+            self.tube_mass = 0.0;
+            self.tube_energy = 0.0;
+        }
+
+        // Pool: sensible heating to boiling, then boil-off; no overshoot.
+        let q = q_cond + q_cool;
+        let cooling_w = if self.pool_t > IC_POOL_T_AMBIENT && self.pool_mass > 0.0 { IC_POOL_COOLING_W } else { 0.0 };
         let mut e = (q - cooling_w) * dt;
         let mut boiloff = 0.0;
         if e > 0.0 {
-            if self.pool_t < 100.0 {
-                let to_boil = self.pool_mass * CP_WATER * (100.0 - self.pool_t);
+            if self.pool_t < POOL_BOIL_T {
+                let to_boil = self.pool_mass * CP_WATER * (POOL_BOIL_T - self.pool_t);
                 if e <= to_boil {
                     self.pool_t += e / (self.pool_mass.max(1e-9) * CP_WATER);
                     e = 0.0;
                 } else {
-                    self.pool_t = 100.0;
+                    self.pool_t = POOL_BOIL_T;
                     e -= to_boil;
                 }
             }
@@ -675,9 +799,14 @@ impl IcTrain {
             self.pool_t = (self.pool_t + e / (self.pool_mass * CP_WATER)).max(IC_POOL_T_AMBIENT);
         }
 
+        self.heat = q;
+        self.w_steam_in = w_in;
+        self.w_condensate_return = w_out;
         IcStep {
             q_removed: q,
+            w_steam_in: w_in,
             w_condensate_return: w_out,
+            h_condensate_return: h_ret,
             energy_to_pool: q * dt,
             pool_boiloff_kg: boiloff,
             pool_cooling_w: cooling_w,
@@ -694,45 +823,46 @@ impl Default for IcTrain {
 
 - [ ] **Step 4: Run the unit tests**
 
-Run: `cargo test --release -p bwr-core ic::tests`
-Expected: all 10 `ic::tests::*` PASS. (`sim.rs` will not compile yet because it still calls the old `step` signature and `VesselInputs.q_ic`; run with `--lib` only if the integration tests block: `cargo test --release -p bwr-core --lib ic::tests`.)
+Run: `cargo test --release -p bwr-core --lib ic::tests`
+Expected: all 13 `ic::tests::*` PASS. (`sim.rs` does not compile against the new signature until Task 3; `--lib` with the `ic::tests` filter still requires the crate to build, so if `cargo` refuses, temporarily stub the call in `sim.rs` as `let out = tr.step(dt, p, f64::INFINITY);` with the old `q_ic` summation and finish the real wiring in Task 3.)
 
-If `pool_energy_closes_through_boiling` fails on the closure assertion by more than `1e-6`, the cause is `q.min(pool_capacity_j / dt)` interacting with the `.max(1e-9)` guard; print `e_in - expected` and fix the arithmetic, do not loosen the tolerance.
+If `vessel_tubes_pool_identity_holds_each_step` fails, the mismatch is between `h_ret` (taken before the tube update) and `tube_energy` arithmetic; print `lhs - rhs` and fix the order of operations, do not loosen the tolerance. The identity must hold because `tube_energy` is updated with the same `h_ret`, `s.h_f` and `q_cool` that produce the flows.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/bwr-core/src/ic.rs
-git commit -m "feat(ic): per-train steam/return valves, tube inventory and conserved pool
+git commit -m "feat(ic): per-train valves, tube inventory with enthalpy, conserved pool, bounded steam request
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 3: Couple the vessel to IC mass flows and wire faults in `Sim`
+### Task 3: Vessel IC ports, fault view, allocation rescale and energy balance in `Sim`
 
 **Files:**
 - Modify: `crates/bwr-core/src/vessel.rs` (`VesselInputs`, `step`)
-- Modify: `crates/bwr-core/src/ledger.rs` (`BoundaryFlows`)
-- Modify: `crates/bwr-core/src/sim.rs` (IC section of `step`, `cold_shutdown`, `SetIcTrain`)
+- Modify: `crates/bwr-core/src/ledger.rs` (doc comment only; fields already exist)
+- Modify: `crates/bwr-core/src/sim.rs` (`IcFaults`, `ic_faults`, IC section of `step`, step-9 rescale, energy balance, `cold_shutdown`, `base`, `SetIcTrain`, auto-initiation)
 - Create: `crates/bwr-core/tests/ic_transients.rs`
 
 **Interfaces:**
-- Consumes: `Fault::{IcTrainUnavailable, IcReturnValveStuck, IcSteamValveClosed, IcNoncondensableDegradation}`, `DomainError::IcModelEnvelope`, `Sim.domain_errors`, `Sim.log`, `vessel::Regime`.
-- Produces: `VesselInputs { q_core, w_ic_steam, w_ic_return, h_ic_return, w_feed, h_feed, w_steam, w_liquid_out }`; `BoundaryFlows.w_ic_steam`, `BoundaryFlows.w_ic_return`; `q_ic` in `BoundaryFlows` and `EnergyBalance` equal to `w_ic_steam*h_g - w_ic_return*h_ic_return`.
+- Consumes: `Sim::find_fault(kind, equipment)`, `Fault::{IcTrainUnavailable, IcReturnValveStuck, IcSteamValveClosed, IcNoncondensableDegradation}`, `Sim::domain_error`, `DomainError::IcModelEnvelope`, `vessel::Regime`, `bop::EnergyBalance { q_ic_w, storage_w, .. }`, `Sim.log`.
+- Produces: `VesselInputs { q_core, w_ic_steam, w_ic_return, h_ic_return, w_feed, h_feed, w_steam, w_liquid_out }`; `BoundaryFlows.{w_ic_steam, w_ic_return, h_ic_return}` populated and `q_ic` DERIVED; `IcFaults`; `Sim::ic_faults`; `Sim.ic_envelope_raised`.
 
-- [ ] **Step 1: Write the failing closed-loop conservation test**
+- [ ] **Step 1: Write the failing plant-level conservation tests**
 
 Create `crates/bwr-core/tests/ic_transients.rs`:
 
 ```rust
-//! Isolation condenser transients: conservation, availability, faults, initiation
-//! ordering, degradation sensitivity and long-duration endurance.
+//! Isolation condenser transients: conservation, allocation, availability, faults,
+//! initiation ordering, degradation sensitivity and long-duration endurance.
 //! Specification: docs/model/isolation-condensers.md.
 
 use bwr_core::api::{Command, ScenarioName};
 use bwr_core::faults::Fault;
+use bwr_core::ic::{CP_WATER, H_FG_ATM, POOL_BOIL_T};
 use bwr_core::params::*;
 use bwr_core::sim::DT;
 use bwr_core::Sim;
@@ -768,6 +898,18 @@ fn results(name: &str, header: &str, rows: &[String]) {
     std::fs::write(format!("{dir}/{name}.csv"), format!("{header}\n{}\n", rows.join("\n"))).unwrap();
 }
 
+/// Energy the pools have absorbed since a cold start at IC_POOL_T_AMBIENT and IC_POOL_MASS.
+fn pool_energy_absorbed(sim: &Sim) -> f64 {
+    sim.ic
+        .iter()
+        .map(|t| {
+            let sensible = IC_POOL_MASS * CP_WATER * (t.pool_t.min(POOL_BOIL_T) - IC_POOL_T_AMBIENT);
+            let latent = (IC_POOL_MASS - t.pool_mass) * H_FG_ATM;
+            sensible + latent
+        })
+        .sum()
+}
+
 #[test]
 fn vessel_plus_tubes_is_closed_when_only_ics_act() {
     let mut sim = Sim::new(ScenarioName::FullPower);
@@ -788,32 +930,59 @@ fn vessel_plus_tubes_is_closed_when_only_ics_act() {
     }
     assert!(max_dev < 1.0, "vessel + tube inventory drifted by {max_dev} kg");
     assert!(sim.ic.iter().map(|t| t.w_steam_in).sum::<f64>() > 1.0, "ICs should be condensing");
+    assert!(sim.ledger.mass_residual(sim.vessel.mass).abs() < 1.0e-3);
 }
 
 #[test]
-fn ic_energy_removal_is_reported_consistently() {
+fn ic_energy_identity_holds_at_plant_level() {
+    // ledger ∫q_ic dt (derived from applied flows) == pool energy absorbed + Δ(tube energy).
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 5.0);
+    let e_pool0 = pool_energy_absorbed(&sim);
+    let e_tube0: f64 = sim.ic.iter().map(|t| t.tube_energy).sum();
+    let ic_j0 = *sim.ledger.integrated.get("ic_j").unwrap_or(&0.0);
+    isolate(&mut sim);
+    run(&mut sim, 600.0);
+    let d_pool = pool_energy_absorbed(&sim) - e_pool0;
+    let d_tube = sim.ic.iter().map(|t| t.tube_energy).sum::<f64>() - e_tube0;
+    let ic_j = sim.ledger.integrated["ic_j"] - ic_j0;
+    assert!(ic_j > 1.0e9, "ICs should have removed GJ by now: {ic_j}");
+    assert!((ic_j - (d_pool + d_tube)).abs() < 1e-6 * ic_j + 1.0e3, "ledger {ic_j} vs pools {d_pool} + tubes {d_tube}");
+    assert!((sim.balance.q_ic_w - sim.last_flows().q_ic).abs() < 1.0, "energy balance q_ic {}", sim.balance.q_ic_w);
+    let w_in: f64 = sim.ic.iter().map(|t| t.w_steam_in).sum();
+    assert!((sim.last_flows().w_ic_steam - w_in).abs() < 1e-9, "trains must carry the APPLIED withdrawal");
+}
+
+#[test]
+fn ic_request_is_rescaled_to_applied_when_the_vessel_runs_dry() {
     let mut sim = Sim::new(ScenarioName::FullPower);
     run(&mut sim, 5.0);
     isolate(&mut sim);
-    run(&mut sim, 300.0);
-    let q_trains: f64 = sim.ic.iter().map(|t| t.heat).sum();
-    let s = sim.vessel.sat();
-    let w_in: f64 = sim.ic.iter().map(|t| t.w_steam_in).sum();
-    let w_ret: f64 = sim.ic.iter().map(|t| t.w_condensate_return).sum();
-    let q_vessel = w_in * s.h_g - w_ret * s.h_f;
-    assert!(q_trains > 1.0e6);
-    // In quasi-steady drain, w_ret ~ w_in and q_vessel ~ q_trains within the tube storage term.
-    assert!((q_vessel - q_trains).abs() < 0.1 * q_trains, "vessel sees {q_vessel}, trains report {q_trains}");
-    assert!((sim.balance.q_ic_w - q_vessel).abs() < 1.0, "energy balance q_ic {}", sim.balance.q_ic_w);
+    seal(&mut sim);
+    run(&mut sim, 120.0);
+    // Drain the vessel artificially to force allocation in the next step.
+    let w_req: f64 = sim.ic.iter().map(|t| t.w_steam_in).sum();
+    assert!(w_req > 1.0);
+    sim.vessel.mass = 0.5 * w_req * DT;
+    sim.vessel.energy = bwr_core::vessel::energy_for(sim.vessel.mass, sim.vessel.eos.t);
+    sim.step(DT);
+    let flows = sim.last_flows();
+    assert!(sim.domain_errors.iter().any(|(_, e)| matches!(e, bwr_core::domain::DomainError::InventoryExhausted { .. })));
+    let w_applied: f64 = sim.ic.iter().map(|t| t.w_steam_in).sum();
+    assert!((w_applied - flows.w_ic_steam).abs() < 1e-9, "trains {w_applied} vs applied {}", flows.w_ic_steam);
+    assert!(w_applied < w_req, "allocation must have scaled the IC request down");
+    assert!(sim.vessel.mass >= 0.0);
 }
 ```
+
+`Sim::last_flows()` is P2/P3's accessor for the `BoundaryFlows` of the most recent step (`grep -n "fn last_flows" crates/bwr-core/src/sim.rs`). If it does not exist, add `pub fn last_flows(&self) -> BoundaryFlows { self.last_flows }` with a private `last_flows: BoundaryFlows` field set right after `self.vessel.step(..)`, and list it in your commit message as a contract addition.
 
 - [ ] **Step 2: Run to verify failure**
 
 Run: `cargo test --release -p bwr-core --test ic_transients`
-Expected: compile error in `sim.rs` (old `IcTrain::step` arity, `VesselInputs.q_ic`) — the crate does not build until Step 3.
+Expected: compile error in `sim.rs` (`IcTrain::step` arity) or in the test (`integrated`/`last_flows` present but `w_ic_steam` always 0) — the crate is not wired until Step 3.
 
-- [ ] **Step 3: Change `VesselInputs` and the vessel step**
+- [ ] **Step 3: `VesselInputs` and the vessel step**
 
 In `crates/bwr-core/src/vessel.rs` replace the `VesselInputs` struct:
 
@@ -822,7 +991,7 @@ In `crates/bwr-core/src/vessel.rs` replace the `VesselInputs` struct:
 pub struct VesselInputs {
     /// Heat from the core into the coolant, W.
     pub q_core: f64,
-    /// Steam drawn by the isolation condensers, kg/s.
+    /// Steam requested by the isolation condensers, kg/s.
     pub w_ic_steam: f64,
     /// Condensate returned by the isolation condensers, kg/s.
     pub w_ic_return: f64,
@@ -830,125 +999,174 @@ pub struct VesselInputs {
     pub h_ic_return: f64,
     pub w_feed: f64,
     pub h_feed: f64,
-    /// Steam leaving through the main steam lines, kg/s.
+    /// Steam requested through the main steam lines, kg/s.
     pub w_steam: f64,
     /// Liquid removed (RWCU reject), kg/s.
     pub w_liquid_out: f64,
 }
 ```
 
-In `Vessel::step`, where P3 bounds outflows and builds `BoundaryFlows`, treat IC steam as a steam outflow and IC return as an inflow. The mass and energy lines become (keeping P3's bounding factor `scale` applied to every outflow):
+In `Vessel::step` (P3's bounded form), treat IC steam as a steam outflow and IC return as an inflow. The block from `let steam_demand = ...` to the `flows` literal becomes:
 
 ```rust
-        let w_steam = if steam_space { inp.w_steam } else { 0.0 };
-        let w_ic_steam = if steam_space { inp.w_ic_steam } else { 0.0 };
-        let out_total = w_steam + w_ic_steam + inp.w_liquid_out + self.vent_flow;
-        let scale = if out_total * dt > self.mass + (inp.w_feed + inp.w_ic_return) * dt {
-            ((self.mass + (inp.w_feed + inp.w_ic_return) * dt) / (out_total * dt)).max(0.0)
+        let steam_space = matches!(self.eos.regime, Regime::Saturated | Regime::GasBlanketed);
+        let steam_demand = if steam_space { inp.w_steam } else { 0.0 };
+        let ic_demand = if steam_space { inp.w_ic_steam } else { 0.0 };
+        let out_demand = steam_demand + ic_demand + inp.w_liquid_out + vent_demand;
+        let available = self.mass + (inp.w_feed + inp.w_ic_return) * dt;
+        let scale = if out_demand * dt > available {
+            (available / (out_demand * dt)).clamp(0.0, 1.0)
         } else {
             1.0
         };
-        let (w_steam, w_ic_steam, w_liq, w_vent) =
-            (w_steam * scale, w_ic_steam * scale, inp.w_liquid_out * scale, self.vent_flow * scale);
-        let dm = inp.w_feed + inp.w_ic_return - w_steam - w_ic_steam - w_liq - w_vent;
-        let de = inp.q_core - heat_loss + inp.w_feed * inp.h_feed + inp.w_ic_return * inp.h_ic_return
-            - (w_steam + w_ic_steam + w_vent) * h_steam
-            - w_liq * h_liq;
-```
+        if scale < 1.0 {
+            self.exhausted = Some(out_demand * dt - available);
+        }
+        let w_steam = steam_demand * scale;
+        let w_ic_steam = ic_demand * scale;
+        let w_liquid_out = inp.w_liquid_out * scale;
+        self.vent_flow = vent_demand * scale;
 
-(`steam_space` is P4's `matches!(self.eos.regime, Regime::Saturated | Regime::GasBlanketed)`; P3 named its exhaustion handling — keep it, just include `w_ic_steam` in the scaled set.) Build the returned flows:
-
-```rust
-        BoundaryFlows {
+        let dm = inp.w_feed + inp.w_ic_return - w_steam - w_ic_steam - w_liquid_out - self.vent_flow;
+        let q_ic = w_ic_steam * h_steam - inp.w_ic_return * inp.h_ic_return;
+        let de = inp.q_core - q_ic - heat_loss + inp.w_feed * inp.h_feed
+            - (w_steam + self.vent_flow) * h_steam
+            - w_liquid_out * h_liq;
+        let flows = BoundaryFlows {
             w_feed: inp.w_feed,
             h_feed: inp.h_feed,
             w_steam,
             h_steam,
-            w_vent,
-            w_liquid_out: w_liq,
+            w_vent: self.vent_flow,
+            w_liquid_out,
             h_liquid_out: h_liq,
             w_ic_steam,
             w_ic_return: inp.w_ic_return,
+            h_ic_return: inp.h_ic_return,
             q_core: inp.q_core,
-            q_ic: w_ic_steam * h_steam - inp.w_ic_return * inp.h_ic_return,
+            q_ic,
             q_loss: heat_loss,
             mass_clipped: 0.0,
             energy_clipped: 0.0,
+        };
+```
+
+(`steam_space` replaces P3's `!self.eos.subcooled` after P4; keep whichever predicate P4 left, but it must gate `ic_demand` too.) `de` uses the derived `q_ic`, so the vessel energy and the ledger agree by construction.
+
+In `crates/bwr-core/src/ledger.rs` change the `q_ic` doc comment to:
+
+```rust
+    /// W: DERIVED as w_ic_steam*h_steam - w_ic_return*h_ic_return (never added separately).
+    pub q_ic: f64,
+```
+
+and confirm `Ledger::record` does not add `w_ic_steam*h_steam` or `w_ic_return*h_ic_return` to the energy sums (it must count `q_ic` only; the master's P2 record already does this: `energy_out_j += (q_ic + q_loss + (w_steam + w_vent)*h_steam + w_liquid_out*h_liquid_out)*dt`). If it does, delete those terms.
+
+Update every other `VesselInputs { .. }` literal in the crate (examples, `tests/conservation.rs`, `tests/vessel_transients.rs`): `grep -rn "VesselInputs {" crates/bwr-core` and replace `q_ic: <x>` with `w_ic_steam: 0.0, w_ic_return: 0.0, h_ic_return: 0.0` unless the test exercises ICs.
+
+- [ ] **Step 4: Fault view and IC section in `Sim::step`**
+
+Add to `crates/bwr-core/src/sim.rs` (near `bop_faults`):
+
+```rust
+/// Per-train fault view, built from `Sim.faults` once per step.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IcFaults {
+    pub unavailable: bool,
+    pub steam_closed: bool,
+    pub return_stuck: [bool; N_IC_RETURN_VALVES],
+    /// 0.0..1.0 fraction of UA lost to noncondensables.
+    pub degradation: f64,
+}
+
+impl Sim {
+    pub fn ic_faults(&self, train: usize) -> IcFaults {
+        let mut f = IcFaults::default();
+        f.unavailable = self.find_fault("IcTrainUnavailable", Some(train)).is_some();
+        f.steam_closed = self.find_fault("IcSteamValveClosed", Some(train)).is_some();
+        for v in 0..N_IC_RETURN_VALVES {
+            f.return_stuck[v] = self.find_fault("IcReturnValveStuck", Some(train * N_IC_RETURN_VALVES + v)).is_some();
         }
+        if let Some(Fault::IcNoncondensableDegradation { pct, .. }) = self.find_fault("IcNoncondensableDegradation", Some(train)) {
+            f.degradation = (*pct as f64 / 100.0).clamp(0.0, 1.0);
+        }
+        f
+    }
+}
 ```
 
-In `crates/bwr-core/src/ledger.rs` add the two fields to `BoundaryFlows` after `w_liquid_out`/`h_liquid_out`:
+Add the private field `ic_envelope_raised: Vec<bool>` to `Sim`, initialised in `Sim::base` as `vec![false; N_IC_TRAINS]` (it is per-constructor state, so `finalize_init` leaves it alone).
+
+Replace the `// --- isolation condensers` block in `Sim::step` (master step 6) with:
 
 ```rust
-    /// Steam drawn by the isolation condensers, kg/s (out).
-    pub w_ic_steam: f64,
-    /// Condensate returned by the isolation condensers, kg/s (in).
-    pub w_ic_return: f64,
-```
-
-and in `Ledger::record` count them: `mass_in += f.w_ic_return * dt; mass_out += f.w_ic_steam * dt;` and leave the energy terms as they are (`q_ic` already carries the net IC energy; do not double count: `energy_out += f.q_ic * dt` stays, and the `w_ic_*` enthalpies must NOT be added separately). Add a doc line on `q_ic`: `/// Net energy removed by the ICs, W: w_ic_steam*h_steam - w_ic_return*h_ic_return.`
-
-- [ ] **Step 4: Wire the trains in `Sim::step`**
-
-Replace the `// --- isolation condensers` block in `crates/bwr-core/src/sim.rs`:
-
-```rust
-        // --- isolation condensers
-        let steam_avail = matches!(self.vessel.eos.regime, Regime::Saturated | Regime::GasBlanketed);
-        let (mut w_ic_steam, mut w_ic_return) = (0.0, 0.0);
-        for (i, tr) in self.ic.iter_mut().enumerate() {
-            tr.available = !self.faults.contains(&Fault::IcTrainUnavailable { train: i });
-            tr.steam_valve_cmd_open = !self.faults.contains(&Fault::IcSteamValveClosed { train: i });
-            for v in 0..N_IC_RETURN_VALVES {
-                tr.return_valve_stuck[v] = self.faults.contains(&Fault::IcReturnValveStuck { train: i, valve: v });
-            }
-            let degradation = self
-                .faults
-                .iter()
-                .filter_map(|f| match f {
-                    Fault::IcNoncondensableDegradation { train, pct } if *train == i => Some(*pct as f64 / 100.0),
-                    _ => None,
-                })
-                .fold(0.0, f64::max);
-            tr.ua_factor = (1.0 - degradation).clamp(0.0, 1.0);
-            let out = tr.step(dt, p, t_cool, steam_avail);
-            w_ic_steam += tr.w_steam_in;
+        // --- isolation condensers (step 6): requested withdrawal
+        let steam_space = matches!(self.vessel.eos.regime, Regime::Saturated | Regime::GasBlanketed);
+        let other_out = self.steam.vessel_steam_flow() + self.fw.rwcu_reject + self.vessel.vent_flow;
+        let w_ic_avail = if steam_space { (self.vessel.mass / dt + self.fw.flow - other_out).max(0.0) } else { 0.0 };
+        let views: Vec<IcFaults> = (0..self.ic.len()).map(|i| self.ic_faults(i)).collect();
+        let (mut w_ic_req, mut w_ic_return, mut h_w_sum) = (0.0, 0.0, 0.0);
+        for (tr, f) in self.ic.iter_mut().zip(&views) {
+            tr.available = !f.unavailable;
+            tr.steam_valve_cmd_open = !f.steam_closed;
+            tr.return_valve_stuck = f.return_stuck;
+            tr.ua_factor = 1.0 - f.degradation;
+            let out = tr.step(dt, p, w_ic_avail);
+            w_ic_req += out.w_steam_in;
             w_ic_return += out.w_condensate_return;
+            h_w_sum += out.w_condensate_return * out.h_condensate_return;
         }
-        let h_ic_return = self.vessel.sat().h_f;
-        for i in 0..self.ic.len() {
-            if self.ic[i].envelope_exceeded(t_cool)
-                && !self.domain_errors.iter().any(|(_, e)| matches!(e, DomainError::IcModelEnvelope { train, .. } if *train == i))
-            {
-                self.domain_errors.push((self.time, DomainError::IcModelEnvelope { train: i, reason: "pool depleted".into() }));
-                self.log.push((self.time, format!("MODEL ENVELOPE: IC train {} pool depleted", i + 1)));
-            }
-        }
+        let h_ic_return = if w_ic_return > 0.0 { h_w_sum / w_ic_return } else { self.vessel.sat().h_f };
 ```
 
-Add `use crate::domain::DomainError; use crate::faults::Fault; use crate::vessel::Regime;` to the imports if not already present. Build the vessel inputs with the new fields:
+Add `use crate::vessel::Regime;` and `use crate::faults::Fault;` if missing. Build the vessel inputs (step 8):
 
 ```rust
         let inputs = VesselInputs {
             q_core: self.q_core,
-            w_ic_steam,
+            w_ic_steam: w_ic_req,
             w_ic_return,
             h_ic_return,
             w_feed: self.fw.flow,
             h_feed: self.fw.h_feed(),
-            w_steam: self.steam.total_flow(),
+            w_steam: self.steam.vessel_steam_flow(),
             w_liquid_out: self.fw.rwcu_reject,
         };
         let flows = self.vessel.step(dt, &inputs);
 ```
 
-Where P6 fills `self.balance.q_ic_w`, set it from `flows.q_ic`. Where P6/P3 record the ledger, nothing changes (`self.ledger.record(dt, &flows)`).
+Directly after it, in P3/P6's step-9 rescale block (where `steam.w_tcv`, `steam.w_bypass`, `fw.rwcu_reject` are scaled by the allocation ratio), add the IC rescale:
 
-In `Sim::cold_shutdown()` after `Self::base(...)` add:
+```rust
+        // step 9: every consumer sees the APPLIED IC withdrawal
+        let ic_ratio = if w_ic_req > 0.0 { flows.w_ic_steam / w_ic_req } else { 1.0 };
+        for tr in self.ic.iter_mut() {
+            tr.w_steam_in *= ic_ratio;
+            tr.heat *= ic_ratio;
+        }
+        let q_ic = flows.q_ic;
+```
+
+`q_ic` feeds the energy balance (`b.q_ic_w = q_ic`). In the energy-balance block (P6), add the tube storage term: before the IC loop save `let e_tube0: f64 = self.ic.iter().map(|t| t.tube_energy).sum();` and after it `let ic_tube_storage_w = (self.ic.iter().map(|t| t.tube_energy).sum::<f64>() - e_tube0) / dt;`, then include `ic_tube_storage_w` in `b.storage_w` (master P6: storage includes `d/dt(ic tube energy)`).
+
+At master step 17, add after the vessel/core error drains:
+
+```rust
+        let t_sat_now = self.vessel.eos.t;
+        for i in 0..self.ic.len() {
+            if !self.ic_envelope_raised[i] && self.ic[i].envelope_exceeded(t_sat_now) {
+                self.ic_envelope_raised[i] = true;
+                self.domain_error(DomainError::IcModelEnvelope { train: i, reason: format!("train {} pool depleted", i + 1) });
+            }
+        }
+```
+
+In `Sim::cold_shutdown()` after `Self::base(...)` and before `finalize_init`:
 
 ```rust
         for t in s.ic.iter_mut() {
             t.tube_mass = 0.0; // no steam for 30 days: tubes drained
+            t.tube_energy = 0.0;
         }
 ```
 
@@ -959,15 +1177,16 @@ In `apply`, replace the `SetIcTrain` arm:
                 if index < self.ic.len() {
                     if !self.ic[index].available {
                         self.event("ic_cmd", format!("IC train {} unavailable", index + 1));
+                        self.log.push((self.time, format!("ignored: SetIcTrain {} (unavailable)", index + 1)));
                         return;
                     }
                     self.ic[index].cmd_open = open;
-                    self.log.push((self.time, format!("IC train {} {}", index + 1, if open { "manual open" } else { "manual close" })));
+                    self.log.push((self.time, format!("ic manual: train {} {}", index + 1, if open { "open" } else { "close" })));
                 }
             }
 ```
 
-In `protection()`, replace the auto-initiation block so unavailable trains are skipped and the log records the event:
+In `protection()`, replace the auto-initiation block so unavailable trains are skipped and the log records the event with the master's event prefix:
 
 ```rust
         if self.vessel.eos.p > IC_HIGH_PRESSURE || self.level_cm() < L2_CM || isolated_at_power {
@@ -978,27 +1197,44 @@ In `protection()`, replace the auto-initiation block so unavailable trains are s
             }
             if started {
                 self.event("ic_init", "Isolation condensers auto-initiated");
-                self.log.push((self.time, "IC auto-initiation".into()));
+                self.log.push((self.time, "ic auto-initiation: all available trains".into()));
             }
         }
 ```
 
-- [ ] **Step 5: Fix compile errors in the rest of the crate**
+(The master's `Metrics.first_event_time` keys on the text before the first `:`; the key is therefore `ic auto-initiation`.)
+
+- [ ] **Step 5: Populate the trace columns**
+
+In `crates/bwr-core/src/validation.rs` `sample(sim)`, replace the three IC triplets' placeholder assignments with:
+
+```rust
+    for i in 0..N_IC_TRAINS.min(3) {
+        let tr = &sim.ic[i];
+        r[col_index(&format!("ic_heat_w_{i}"))] = tr.heat;
+        r[col_index(&format!("ic_pool_kg_{i}"))] = tr.pool_mass;
+        r[col_index(&format!("ic_return_pos_{i}"))] = tr.return_valve_pos.iter().cloned().fold(0.0, f64::max);
+    }
+```
+
+(`t_coolant_c` is already sampled from `sim.vessel.eos.t` by P2.) `heat` is the applied value (rescaled at step 9) because `sample` runs after `step`.
+
+- [ ] **Step 6: Build, fix call sites, run**
 
 Run: `cargo build --release -p bwr-core 2>&1 | grep -E "^error" -A5`
-Expected: errors only where `VesselInputs { q_ic, .. }` is constructed (examples and tests from earlier packages, e.g. `tests/conservation.rs`, `tests/vessel_transients.rs`). Update each to the new fields with `w_ic_steam: 0.0, w_ic_return: 0.0, h_ic_return: 0.0` unless that test exercises ICs.
+Expected: errors only at remaining `VesselInputs { q_ic, .. }` literals (fix per Step 3) and at any P3 interim `tr.step(dt, t_cool, h_fg, steam_avail)` call left in examples.
 
 Run: `cargo test --release -p bwr-core --test ic_transients`
-Expected: both tests PASS.
+Expected: three tests PASS.
 
 Run: `cargo test --release -p bwr-core`
-Expected: everything passes except possibly `plant::msiv_closure_scrams_and_isolation_condensers_cool` (it asserts `t.heat > 1.0e6` for any train, which still holds) and P2 baseline comparisons, which are regenerated in Task 10. If any other test fails, read the failure; do not change its expected value in this task.
+Expected: everything passes except the P2 baseline comparison (regenerated in Task 10) and possibly `register` if a `params.rs` row is missing. `plant::msiv_closure_scrams_and_isolation_condensers_cool` asserts `t.heat > 1.0e6` for any train and still holds. Do not change any other test's expected value in this task.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add crates/bwr-core/src/vessel.rs crates/bwr-core/src/ledger.rs crates/bwr-core/src/sim.rs crates/bwr-core/tests
-git commit -m "feat(ic): vessel sees IC steam and condensate flows; faults and envelope wired in Sim
+git add crates/bwr-core/src/vessel.rs crates/bwr-core/src/ledger.rs crates/bwr-core/src/sim.rs crates/bwr-core/src/validation.rs crates/bwr-core/tests crates/bwr-core/examples
+git commit -m "feat(ic): vessel IC mass ports, derived q_ic, fault view, allocation rescale, trace columns
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -1012,8 +1248,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Modify: `crates/bwr-core/src/sim.rs` only if a test exposes a defect
 
 **Interfaces:**
-- Consumes: Task 3 wiring, `Sim.log`, `Sim.domain_errors`.
-- Produces: nothing new; verifies behaviour the spec requires ("automatic initiation, manual control, reset/latch behavior, available trains").
+- Consumes: Task 3 wiring, `Sim.log`, `Sim.domain_errors`, `Sim::has_fault`.
 
 - [ ] **Step 1: Write the tests**
 
@@ -1030,7 +1265,7 @@ fn auto_initiation_opens_only_available_trains_and_latches() {
     assert!(sim.ic[0].cmd_open && sim.ic[1].cmd_open, "available trains initiated");
     assert!(!sim.ic[2].cmd_open, "unavailable train must not be commanded");
     assert_eq!(sim.ic[2].return_valve_pos, [0.0; N_IC_RETURN_VALVES]);
-    assert!(sim.log.iter().any(|(_, t)| t == "IC auto-initiation"));
+    assert!(sim.log.iter().any(|(_, t)| t.starts_with("ic auto-initiation")));
     // Latch: the initiating condition clears as pressure falls, valves stay open.
     run(&mut sim, 600.0);
     assert!(sim.vessel.eos.p < IC_HIGH_PRESSURE);
@@ -1049,10 +1284,11 @@ fn manual_command_to_unavailable_train_is_rejected() {
     let mut sim = Sim::new(ScenarioName::HotStandby);
     sim.set_fault(Fault::IcTrainUnavailable { train: 1 }, true);
     sim.apply(Command::SetIcTrain { index: 1, open: true });
-    run(&mut sim, 30.0);
+    run(&mut sim, 10.0);
     assert!(!sim.ic[1].cmd_open);
     let snap = sim.snapshot();
     assert!(snap.alarms.iter().any(|a| a.text.contains("IC train 2 unavailable")), "{:?}", snap.alarms);
+    assert!(sim.log.iter().any(|(_, t)| t.starts_with("ignored: SetIcTrain 2")));
 }
 
 #[test]
@@ -1068,6 +1304,8 @@ fn stuck_return_valve_is_held_and_parallel_valve_carries_the_train() {
     let q0 = sim.ic[0].heat;
     let q1 = sim.ic[1].heat;
     assert!((q0 - q1).abs() < 0.02 * q1, "train with one stuck valve {q0} vs healthy {q1}");
+    // The fault lookup is by (kind, equipment): train 0 valve 1 must be unaffected.
+    assert!(sim.find_fault("IcReturnValveStuck", Some(1)).is_none());
 }
 
 #[test]
@@ -1078,7 +1316,7 @@ fn closed_steam_valve_train_removes_nothing_at_plant_level() {
     isolate(&mut sim);
     run(&mut sim, 300.0);
     assert!(sim.ic[1].steam_valve_pos < 1e-9);
-    assert_eq!(sim.ic[1].heat, 0.0);
+    assert!(sim.ic[1].heat < 1.0, "a closed steam path may only release residual tube heat: {}", sim.ic[1].heat);
     assert!(sim.ic[0].heat > 1.0e6 && sim.ic[2].heat > 1.0e6);
     assert!(sim.domain_errors.is_empty(), "a closed valve is a fault, not a model-envelope breach");
 }
@@ -1089,16 +1327,18 @@ fn pool_depletion_raises_model_envelope_error_once() {
     run(&mut sim, 5.0);
     for t in sim.ic.iter_mut() {
         t.pool_mass = 2_000.0; // tiny pools so depletion happens inside the test
-        t.pool_t = 100.0;
+        t.pool_t = POOL_BOIL_T;
     }
     isolate(&mut sim);
     run(&mut sim, 1800.0);
-    let ic_errors: Vec<_> = sim
+    let ic_errors = sim
         .domain_errors
         .iter()
         .filter(|(_, e)| matches!(e, bwr_core::domain::DomainError::IcModelEnvelope { .. }))
-        .collect();
-    assert_eq!(ic_errors.len(), 3, "one entry per depleted train: {:?}", sim.domain_errors);
+        .count();
+    assert_eq!(ic_errors, 1, "domain_error dedups by variant: {:?}", sim.domain_errors);
+    let depletion_logs = sim.log.iter().filter(|(_, t)| t.contains("pool depleted")).count();
+    assert_eq!(depletion_logs, 1, "no re-raising per step: {:?}", sim.log);
     let snap = sim.snapshot();
     assert!(snap.unsupported.is_some());
     assert!(snap.alarms.iter().any(|a| a.id == "unsupported"));
@@ -1123,7 +1363,7 @@ fn shutdown_mode_does_not_reset_ic_initiation() {
 - [ ] **Step 2: Run**
 
 Run: `cargo test --release -p bwr-core --test ic_transients`
-Expected: all PASS. If `manual_command_to_unavailable_train_is_rejected` fails because `event` ids expire after 30 s, that is fine at 30 s of run; the test runs 30 s exactly — if it is flaky at the boundary, change the run to `run(&mut sim, 10.0)`. If `auto_initiation_opens_only_available_trains_and_latches` fails at the `in_service()` assertion after 600 s, check that `Sim` is not re-closing valves anywhere (grep `cmd_open = false` in `sim.rs`); the only writer must be `SetIcTrain`.
+Expected: all PASS. If `auto_initiation_opens_only_available_trains_and_latches` fails at the `in_service()` assertion after 600 s, some other code is writing `cmd_open = false` (`grep -n "cmd_open = false" crates/bwr-core/src/sim.rs`); the only writer must be `SetIcTrain`.
 
 - [ ] **Step 3: Commit**
 
@@ -1140,10 +1380,9 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `crates/bwr-core/tests/ic_transients.rs`
-- Modify: `docs/model/isolation-condensers.md` (results pointer already present)
 
 **Interfaces:**
-- Consumes: `Fault::IcNoncondensableDegradation { train, pct }`, `isolate`, `results`.
+- Consumes: `Fault::IcNoncondensableDegradation { train, pct }` via `Sim::ic_faults`, `isolate`, `results`.
 - Produces: `docs/validation/results/ic-degradation.csv` when `BWR_WRITE_RESULTS=1`.
 
 - [ ] **Step 1: Write the test**
@@ -1169,6 +1408,7 @@ fn degraded_response(pct: u8) -> (f64, Option<f64>) {
             t150 = Some(sim.time);
         }
     }
+    assert!((sim.ic[0].ua_factor - (1.0 - pct as f64 / 100.0)).abs() < 1e-12, "fault view applied");
     (peak, t150)
 }
 
@@ -1194,7 +1434,7 @@ fn noncondensable_degradation_monotonically_worsens_response() {
 - [ ] **Step 2: Run and write results**
 
 Run: `BWR_WRITE_RESULTS=1 cargo test --release -p bwr-core --test ic_transients noncondensable -- --nocapture`
-Expected: PASS; `docs/validation/results/ic-degradation.csv` created with three rows. If the 50 % case exceeds design pressure, that is a finding: keep the test failing, report it in the commit message and in `isolation-condensers.md` under "Results tables", and stop this task for Jim's decision (the spec forbids inventing performance).
+Expected: PASS; `docs/validation/results/ic-degradation.csv` created with three rows. If the 50 % case exceeds design pressure, that is a finding: leave the test failing, report it in the commit message and under "Results tables" in `isolation-condensers.md`, and stop this task for Jim's decision (the spec forbids inventing performance).
 
 - [ ] **Step 3: Commit**
 
@@ -1211,13 +1451,14 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `crates/bwr-core/tests/ic_transients.rs`
+- Modify: `crates/bwr-core/src/sim.rs` (`cw_pumps_all_off`)
 
 **Interfaces:**
-- Consumes: `Fault::CwPumpTrip` (P6), turbine trip on low vacuum, bypass block on condenser pressure, high-pressure scram, IC auto-initiation; `Sim.log` entries written by P2–P6 (`"Turbine trip: ..."`, scram text, `"IC auto-initiation"`).
+- Consumes: `Fault::CwPumpTrip` honoured by P6, turbine trip on low vacuum, bypass block on condenser pressure, high-pressure scram, IC auto-initiation; `Sim.log` entries from P2–P6 (turbine trip, scram, `ic auto-initiation`).
 
-- [ ] **Step 1: Write the test**
+- [ ] **Step 1: Write the test and helper**
 
-Append:
+Append to the test file:
 
 ```rust
 #[test]
@@ -1233,7 +1474,7 @@ fn loss_of_circulating_water_ends_with_ic_cooling_in_the_right_order() {
         peak = peak.max(sim.vessel.eos.p);
     }
     let find = |needle: &str| sim.log.iter().find(|(_, t)| t.to_lowercase().contains(needle)).map(|(t, _)| *t);
-    let t_turbine = find("turbine").expect("turbine trip logged");
+    let t_turbine = find("turbine trip").expect("turbine trip logged");
     let t_scram = find("scram").expect("scram logged");
     let t_ic = find("ic auto-initiation").expect("IC initiation logged");
     assert!(t_turbine <= t_scram, "turbine trip ({t_turbine}) before scram ({t_scram})");
@@ -1246,9 +1487,10 @@ fn loss_of_circulating_water_ends_with_ic_cooling_in_the_right_order() {
 }
 ```
 
-Add to `Sim` in `sim.rs` (public helper used only by tests):
+Add to `impl Sim` in `sim.rs`:
 
 ```rust
+    /// Test helper: no circulating water pump is running.
     pub fn cw_pumps_all_off(&self) -> bool {
         self.cond.cw_pumps.iter().all(|&b| !b)
     }
@@ -1257,7 +1499,7 @@ Add to `Sim` in `sim.rs` (public helper used only by tests):
 - [ ] **Step 2: Run**
 
 Run: `cargo test --release -p bwr-core --test ic_transients loss_of_circulating`
-Expected: PASS. If the scram is logged before the turbine trip, inspect `sim.log` with `--nocapture`; the first signal after vacuum loss must be the condenser-pressure turbine trip (`CONDENSER_TRIP_P` = 25 kPa) and the scram should follow from pressure. If instead the scram comes from MSIV closure (low condenser vacuum MSIV isolation is not implemented), the ordering assertion still holds; record the actual order in the commit message.
+Expected: PASS. If the scram is logged before the turbine trip, inspect `sim.log` with `--nocapture`; the first signal after vacuum loss must be the condenser-pressure turbine trip (`CONDENSER_TRIP_P` = 25 kPa) and the scram should follow from pressure. Record the actual order in the commit message.
 
 - [ ] **Step 3: Commit**
 
@@ -1270,13 +1512,13 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 7: Train availability matrix, inadvertent initiation, hot and low pools
+### Task 7: Train availability matrix, capacity sensitivity, inadvertent initiation, hot and low pools
 
 **Files:**
 - Modify: `crates/bwr-core/tests/ic_transients.rs`
 
 **Interfaces:**
-- Produces: `docs/validation/results/ic-availability.csv` rows `case,trains,pool_t0_c,pool_frac0,peak_pressure_pa,peak_time_s,above_design,p_600s_pa,t_600s_c`.
+- Produces: `docs/validation/results/ic-availability.csv` and `ic-inadvertent.csv`.
 
 - [ ] **Step 1: Write the tests**
 
@@ -1288,6 +1530,8 @@ struct IcCase {
     trains: usize,
     pool_t0: f64,
     pool_frac0: f64,
+    /// UA multiplier applied through the degradation fault (1.0 - pct/100); 1.0 = nominal.
+    ua_pct_loss: u8,
 }
 
 fn isolation_with(case: &IcCase) -> (f64, f64, f64, f64) {
@@ -1295,6 +1539,11 @@ fn isolation_with(case: &IcCase) -> (f64, f64, f64, f64) {
     run(&mut sim, 5.0);
     for i in case.trains..N_IC_TRAINS {
         sim.set_fault(Fault::IcTrainUnavailable { train: i }, true);
+    }
+    if case.ua_pct_loss > 0 {
+        for train in 0..N_IC_TRAINS {
+            sim.set_fault(Fault::IcNoncondensableDegradation { train, pct: case.ua_pct_loss }, true);
+        }
     }
     for t in sim.ic.iter_mut() {
         t.pool_t = case.pool_t0;
@@ -1314,25 +1563,35 @@ fn isolation_with(case: &IcCase) -> (f64, f64, f64, f64) {
 
 #[test]
 fn train_availability_matrix() {
+    let nominal = |name, trains| IcCase { name, trains, pool_t0: IC_POOL_T_AMBIENT, pool_frac0: 1.0, ua_pct_loss: 0 };
     let cases = [
-        IcCase { name: "three_trains", trains: 3, pool_t0: IC_POOL_T_AMBIENT, pool_frac0: 1.0 },
-        IcCase { name: "two_trains", trains: 2, pool_t0: IC_POOL_T_AMBIENT, pool_frac0: 1.0 },
-        IcCase { name: "one_train", trains: 1, pool_t0: IC_POOL_T_AMBIENT, pool_frac0: 1.0 },
-        IcCase { name: "three_trains_hot_pool", trains: 3, pool_t0: 100.0, pool_frac0: 1.0 },
-        IcCase { name: "three_trains_low_pool", trains: 3, pool_t0: IC_POOL_T_AMBIENT, pool_frac0: 0.3 },
+        nominal("three_trains", 3),
+        nominal("two_trains", 2),
+        nominal("one_train", 1),
+        IcCase { name: "three_trains_hot_pool", trains: 3, pool_t0: POOL_BOIL_T, pool_frac0: 1.0, ua_pct_loss: 0 },
+        IcCase { name: "three_trains_low_pool", trains: 3, pool_t0: IC_POOL_T_AMBIENT, pool_frac0: 0.3, ua_pct_loss: 0 },
+        // Capacity sensitivity for the ESBWR-derived duty (E-08): -30 % via the UA fault.
+        IcCase { name: "three_trains_minus_30pct_duty", trains: 3, pool_t0: IC_POOL_T_AMBIENT, pool_frac0: 1.0, ua_pct_loss: 30 },
     ];
     let mut rows = Vec::new();
     for c in &cases {
         let (peak, t_peak, p600, t600) = isolation_with(c);
         let above = peak > VESSEL_DESIGN_PRESSURE;
-        rows.push(format!("{},{},{},{},{:.0},{:.1},{},{:.0},{:.1}", c.name, c.trains, c.pool_t0, c.pool_frac0, peak, t_peak, above, p600, t600));
-        if c.trains >= 2 {
+        rows.push(format!(
+            "{},{},{},{},{},{:.0},{:.1},{},{:.0},{:.1}",
+            c.name, c.trains, c.pool_t0, c.pool_frac0, c.ua_pct_loss, peak, t_peak, above, p600, t600
+        ));
+        if c.trains >= 2 && c.ua_pct_loss == 0 {
             assert!(!above, "{}: peak {peak} Pa above design pressure", c.name);
             assert!(p600 < IC_HIGH_PRESSURE, "{}: pressure not falling after 600 s ({p600} Pa)", c.name);
         }
-        // One train: recorded only. The spec forbids inventing a performance target.
+        // One train and -30 % duty: recorded only. The spec forbids inventing a performance target.
     }
-    results("ic-availability", "case,trains,pool_t0_c,pool_frac0,peak_pressure_pa,peak_time_s,above_design,p_600s_pa,t_600s_c", &rows);
+    results(
+        "ic-availability",
+        "case,trains,pool_t0_c,pool_frac0,ua_pct_loss,peak_pressure_pa,peak_time_s,above_design,p_600s_pa,t_600s_c",
+        &rows,
+    );
 }
 
 #[test]
@@ -1362,13 +1621,13 @@ fn inadvertent_initiation_at_full_power_does_not_scram() {
 - [ ] **Step 2: Run and write results**
 
 Run: `BWR_WRITE_RESULTS=1 cargo test --release -p bwr-core --test ic_transients -- train_availability inadvertent --nocapture`
-Expected: PASS; two CSV files written. If `two_trains` exceeds design pressure, that is a finding against `IC_TRAIN_RATED_W` or the pool split (A-IC-04): leave the test failing, add the row to `isolation-condensers.md` "Results tables", and stop for Jim's decision.
+Expected: PASS; two CSV files written. If `two_trains` exceeds design pressure, that is a finding against `IC_TRAIN_RATED_W` or the pool split (A-023): leave the test failing, add the row to `isolation-condensers.md` "Results tables", and stop for Jim's decision.
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add crates/bwr-core/tests/ic_transients.rs docs/validation/results/ic-availability.csv docs/validation/results/ic-inadvertent.csv
-git commit -m "test(ic): availability matrix, inadvertent initiation, hot and low pools
+git commit -m "test(ic): availability matrix, capacity sensitivity, inadvertent initiation, hot and low pools
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -1378,24 +1637,29 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ### Task 8: 72-hour and 7-day endurance cases with coarse-step convergence
 
 **Files:**
-- Modify: `crates/bwr-core/src/validation.rs` (`Case.dt_after_s`, `DT_LONG`, `run_case`, `standard_cases`)
+- Modify: `crates/bwr-core/src/validation.rs` (`DT_LONG`, `run_case` honours `dt_after_s`, `standard_cases`)
+- Modify: `crates/bwr-core/examples/validation.rs` (`--long`)
 - Modify: `docs/validation/cases.csv`
 - Modify: `crates/bwr-core/tests/ic_transients.rs`
 - Modify: `.github/workflows/validate.yml`
-- Modify: every place that constructs a `Case` literal (grep `Case {`) to add `dt_after_s: None`
 
 **Interfaces:**
-- Produces: `validation::DT_LONG = 0.5`, `Case.dt_after_s: Option<(f64, f64)>`, cases `fp_scram_ic_72h` and `fp_scram_ic_7d`.
+- Consumes: `Case.dt_after_s` (master field; P2 may have left it unused by `run_case`), `Operator::None`, `Trace::column`, `Tolerance::physical`, `compare`.
+- Produces: `validation::DT_LONG = 0.5`; cases `fp_scram_ic_72h`, `fp_scram_ic_7d`; `docs/validation/results/ic-endurance.csv`.
 
-- [ ] **Step 1: Write the failing convergence test**
+- [ ] **Step 1: Write the failing tests**
 
 Append to `ic_transients.rs`:
 
 ```rust
-use bwr_core::validation::{run_case, standard_cases, Tolerance, DT_LONG};
+use bwr_core::validation::{compare, run_case, standard_cases, Case, Tolerance, DT_LONG};
 
-fn case(id: &str) -> bwr_core::validation::Case {
+fn case(id: &str) -> Case {
     standard_cases().into_iter().find(|c| c.id == id).unwrap_or_else(|| panic!("case {id} missing"))
+}
+
+fn pool_total(tr: &bwr_core::validation::Trace, row: usize) -> f64 {
+    (0..3).map(|i| tr.column(&format!("ic_pool_kg_{i}"))[row]).sum()
 }
 
 #[test]
@@ -1406,24 +1670,26 @@ fn coarse_step_matches_fine_step_over_the_first_hour() {
     fine.dt_after_s = None;
     let a = run_case(&fine, DT).metrics();
     let b = run_case(&c, DT).metrics(); // DT for 600 s, then DT_LONG
-    let violations = bwr_core::validation::compare(&a, &b, &Tolerance::physical());
+    let violations = compare(&a, &b, &Tolerance::physical());
     assert!(violations.is_empty(), "coarse step diverges: {violations:?}");
 }
 
 #[test]
 fn seventy_two_hour_cooling_with_three_trains() {
     let tr = run_case(&case("fp_scram_ic_72h"), DT);
-    let pool = tr.column("ic_pool_kg");
-    let temp_end = *tr.column("t_coolant_c").last().unwrap();
-    let p_peak = tr.column("pressure_pa").iter().cloned().fold(0.0, f64::max);
-    assert!(*pool.last().unwrap() > 0.0, "pool depleted before 72 h");
+    let last = tr.rows.len() - 1;
+    let pool_end = pool_total(&tr, last);
+    let temp_end = tr.column("t_coolant_c")[last];
+    let p_peak = tr.column("pressure_pa_max_int").iter().cloned().fold(0.0, f64::max);
+    assert!(pool_end > 0.0, "pool depleted before 72 h");
     assert!(p_peak < VESSEL_DESIGN_PRESSURE);
-    assert!(temp_end >= 100.0 - 0.5, "ICs cannot cool below the boiling pool: {temp_end} degC");
-    assert!(!tr.events.iter().any(|(_, e)| e.contains("MODEL ENVELOPE")), "{:?}", tr.events);
+    assert!(temp_end >= POOL_BOIL_T - 0.5, "ICs cannot cool below the boiling pool: {temp_end} degC");
+    assert!(!tr.events.iter().any(|(_, e)| e.starts_with("DOMAIN")), "{:?}", tr.events);
+    assert!(tr.column("unsupported").iter().all(|&u| u == 0.0));
     results(
         "ic-endurance",
         "case,hours,pool_fraction,t_coolant_c,peak_pressure_pa",
-        &[format!("fp_scram_ic_72h,72,{:.3},{:.1},{:.0}", pool.last().unwrap() / IC_POOL_MASS_TOTAL, temp_end, p_peak)],
+        &[format!("fp_scram_ic_72h,72,{:.3},{:.1},{:.0}", pool_end / IC_POOL_MASS_TOTAL, temp_end, p_peak)],
     );
 }
 
@@ -1431,17 +1697,15 @@ fn seventy_two_hour_cooling_with_three_trains() {
 #[ignore = "7-day run: executed by validate.yml with --ignored"]
 fn seven_day_cooling_with_three_trains() {
     let tr = run_case(&case("fp_scram_ic_7d"), DT);
-    let pool = tr.column("ic_pool_kg");
+    let t = tr.column("t");
     let temp = tr.column("t_coolant_c");
-    let p_peak = tr.column("pressure_pa").iter().cloned().fold(0.0, f64::max);
-    let at = |h: f64| {
-        let i = tr.column("t").iter().position(|&t| t >= h * 3600.0).unwrap();
-        (pool[i], temp[i])
-    };
-    let (pool72, t72) = at(72.0);
-    let (pool7d, t7d) = (*pool.last().unwrap(), *temp.last().unwrap());
+    let p_peak = tr.column("pressure_pa_max_int").iter().cloned().fold(0.0, f64::max);
+    let i72 = t.iter().position(|&x| x >= 72.0 * 3600.0).unwrap();
+    let last = t.len() - 1;
+    let (pool72, t72) = (pool_total(&tr, i72), temp[i72]);
+    let (pool7d, t7d) = (pool_total(&tr, last), temp[last]);
     assert!(pool72 > 0.0);
-    assert!(t7d >= 100.0 - 0.5, "{t7d}");
+    assert!(t7d >= POOL_BOIL_T - 0.5, "{t7d}");
     results(
         "ic-endurance",
         "case,hours,pool_fraction,t_coolant_c,peak_pressure_pa",
@@ -1455,41 +1719,46 @@ fn seven_day_cooling_with_three_trains() {
 }
 ```
 
-`TRACE_COLUMNS` in the master has `ic_pool_kg` but no coolant temperature column. Add `"t_coolant_c"` as a 25th column: change `TRACE_COLUMNS: [&str; 25]`, `rows: Vec<[f64; 25]>`, and the row builder in `run_case` to include `sim.vessel.eos.t` after `ic_pool_kg`. Note this in the master "Shared interface contract" P2 section as part of this commit (one-line edit: `[&str; 24]` → `[&str; 25]` plus the column name).
-
 - [ ] **Step 2: Run to verify failure**
 
 Run: `cargo test --release -p bwr-core --test ic_transients coarse_step`
-Expected: compile error: `dt_after_s` not a field of `Case`, `DT_LONG` not found.
+Expected: FAIL: `DT_LONG` not found and/or `case fp_scram_ic_72h missing`.
 
-- [ ] **Step 3: Extend `validation.rs`**
+- [ ] **Step 3: Extend `validation.rs` and the runner**
 
 In `crates/bwr-core/src/validation.rs`:
 
 ```rust
-/// Coarse step for long unattended-cooling cases, s. Convergence against `sim::DT`
-/// over the first hour is checked by ic_transients::coarse_step_matches_fine_step_over_the_first_hour.
+/// Coarse step for long unattended-cooling cases, s. Convergence against `sim::DT` over the
+/// first hour is checked by ic_transients::coarse_step_matches_fine_step_over_the_first_hour.
 pub const DT_LONG: f64 = 0.5;
 ```
 
-Add to `Case`:
+In `run_case`, if P2 left `dt_after_s` unused, replace the single `sim.step(dt)` and the fixed `sample_every` with a time-based sampler so the coarse phase samples on the same multiples:
 
 ```rust
-    /// `(from_t, dt)`: after `from_t` seconds of simulation time, step with `dt`.
-    pub dt_after_s: Option<(f64, f64)>,
-```
-
-In `run_case`, where the loop currently does `sim.step(dt)`, select the step:
-
-```rust
+    let mut next_sample = 0.0;
+    loop {
+        // commands/faults due before this step (unchanged from P2)
+        if sim.time + 1e-9 >= next_sample {
+            trace.rows.push(sample(&sim));
+            next_sample += case.sample_dt_s;
+        }
+        if sim.time + 1e-9 >= case.duration_s {
+            break;
+        }
         let h = match case.dt_after_s {
-            Some((from_t, big)) if sim.time >= from_t => big,
+            Some((from_t, big)) if sim.time + 1e-9 >= from_t => big,
             _ => dt,
         };
         sim.step(h);
+        trace.events.extend(sim.log.drain(..));
+    }
 ```
 
-and make the sampling test `sim.time + 1e-9 >= next_sample` (it already compares against `sample_dt_s`; with a 0.5 s step and `sample_dt_s` of 60 s sampling stays on multiples of 60 s). Add the two cases to `standard_cases()`:
+Keep P2's command/fault application (`due = sim.time + 0.5 * h`). Interval-extrema columns (`*_max_int`, `*_min_int`) are accumulated per physics step by P2's sampler and are unaffected by `h`.
+
+Add to `standard_cases()`:
 
 ```rust
         Case {
@@ -1504,6 +1773,7 @@ and make the sampling test `sim.time + 1e-9 >= next_sample` (it already compares
             ],
             faults: vec![],
             dt_after_s: Some((600.0, DT_LONG)),
+            operator: Operator::None,
         },
         Case {
             id: "fp_scram_ic_7d",
@@ -1517,48 +1787,52 @@ and make the sampling test `sim.time + 1e-9 >= next_sample` (it already compares
             ],
             faults: vec![],
             dt_after_s: Some((600.0, DT_LONG)),
+            operator: Operator::None,
         },
 ```
 
-Add `dt_after_s: None` to every other `Case {` literal (`grep -rn "Case {" crates/bwr-core`).
-
-In `examples/validation.rs`, skip cases with `duration_s > 24.0 * 3600.0` unless the `--long` flag is given (so the default baseline run stays short):
+In `crates/bwr-core/examples/validation.rs`, after `let write = ...`:
 
 ```rust
-    let long = std::env::args().any(|a| a == "--long");
-    for case in standard_cases().into_iter().filter(|c| long || c.duration_s <= 24.0 * 3600.0) {
+    let long = args.iter().any(|a| a == "--long");
 ```
+
+and filter the case loop: `for case in standard_cases().into_iter().filter(|c| long || c.duration_s <= 86_400.0)`. Document the flag in the example's header comment: `//! --long   include cases longer than 24 h (fp_scram_ic_72h, fp_scram_ic_7d)`.
 
 - [ ] **Step 4: Register the cases**
 
-Append to `docs/validation/cases.csv` (Package 2 column order: id, scenario, purpose, reference, tolerance_class):
+Append to `docs/validation/cases.csv` (master header `id,scenario,duration_s,purpose,reference,tolerance_class,role,status`; if the file still has P2's 7-column header without `role`, add the `role` column to the header and `plausibility` to every existing row in this commit, since the master locks 8 columns):
 
 ```
-fp_scram_ic_72h,fullPower,"72 h unattended cooling, 3 IC trains, no makeup, no pool cooling, 2 y at rated before scram","SRC-IC-03 passive cooling claim (conditions differ; simulator result only)",physical
-fp_scram_ic_7d,fullPower,"7 d unattended cooling, same conditions; pool fraction reported","SRC-IC-03 7-day claim (not reproduced; reported)",physical
+fp_scram_ic_72h,fullPower,259200,72 h unattended cooling with 3 IC trains; no makeup; no pool cooling; 2 y at rated before scram,S-10 passive cooling claim (conditions differ; simulator result only),physical,plausibility,baseline
+fp_scram_ic_7d,fullPower,604800,7 d unattended cooling under the same conditions; pool fraction reported,S-10 7-day claim (not reproduced; reported),physical,plausibility,long-run-only
 ```
 
-- [ ] **Step 5: Add the CI step**
+- [ ] **Step 5: CI**
 
-In `.github/workflows/validate.yml`, after the existing validation run step add:
+In `.github/workflows/validate.yml`, in the `engine` job after the "Validation cases against baselines" step:
 
 ```yaml
-      - name: Long-duration IC endurance (7 d)
+      - name: Long-duration IC endurance (7 d, ignored test)
         run: cargo test --release -p bwr-core --test ic_transients -- --ignored seven_day
 ```
 
 - [ ] **Step 6: Run**
 
 Run: `cargo test --release -p bwr-core --test ic_transients`
-Expected: PASS (the 72 h case takes on the order of 30 s in release; if it exceeds 120 s, raise `DT_LONG` is NOT the fix — profile with `cargo build --release --example trace` and report).
+Expected: PASS. The 72 h case runs about 520 000 coarse steps; if it takes longer than 120 s in release, profile (`cargo build --release --example trace`, run `fp_scram_ic_72h` under `time`) and report; do not raise `DT_LONG`.
 
-Run: `BWR_WRITE_RESULTS=1 cargo test --release -p bwr-core --test ic_transients -- --ignored seven_day --nocapture`
-Expected: PASS with the printed 7-day pool fraction; `docs/validation/results/ic-endurance.csv` written (the two tests both write this file; the 7-day run last, so run the 72 h test first, then the 7-day one, and merge the rows by hand into one file with three rows).
+Run: `BWR_WRITE_RESULTS=1 cargo test --release -p bwr-core --test ic_transients seventy_two`
+Then: `BWR_WRITE_RESULTS=1 cargo test --release -p bwr-core --test ic_transients -- --ignored seven_day --nocapture`
+Expected: both PASS. Both write `ic-endurance.csv`; after the second run, merge the 72 h row from the first run back in so the file has three rows and the header once.
+
+Run: `cargo run --release -p bwr-core --example validation -- --long --write --case fp_scram_ic_72h`
+Expected: baseline `docs/validation/baseline/fp_scram_ic_72h.csv` written (the 7 d case gets no baseline; it is a long-run-only report).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/bwr-core/src/validation.rs crates/bwr-core/examples/validation.rs crates/bwr-core/tests/ic_transients.rs docs/validation/cases.csv docs/validation/results/ic-endurance.csv .github/workflows/validate.yml docs/superpowers/plans/2026-10-20-refinement-master.md
+git add crates/bwr-core/src/validation.rs crates/bwr-core/examples/validation.rs crates/bwr-core/tests/ic_transients.rs docs/validation/cases.csv docs/validation/results/ic-endurance.csv docs/validation/baseline/fp_scram_ic_72h.csv .github/workflows/validate.yml
 git commit -m "feat(validation): 72 h and 7 d IC endurance cases with coarse-step convergence check
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -1570,7 +1844,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `crates/bwr-core/src/api.rs` (`IcTrain`)
-- Modify: `crates/bwr-core/src/sim.rs` (`snapshot()` IC mapping)
+- Modify: `crates/bwr-core/src/sim.rs` (`snapshot()` IC mapping, `ic` alarm)
 - Modify: `crates/bwr-core/tests/plant.rs` (`json_contract_matches_ui`)
 - Modify: `ui/src/sim/types.ts`, `ui/src/sim/mock.ts`, `ui/src/components/mimic/PlantMimic.tsx`
 
@@ -1633,7 +1907,7 @@ In `sim.rs` `snapshot()`:
                 .collect(),
 ```
 
-Also update the `ic` alarm to use `in_service()`: `if self.ic.iter().any(|t| t.in_service())`.
+Change the `ic` alarm condition to `if self.ic.iter().any(|t| t.in_service())`.
 
 Run: `cargo test --release -p bwr-core --test plant json_contract`
 Expected: PASS.
@@ -1646,7 +1920,7 @@ Expected: PASS.
 export interface IcTrain {
   /** max(returnValvePos) — kept for the mimic. */
   valvePos: number;
-  /** Steam supply valve 0..1, normally open; closed only by a test fault. */
+  /** Steam supply valve 0..1, normally open; closed only by an engine-level test fault. */
   steamValvePos: number;
   /** Two parallel condensate return valves 0..1; opening either puts the train in service. */
   returnValvePos: number[];
@@ -1686,7 +1960,7 @@ and in the mock step loop replace the valve line:
       ic.condensateReturnKgs = (ic.heatMw * 1e6) / 1.5e6;
 ```
 
-`ui/src/components/mimic/PlantMimic.tsx`: in the IC `Valve` element change the `title` and add a dim tone for an unavailable train:
+`ui/src/components/mimic/PlantMimic.tsx`, IC valve and tag:
 
 ```tsx
               <Valve
@@ -1727,26 +2001,26 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Modify: `docs/validation/baseline/*.csv`, `docs/model/coverage.md`, `docs/model/isolation-condensers.md`, `README.md`
 
 **Interfaces:**
-- Consumes: `examples/validation.rs` compare and `--write-baseline` modes (P2).
+- Consumes: `examples/validation.rs` compare mode and `--write` (P2).
 
 - [ ] **Step 1: Compare against the pre-package baselines and record the differences**
 
 Run: `cargo run --release -p bwr-core --example validation 2>&1 | tee /tmp/ic-before-after.txt`
-Expected: violations only in cases where ICs act (`fp_msiv_closure`, `fp_loss_of_cw` and any case whose events include "IC"). For each violated metric, add a row to a "Baseline changes from Package 7" table at the end of `docs/model/isolation-condensers.md`:
+Expected: violations only in cases where ICs act (`fp_msiv_closure` and any case whose events include `ic auto-initiation`). For each violated metric, add a row to a "Baseline changes from Package 7" table at the end of `docs/model/isolation-condensers.md`:
 
 ```markdown
 ## Baseline changes from Package 7
 
 | Case | Metric | Before | After | Cause |
 |---|---|---|---|---|
-| fp_msiv_closure | pressure_pa peak | <before> | <after> | tube drain lag (~60 s to full duty) replaces 20 s heat lag; return water now adds mass |
+| fp_msiv_closure | pressure_pa peak | <before> | <after> | tube drain (about 60 s to full duty) replaces the 20 s heat lag; return water now adds mass |
 ```
 
 (one row per violation printed, copied verbatim from the runner output). Cases that do not touch the ICs must show no violations; if one does, stop and find out why before regenerating anything.
 
 - [ ] **Step 2: Regenerate**
 
-Run: `cargo run --release -p bwr-core --example validation -- --write-baseline`
+Run: `cargo run --release -p bwr-core --example validation -- --write`
 Then: `cargo run --release -p bwr-core --example validation`
 Expected: no violations.
 
@@ -1755,13 +2029,13 @@ Expected: no violations.
 In `docs/model/coverage.md`, set the isolation condensers row to:
 
 ```
-| Isolation condensers | docs/model/isolation-condensers.md; A-IC-01..10; SRC-IC-01..04 | tests/ic_transients.rs (12), ic::tests (10), cases fp_scram_ic_72h/7d | 1-train endurance and absolute duty are reported, not validated; cooling below 100 degC out of envelope |
+| Isolation condensers | ic.rs | S-ESBWR-05 (shared concept); S-06; S-09; S-10 | N_IC_TRAINS; N_IC_RETURN_VALVES; IC_*; ic.* | A-020..A-029 | ic::tests (13); ic_transients.rs (15); cases fp_scram_ic_72h, fp_scram_ic_7d | 1-train endurance, -30 % duty and absolute duty are reported, not validated; cooling below 100 degC out of envelope |
 ```
 
 In `README.md`, change the Isolation condensers row of the status table to:
 
 ```
-| Isolation condensers | 3 passive trains, each with a steam valve and two parallel return valves; tubes flood in standby and drain into service; pools heat, boil off and are conserved; endurance to 7 days reported under stated assumptions (cannot cool below the boiling pool) |
+| Isolation condensers | 3 passive trains, each with a steam valve and two parallel return valves; tubes flood in standby and drain into service; the vessel supplies the steam they condense; pools heat, boil off and are conserved; endurance to 7 days reported under stated assumptions (cannot cool below the boiling pool) |
 ```
 
 and in "Data sources" append `- US NRC, *ESBWR Design Control Document* Tier 2 Rev. 10, chapter 5 (isolation condenser arrangement, used as a shared concept only)`.
@@ -1782,11 +2056,13 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-## Package self-review (run before handing off)
+## Package self-review (master r2 checklist, run before handing off)
 
-- [ ] Spec bullets → tasks: train arrangement and parallel return valves (T1, T2); unsupported capacity/pool/timing replaced or quantified (T1, T7); steam supply / condensate / tube inventory / pressure difference / pool coupling (T2, T3); noncondensable sensitivity (T5); auto initiation, manual, reset/latch, available trains, loss of normal heat rejection (T4, T6); 1/2/3 trains, inadvertent, valve failure, hot and low pools, depletion (T4, T7); 72 h and 7 d with stated conditions (T8); lower temperature limit and unimplemented shutdown cooling boundary (T1 doc, T8 assertions).
-- [ ] No placeholders: the only `<...>` cells are the derived pool mass and checksums produced by commands in Task 1 and the before/after table copied from runner output in Task 10.
-- [ ] Names match the master: `IcTrain` fields, `IcStep`, `in_service`, `step(dt, p_vessel, t_sat, steam_available)`, `DomainError::IcModelEnvelope`, `Fault::Ic*`, Snapshot additions. Additions beyond the master are listed in the table at the top and must be appended to the master's P7 section in the Task 2 commit.
-- [ ] Every new constant has a `parameters.csv` row (Task 1 Step 7).
-- [ ] Every Snapshot change has `types.ts` and `mock.ts` steps and keeps `npm --prefix ui run typecheck` green (Task 9).
-- [ ] Every defect fix has a failing test first (Task 2 Step 1, Task 3 Step 1, Task 8 Step 1, Task 9 Step 1).
+- [x] **Spec bullets → tasks:** train arrangement and parallel return valves (T1, T2); unsupported capacity/pool/timing replaced or quantified (T1 derivation, T7 capacity sensitivity); steam supply / condensate / tube inventory / pressure difference / pool coupling (T2 equations, T3 vessel ports); noncondensable sensitivity (T5); auto initiation, manual, reset/latch, available trains, loss of normal heat rejection (T4, T6); 1/2/3 trains, inadvertent, valve failure, hot and low pools, depletion (T4, T7); 72 h and 7 d with stated conditions (T8); lower temperature limit and unimplemented shutdown cooling boundary (T1 doc, T8 assertions).
+- [x] **No placeholders:** the only `<...>` cells are the derived pool mass, the source checksums and the before/after table, each produced by a command in the same step.
+- [x] **Names match master r2:** `IcTrain::step(dt, p_vessel, w_steam_available)`, seven-field `IcStep`, `tube_energy`, `VesselInputs`/`BoundaryFlows` IC ports, derived `q_ic`, `faults: Vec<Fault>` via `find_fault` with `train*N_IC_RETURN_VALVES + valve`, `Sim::domain_error`, `Case.dt_after_s` + `operator`, trace columns `ic_heat_w_i`/`ic_pool_kg_i`/`ic_return_pos_i`/`t_coolant_c` (no column-count change), `parameters.csv` 13 columns with `id`, results under `docs/validation/results/`. Additions beyond the master are in the table at the top; the executor appends them to the master's P7 section in the Task 2 commit.
+- [x] **Derives rule:** `IcStep` `Clone, Copy, Debug, Default`; `IcTrain` `Clone, Debug` + `impl Default`; `IcFaults` `Clone, Copy, Debug, Default`; `api::IcTrain` `Clone, Debug, Serialize, Deserialize` camelCase.
+- [x] **Every new constant has a `parameters.csv` row** (Task 1 Step 7; `register.rs` gates it).
+- [x] **Every Snapshot change has `types.ts` and `mock.ts` steps** and keeps `npm --prefix ui run typecheck` green (Task 9).
+- [x] **Every defect fix has a failing test first:** no-steam lag (T2 `no_steam_limits_heat_to_tube_water_energy_without_lag`), pool overshoot/depletion (T2), allocation (T3 `ic_request_is_rescaled_to_applied_when_the_vessel_runs_dry`), trace population (T8 `pool_total` reads the per-train columns), contract (T9).
+- [x] **Every consumer of a transfer uses the applied value:** trains rescaled at step 9 before the energy balance, ledger, trace sample and snapshot read them (T3 Step 4, asserted in `ic_energy_identity_holds_at_plant_level` and the allocation test).

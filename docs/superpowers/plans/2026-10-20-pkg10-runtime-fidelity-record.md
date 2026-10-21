@@ -1,14 +1,14 @@
-# Package 10: Unify Runtime Behavior and Publish the Fidelity Record — Implementation Plan
+# Package 10: Unify Runtime Behavior and Publish the Fidelity Record — Implementation Plan (r2)
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. The master plan `docs/superpowers/plans/2026-10-20-refinement-master.md` owns every shared name and signature; if this file and the master disagree, the master wins.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. The master plan `docs/superpowers/plans/2026-10-20-refinement-master.md` (r2) owns every shared name and signature; if this file and the master disagree, the master wins.
 
-**Goal:** Make the supported application path (Tauri + Rust engine) show exactly the engine's behaviour with honest time accounting, step-level extrema, a compiler-checked UI contract, an unmistakable browser-mock label, and a published fidelity record that matches the executable and its tests.
+**Goal:** Make the supported application path (Tauri + Rust engine) show exactly the engine's behaviour with honest time accounting in both the engine and the shell, step-level extrema on every emitted snapshot, a compiler-checked UI contract, an unmistakable browser-mock label, and a published fidelity record that matches the executable and its tests.
 
-**Architecture:** `Sim::advance` keeps a bounded backlog instead of zeroing it, reports effective speed and dropped time, and tracks per-step extrema that ride along with each snapshot. A Rust integration test generates `ui/src/sim/contract.generated.ts` so `tsc` fails when `api.rs` and `types.ts` diverge. The trend buffer keeps every snapshot and draws the extrema envelope. `docs/validation/results.md` is generated from the validation runner's `--report` output plus the model docs from Packages 4 through 9.
+**Architecture:** `Sim::advance` keeps a bounded backlog instead of zeroing it and reports effective speed and dropped time; the Tauri shell stops clamping wall-clock time so the engine's backlog rule is the only time policy. `Sim` tracks per-step `Extrema` that are seeded from current values (never zeros) and consumed only by `snapshot_with_extrema`. A Rust integration test generates `ui/src/sim/contract.generated.ts` (scenario fixtures, synthesized enum/nullable fixtures, a reverse key check) and a Rust unit-suffix test enforces field naming, so `tsc` and `cargo test` fail when `api.rs` and `types.ts` diverge. The trend buffer keeps every snapshot and draws the extrema envelope. `docs/validation/results.md` is generated from the validation runner's `--report` output (validation and conservation tables) plus the model docs from Packages 4–9.
 
 **Tech Stack:** Rust 2021, serde/serde_json (dev-dependency, available to tests and examples), Tauri 2.12, TypeScript 5.6 with `strict`, `noUnusedLocals`, `resolveJsonModule` (already on), React 18, Vite 5. No new dependencies.
 
-**Spec package:** "Package 10: Unify runtime behavior and publish the fidelity record" in `docs/superpowers/plans/2026-10-20-existing-systems-refinement.md`. **Assumes Packages 1–9 are complete and committed**: `Sim` already has `ledger`, `log`, `faults`, `domain_errors`, `sensors`, `balance`; `Snapshot` already has every field listed in the master "API contract additions summary" for P3–P8; `examples/validation.rs`, `standard_cases()`, `Trace::metrics()`, `compare()`, `Tolerance`, `docs/validation/cases.csv`, `docs/validation/baseline/*.csv`, and `.github/workflows/validate.yml` exist.
+**Spec package:** "Package 10: Unify runtime behavior and publish the fidelity record" in `docs/superpowers/plans/2026-10-20-existing-systems-refinement.md`. **Assumes Packages 1–9 are complete and committed**: `Sim` already has `ledger` (with `integrated`), `log`, `faults: Vec<Fault>`, `domain_errors`, `sensors`, `balance`, and the constructor epilogue `Sim::finalize_init(&mut self)`; `Snapshot` already has every field in the master "API contract additions summary" for P3–P8 (`unsupported`, `vessel.regime`, `neutronics.cladTempC`, `fuelEnvelopeExceeded`, `rods.motion`, sensor fields, P6/P7 fields); `examples/validation.rs`, `standard_cases()`, `run_case`, `Trace::from_csv(&str)`, `Trace::metrics()`, `compare()`, `Tolerance::{numerical, physical, source_comparison}`, trace schema v2 with `*_max_int` / `*_min_int` columns, `docs/validation/cases.csv` with the locked header `id,scenario,duration_s,purpose,reference,tolerance_class,role,status`, `docs/validation/baseline/*.csv`, and `.github/workflows/validate.yml` exist.
 
 ## Global Constraints
 
@@ -19,33 +19,39 @@ Inherited verbatim from the master plan; repeated here because the task implemen
 - "No claim of exact design reproduction, regulatory approval, or validation against unavailable plant data is made."
 - No new Rust or npm dependencies without asking Jim first. Hand-roll CSV/JSON/TS emission with `std`, `serde_json`.
 - Commands: `cargo test --release -p bwr-core`, `npm --prefix ui ci`, `npm --prefix ui run typecheck`, `npm --prefix ui run build`, `cargo run --release -p bwr-core --example validation`.
+- Every numeric constant added or changed gets a row in `docs/model/parameters.csv` (header `id,value,unit,definition,reference_state,source_design,status,source_ids,interval_lo,interval_hi,assumption_id,location,notes`) with a status of `confirmed`, `derived`, `calibrated`, `esbwr-estimate`, `assumed`, or `unavailable`.
+- Derives rule: every new struct or enum stored inside `Sim` derives at least `Clone, Debug`; anything placed in `api.rs` also derives `Serialize, Deserialize` with `#[serde(rename_all = "camelCase")]`.
+- Every consumer of a transfer uses the applied (post-allocation) value. (P10 adds no consumers; the conservation report reads the ledger, which records applied flows.)
 - Commit after every task. Commit messages end with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
 - 2-space indentation in TypeScript; match surrounding Rust style by hand (do not run `cargo fmt` if the component is not installed).
 - Jim does not test locally for deployed builds: the final task commits **and pushes**.
-- After touching UI layout (Tasks 1, 4, 6), run the `frontend-design-audit` skill (`/fda:quick`) before calling the package done (CLAUDE.md).
+- After touching UI layout (Tasks 1, 5, 7), run the `frontend-design-audit` skill (`/fda:quick`) before calling the package done (CLAUDE.md).
 
 **Acceptance gate (verbatim from the spec):** "Users see the same authoritative engine behavior in the supported application path. The fidelity record matches the executable and its tests."
 
-**Baseline defects this package fixes (master list items 9 and 10):**
+**Baseline defects this package fixes (master r2 items 9, 10, 11):**
 
 9. `sim.rs` `advance()`: when `n >= 4000` the accumulator is zeroed and simulation time is silently lost.
 10. `history.ts`: 1 s sampling of 10 Hz snapshots, and 10 Hz snapshots of 20 Hz physics, can hide sub-second excursions.
+11. `src-tauri/src/lib.rs`: `let dt = (now - last).as_secs_f64().min(0.5)` discards wall-clock time whenever the thread stalls more than 0.5 s (sleep, lock contention); a second silent time-loss path independent of defect 9.
 
 ## Names this package introduces beyond the master contract
 
 | Name | Where | Meaning |
 |---|---|---|
-| `MAX_STEPS_PER_ADVANCE: usize = 4000` | `sim.rs` | hard cap on physics steps per `advance` call (was a literal) |
-| `MAX_BACKLOG_S: f64 = 60.0` | `sim.rs` | sim-seconds of requested-but-not-yet-run time kept; excess is counted in `dropped_sim_time_s` |
 | `Sim::backlog_s(&self) -> f64` | `sim.rs` | read access to the private accumulator |
-| `Sim::advance_with(&mut self, real_dt: f64, cmds: Vec<Command>)` | `sim.rs` | applies commands, then `advance` |
-| `Sim::snapshot_with_extrema(&mut self) -> Snapshot` | `sim.rs` | snapshot carrying `take_extrema()`; resets the window |
-| `Extrema::seed(...)`, `Extrema::include(...)` | `api.rs` | window reset and per-step update |
+| private `overload_logged: bool` | `sim.rs` | one log line per overload episode |
+| `Extrema::update(&mut self, current: &Extrema)` | `api.rs` | per-step fold (step-order item 16 names it `extrema.update`) |
+| `Sim::extrema_now(&self) -> Extrema` | `sim.rs` | current values packed as an `Extrema` with `steps = 0`; the argument to `Extrema::seed` |
+| `SHELL_WALL_DT_CLAMP_S` | `parameters.csv` only | the removed `0.5` s shell clamp, recorded for traceability |
+| `RodMotion::label(&self) -> &'static str` | `reactor.rs` | the five contract strings; P8's `snapshot()` should already use it, else add it here |
 | `TrendSample.powerPctMax/pressureMpaMax/levelNrCmMin/levelNrCmMax` | `history.ts` | folded extrema |
 | `Series.envelope?: { lo; hi }` | `StripChart.tsx` | translucent band between two sample accessors |
+| `UNIT_SUFFIXES`, `DIMENSIONLESS` | `tests/contract.rs` | unit-suffix rule and its explicit allowlist |
+| `export const _exhaustive` | `contract.generated.ts` | exported so `noUnusedLocals` accepts it |
 | `examples/record_snapshots.rs` | engine | writes `ui/src/sim/recorded/fullPower.json` |
 | `?replay=1` | `mock.ts` | browser mock replays recorded Rust snapshots |
-| `--report` | `examples/validation.rs` | prints Markdown tables for `results.md` |
+| `--report` | `examples/validation.rs` | prints the validation and conservation Markdown tables for `results.md` |
 | `.demo-banner`, `.speed-eff`, `.speed-eff.slow`, `.dropped-chip` | `styles.css` | UI classes |
 
 ---
@@ -53,14 +59,16 @@ Inherited verbatim from the master plan; repeated here because the task implemen
 ## File structure
 
 ```
-crates/bwr-core/src/api.rs            Extrema (+ seed/include), Snapshot.effective_speed, .dropped_sim_time_s, .extrema
+crates/bwr-core/src/api.rs            Extrema (+ seed/update), Snapshot.effective_speed, .dropped_sim_time_s, .extrema
 crates/bwr-core/src/sim.rs            MAX_STEPS_PER_ADVANCE, MAX_BACKLOG_S, advance, advance_with, backlog_s,
-                                      effective_speed, dropped_sim_time_s, extrema, take_extrema, snapshot_with_extrema
-crates/bwr-core/tests/runtime.rs      time accounting, boundaries, pause, reset, extrema tests
-crates/bwr-core/tests/contract.rs     generates ui/src/sim/contract.generated.ts
+                                      effective_speed, dropped_sim_time_s, extrema, extrema_now, snapshot_with_extrema,
+                                      finalize_init extension
+crates/bwr-core/src/reactor.rs        RodMotion::label (only if P8 did not add it)
+crates/bwr-core/tests/runtime.rs      time accounting, shell clamp, boundaries, pause, reset, extrema tests
+crates/bwr-core/tests/contract.rs     generates ui/src/sim/contract.generated.ts; unit-suffix test
 crates/bwr-core/examples/record_snapshots.rs
 crates/bwr-core/examples/validation.rs  --report
-src-tauri/src/lib.rs                  snapshot_with_extrema, boundary comment
+src-tauri/src/lib.rs                  clamp removed, snapshot_with_extrema, boundary comment
 ui/src/sim/types.ts                   mirror of api.rs additions
 ui/src/sim/mock.ts                    relabel header, mirror fields, replay mode
 ui/src/sim/bridge.ts                  initial snapshot via sim_snapshot
@@ -68,10 +76,11 @@ ui/src/sim/history.ts                 no decimation, extrema folded in
 ui/src/sim/contract.generated.ts      generated
 ui/src/sim/recorded/fullPower.json    generated
 ui/src/components/StripChart.tsx      envelope band
-ui/src/components/TrendPanel.tsx      envelopes on pressure and level
+ui/src/components/TrendPanel.tsx      envelopes on thermal power, pressure, level
 ui/src/components/TopBar.tsx          effective speed, dropped chip, demo banner
 ui/src/styles.css                     new classes
 .github/workflows/validate.yml        contract freshness check
+docs/model/parameters.csv             three runtime rows
 docs/validation/results.md            fidelity record
 README.md                             Status / Data sources rewrite
 ```
@@ -81,21 +90,22 @@ README.md                             Status / Data sources rewrite
 ### Task 1: Honest time accounting in `Sim::advance`
 
 **Files:**
-- Modify: `crates/bwr-core/src/sim.rs` (struct fields, `base`, `advance`, `apply` for `SetSpeed`/`LoadScenario`, `snapshot`)
+- Modify: `crates/bwr-core/src/sim.rs` (constants, struct fields, `base`, `finalize_init`, `advance`, `advance_with`, `backlog_s`, `apply` for `SetSpeed`, `snapshot`)
 - Modify: `crates/bwr-core/src/api.rs` (`Snapshot` fields)
+- Modify: `docs/model/parameters.csv`
 - Modify: `ui/src/sim/types.ts`, `ui/src/sim/mock.ts` (`blankSnapshot`), `ui/src/components/TopBar.tsx`, `ui/src/styles.css`
 - Test: `crates/bwr-core/tests/runtime.rs` (new)
 
 **Interfaces:**
-- Consumes: `Sim::step(dt)`, `DT`, `Sim.log: Vec<(f64, String)>` (P2), `Sim::event(id, text)`.
-- Produces: `pub const MAX_STEPS_PER_ADVANCE: usize`, `pub const MAX_BACKLOG_S: f64`, `Sim.effective_speed: f64`, `Sim.dropped_sim_time_s: f64`, `Sim::backlog_s(&self) -> f64`, `Snapshot.effective_speed`, `Snapshot.dropped_sim_time_s`.
+- Consumes: `Sim::step(dt)`, `DT`, `Sim.log: Vec<(f64, String)>` (P2), `Sim::event(id, text)`, `Sim::finalize_init(&mut self)` (P2).
+- Produces: `pub const MAX_STEPS_PER_ADVANCE: usize = 4000`, `pub const MAX_BACKLOG_S: f64 = 60.0`, `Sim.effective_speed: f64`, `Sim.dropped_sim_time_s: f64`, `Sim::backlog_s(&self) -> f64`, `Sim::advance_with(&mut self, real_dt: f64, cmds: Vec<Command>)`, `Snapshot.effective_speed`, `Snapshot.dropped_sim_time_s`.
 
 - [ ] **Step 1: Write the failing tests**
 
 Create `crates/bwr-core/tests/runtime.rs`:
 
 ```rust
-//! Runtime behaviour: time accounting, command boundaries, reset, extrema.
+//! Runtime behaviour: time accounting, shell clamp, command boundaries, reset, extrema.
 
 use bwr_core::api::{Command, ScenarioName};
 use bwr_core::sim::{DT, MAX_BACKLOG_S, MAX_STEPS_PER_ADVANCE};
@@ -125,16 +135,16 @@ fn advance_never_loses_time_silently() {
 fn backlog_drains_without_dropping() {
     let mut sim = Sim::new(ScenarioName::ColdShutdown);
     sim.apply(Command::SetSpeed { speed: 100.0 });
-    // 3 s of wall at 100x = 300 s requested; one call runs 200 s, keeps 100 s? No: backlog cap is 60 s.
-    // Use 2.5 s: 250 s requested -> 200 s run, 50 s backlog, nothing dropped.
+    // 2.5 s of wall at 100x = 250 s requested -> 200 s run, 50 s backlog, nothing dropped.
     sim.advance(2.5);
-    assert!((sim.backlog_s() - 50.0).abs() < 1e-6);
+    assert!((sim.backlog_s() - 50.0).abs() < 1e-6, "backlog {}", sim.backlog_s());
     assert_eq!(sim.dropped_sim_time_s, 0.0);
     // A quiet call drains the backlog.
     sim.advance(0.0);
     assert!(sim.backlog_s() < DT);
     assert!((sim.time - 250.0).abs() < 1e-6);
     assert_eq!(sim.dropped_sim_time_s, 0.0);
+    assert!(!sim.log.iter().any(|(_, m)| m.starts_with("Simulation overloaded")));
 }
 
 #[test]
@@ -153,7 +163,7 @@ fn effective_speed_tracks_real_throughput() {
 Run: `cargo test --release -p bwr-core --test runtime`
 Expected: compile error `cannot find value MAX_BACKLOG_S in module bwr_core::sim` / `no method named backlog_s` / `no field dropped_sim_time_s`.
 
-- [ ] **Step 3: Implement the fields and `advance`**
+- [ ] **Step 3: Implement the constants, fields and `advance`**
 
 In `crates/bwr-core/src/sim.rs`, replace `pub const DT: f64 = 0.05;` with:
 
@@ -161,9 +171,11 @@ In `crates/bwr-core/src/sim.rs`, replace `pub const DT: f64 = 0.05;` with:
 /// Fixed physics time step, s.
 pub const DT: f64 = 0.05;
 /// Hard cap on physics steps per `advance` call so one wall-clock tick never stalls the shell.
+/// parameters.csv: MAX_STEPS_PER_ADVANCE (assumed, numerical).
 pub const MAX_STEPS_PER_ADVANCE: usize = 4000;
 /// Requested-but-not-yet-simulated time kept between calls, s. Beyond this the
 /// excess is counted in `dropped_sim_time_s` and reported, never silently discarded.
+/// parameters.csv: MAX_BACKLOG_S (assumed, numerical).
 pub const MAX_BACKLOG_S: f64 = 60.0;
 ```
 
@@ -179,6 +191,14 @@ Add to `pub struct Sim` (after `accumulator: f64,`):
 ```
 
 In `Sim::base`, after `accumulator: 0.0,` add `effective_speed: 1.0, dropped_sim_time_s: 0.0, overload_logged: false,`.
+
+In `Sim::finalize_init` (the P2 constructor epilogue), add after the line that resets `accumulator`:
+
+```rust
+        self.dropped_sim_time_s = 0.0;
+        self.overload_logged = false;
+        self.effective_speed = self.speed;
+```
 
 Replace the whole `pub fn advance(&mut self, real_dt: f64)` with:
 
@@ -200,7 +220,8 @@ Replace the whole `pub fn advance(&mut self, real_dt: f64)` with:
     ///
     /// Runs at most `MAX_STEPS_PER_ADVANCE` steps. Whatever is left stays in the
     /// backlog up to `MAX_BACKLOG_S`; anything beyond that is added to
-    /// `dropped_sim_time_s` and logged once per overload episode.
+    /// `dropped_sim_time_s` and logged once per overload episode. The shell passes
+    /// the true elapsed wall time (no clamp): this is the only time policy.
     pub fn advance(&mut self, real_dt: f64) {
         if self.paused {
             return;
@@ -236,7 +257,7 @@ Replace the whole `pub fn advance(&mut self, real_dt: f64)` with:
     }
 ```
 
-In `apply`, change the two speed-related arms:
+In `apply`, change the `SetSpeed` arm (leave `LoadScenario` as it is: it goes through the constructor and `finalize_init`, which now sets `effective_speed = speed`; but the constructor runs before `speed` is copied back, so set it after):
 
 ```rust
             Command::SetSpeed { speed } => {
@@ -269,9 +290,18 @@ Run: `cargo test --release -p bwr-core --test runtime`
 Expected: `test result: ok. 3 passed`.
 
 Run: `cargo test --release -p bwr-core`
-Expected: all tests pass (the `json_contract_matches_ui` test in `tests/plant.rs` still passes; it checks presence of keys only).
+Expected: all tests pass.
 
-- [ ] **Step 5: Mirror in the UI**
+- [ ] **Step 5: Register the constants**
+
+Append to `docs/model/parameters.csv` (no commas inside fields):
+
+```
+MAX_STEPS_PER_ADVANCE,4000,steps,Maximum physics steps run by one Sim::advance call,n/a,n/a,assumed,,1000,20000,,crates/bwr-core/src/sim.rs,Runtime bound on shell latency; numerical not physical
+MAX_BACKLOG_S,60,s,Requested simulation time retained between advance calls before the excess is counted as dropped,n/a,n/a,assumed,,10,600,,crates/bwr-core/src/sim.rs,Excess is reported in dropped_sim_time_s and logged; never silent
+```
+
+- [ ] **Step 6: Mirror in the UI**
 
 `ui/src/sim/types.ts`, in `interface Snapshot` after `speed: number;`:
 
@@ -338,15 +368,15 @@ Expected: all tests pass (the `json_contract_matches_ui` test in `tests/plant.rs
 }
 ```
 
-- [ ] **Step 6: Typecheck and build the UI**
+- [ ] **Step 7: Typecheck and build the UI**
 
 Run: `npm --prefix ui run typecheck && npm --prefix ui run build`
 Expected: no errors; `vite build` reports `✓ built`.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add crates/bwr-core/src/sim.rs crates/bwr-core/src/api.rs crates/bwr-core/tests/runtime.rs ui/src/sim/types.ts ui/src/sim/mock.ts ui/src/components/TopBar.tsx ui/src/styles.css
+git add crates/bwr-core/src/sim.rs crates/bwr-core/src/api.rs crates/bwr-core/tests/runtime.rs docs/model/parameters.csv ui/src/sim/types.ts ui/src/sim/mock.ts ui/src/components/TopBar.tsx ui/src/styles.css
 git commit -m "fix(runtime): keep a bounded backlog in Sim::advance and report effective speed and dropped time
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -354,19 +384,111 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 2: Command boundaries, pause, scenario reset, and initial snapshot delivery
+### Task 2: Remove the shell's 0.5 s wall-clock clamp (defect 11)
 
 **Files:**
-- Modify: `crates/bwr-core/src/sim.rs` (`full_power` clears runtime state; doc comment on `apply`)
+- Modify: `src-tauri/src/lib.rs`
+- Modify: `docs/model/parameters.csv`
+- Test: `crates/bwr-core/tests/runtime.rs`
+
+**Interfaces:**
+- Consumes: `Sim::advance` backlog rule (Task 1).
+- Produces: the shell passes true elapsed wall time; `parameters.csv` row `SHELL_WALL_DT_CLAMP_S` recording the removed constant.
+
+- [ ] **Step 1: Write the demonstration test**
+
+The shell loop cannot be unit-tested without a Tauri runtime, so the test reproduces the shell's old policy against the engine and shows the loss. Append to `crates/bwr-core/tests/runtime.rs`:
+
+```rust
+#[test]
+fn shell_stall_is_accounted_not_clamped() {
+    // Old src-tauri/src/lib.rs policy: dt = elapsed.min(0.5). A 2 s stall (sleep,
+    // lock contention) handed the engine 0.5 s and nobody ever heard of the other 1.5 s.
+    let stall_s = 2.0;
+    let mut clamped = Sim::new(ScenarioName::ColdShutdown);
+    clamped.advance(stall_s.min(0.5));
+    let lost = stall_s - (clamped.time + clamped.backlog_s() + clamped.dropped_sim_time_s);
+    assert!((lost - 1.5).abs() < 1e-9, "the clamp loses {lost} s with no record");
+
+    // New policy: the shell passes the true elapsed time; the engine's backlog rule accounts for all of it.
+    let mut honest = Sim::new(ScenarioName::ColdShutdown);
+    honest.advance(stall_s);
+    let accounted = honest.time + honest.backlog_s() + honest.dropped_sim_time_s;
+    assert!((accounted - stall_s).abs() < 1e-9, "accounted {accounted}");
+    assert!((honest.time - stall_s).abs() < 1e-9, "2 s at 1x is 40 steps, well under the cap");
+
+    // A pathological stall (laptop asleep for an hour at 30x) is bounded and reported, not lost.
+    let mut asleep = Sim::new(ScenarioName::ColdShutdown);
+    asleep.apply(Command::SetSpeed { speed: 30.0 });
+    asleep.advance(3600.0);
+    let requested = 3600.0 * 30.0;
+    let accounted = asleep.time + asleep.backlog_s() + asleep.dropped_sim_time_s;
+    assert!((accounted - requested).abs() < 1e-3);
+    assert!(asleep.dropped_sim_time_s > 0.0);
+    assert!(asleep.log.iter().any(|(_, m)| m.starts_with("Simulation overloaded")));
+}
+```
+
+- [ ] **Step 2: Run it**
+
+Run: `cargo test --release -p bwr-core --test runtime shell_stall_is_accounted_not_clamped`
+Expected: PASS (the engine side is already honest after Task 1; this test pins the demonstration). The defect lives in the shell, fixed next.
+
+- [ ] **Step 3: Remove the clamp from the shell**
+
+In `src-tauri/src/lib.rs`, in the worker loop replace
+
+```rust
+                    let dt = (now - last).as_secs_f64().min(0.5);
+```
+
+with
+
+```rust
+                    // True elapsed wall time, unclamped (defect 11). The engine's backlog rule in
+                    // Sim::advance (MAX_BACKLOG_S, dropped_sim_time_s) is the only time policy; a
+                    // long stall shows up as a DROPPED chip in the UI instead of vanishing here.
+                    let dt = (now - last).as_secs_f64();
+```
+
+Run: `grep -n "min(0.5)" src-tauri/src/lib.rs`
+Expected: no output.
+
+Run: `cargo check -p bwrx300-sim`
+Expected: no errors.
+
+- [ ] **Step 4: Register the removed constant**
+
+Append to `docs/model/parameters.csv`:
+
+```
+SHELL_WALL_DT_CLAMP_S,0.5,s,Former cap on wall-clock elapsed time passed from the Tauri shell to Sim::advance,n/a,n/a,assumed,,,,,src-tauri/src/lib.rs (removed in Package 10),Defect 11: discarded elapsed time silently; removed; MAX_BACKLOG_S applies instead
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src-tauri/src/lib.rs docs/model/parameters.csv crates/bwr-core/tests/runtime.rs
+git commit -m "fix(shell): pass true elapsed wall time to Sim::advance instead of clamping to 0.5 s (defect 11)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 3: Command boundaries, pause, scenario reset, and initial snapshot delivery
+
+**Files:**
+- Modify: `crates/bwr-core/src/sim.rs` (doc comment on `apply`)
 - Modify: `src-tauri/src/lib.rs` (boundary comment)
 - Modify: `ui/src/sim/bridge.ts`
 - Test: `crates/bwr-core/tests/runtime.rs`
 
 **Interfaces:**
-- Consumes: `Sim::advance_with` (Task 1), `Sim.faults` + `Sim::set_fault` (P2), `Sim.ledger` (P2), `Sim.log` (P2), `Sim.domain_errors` (P3), `Fault::BypassUnavailable` (P2/P6), `ROD_FULL_OUT`, `SCRAM_TIME`.
-- Produces: guarantee that `apply` only runs between steps; `LoadScenario` resets every runtime accumulator; UI receives a snapshot immediately on subscribe.
+- Consumes: `Sim::advance_with` (Task 1), `Sim.faults: Vec<Fault>` + `Sim::set_fault` (P2), `Sim.ledger` (P2), `Sim.log` (P2), `Sim.domain_errors` (P3), `Fault::BypassUnavailable` (P2/P6), `ROD_FULL_OUT`, `SCRAM_TIME`, `Sim::finalize_init` (P2).
+- Produces: guarantee that `apply` only runs between steps; `LoadScenario` resets every runtime accumulator and clears `faults`; UI receives a snapshot immediately on subscribe.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Write the tests**
 
 Append to `crates/bwr-core/tests/runtime.rs`:
 
@@ -378,8 +500,8 @@ use bwr_core::params::{ROD_FULL_OUT, SCRAM_TIME};
 fn commands_apply_at_step_boundaries() {
     let mut sim = Sim::new(ScenarioName::FullPower);
     let before = sim.core.rods.pos.clone();
-    // One wall-second at 1x with exactly one command: the scram is applied before
-    // the single step, so every rod has moved exactly one step of hydraulic travel.
+    // Exactly one step with exactly one command: the scram is applied before the
+    // step, so every rod has moved exactly one step of hydraulic travel.
     sim.advance_with(DT, vec![Command::ManualScram]);
     assert!(sim.scrammed);
     assert!((sim.time - DT).abs() < 1e-9);
@@ -406,6 +528,7 @@ fn paused_advance_accumulates_nothing() {
 fn load_scenario_resets_runtime_state_but_keeps_speed() {
     let mut sim = Sim::new(ScenarioName::FullPower);
     sim.set_fault(Fault::BypassUnavailable, true);
+    assert_eq!(sim.faults.len(), 1);
     sim.apply(Command::SetSpeed { speed: 100.0 });
     sim.advance(1000.0);
     assert!(sim.dropped_sim_time_s > 0.0);
@@ -414,73 +537,61 @@ fn load_scenario_resets_runtime_state_but_keeps_speed() {
 
     sim.apply(Command::LoadScenario { name: ScenarioName::HotStandby });
     assert_eq!(sim.time, 0.0);
-    assert!(sim.faults.is_empty(), "faults are test/instructor state and clear on load");
+    assert!(sim.faults.is_empty(), "faults are test/instructor state and clear on load (master: LoadScenario clears faults)");
     assert_eq!(sim.dropped_sim_time_s, 0.0);
     assert_eq!(sim.backlog_s(), 0.0);
     assert!(sim.log.is_empty(), "log: {:?}", sim.log);
-    assert!(sim.domain_errors.is_empty());
+    assert!(sim.domain_errors.is_empty(), "hot standby is a valid initial condition");
     assert_eq!(sim.ledger.mass_in_kg, 0.0);
     assert_eq!(sim.ledger.mass_out_kg, 0.0);
     assert_eq!(sim.speed, 100.0);
     assert_eq!(sim.effective_speed, 100.0);
+    assert_eq!(sim.extrema.steps, 0);
 }
 
 #[test]
-fn full_power_initialisation_leaves_no_runtime_residue() {
-    // full_power() settles for 12 minutes internally; that settling must not leak
-    // into the log, ledger or extrema that the user sees at t = 0.
-    let sim = Sim::new(ScenarioName::FullPower);
-    assert_eq!(sim.time, 0.0);
-    assert!(sim.log.is_empty(), "log: {:?}", sim.log);
-    assert_eq!(sim.ledger.mass_in_kg, 0.0);
-    assert_eq!(sim.backlog_s(), 0.0);
+fn constructors_leave_no_runtime_residue() {
+    // full_power() settles for 12 minutes internally; finalize_init must hide that
+    // from the log, ledger, backlog, dropped time and extrema the user sees at t = 0.
+    for name in [ScenarioName::ColdShutdown, ScenarioName::HotStandby, ScenarioName::FullPower] {
+        let sim = Sim::new(name);
+        assert_eq!(sim.time, 0.0);
+        assert!(sim.log.is_empty(), "{name:?} log: {:?}", sim.log);
+        assert_eq!(sim.ledger.mass_in_kg, 0.0, "{name:?}");
+        assert_eq!(sim.backlog_s(), 0.0, "{name:?}");
+        assert_eq!(sim.dropped_sim_time_s, 0.0, "{name:?}");
+        assert_eq!(sim.extrema.steps, 0, "{name:?}");
+    }
 }
 ```
 
-- [ ] **Step 2: Run to verify which fail**
+- [ ] **Step 2: Run them**
 
 Run: `cargo test --release -p bwr-core --test runtime`
-Expected: `commands_apply_at_step_boundaries` and `paused_advance_accumulates_nothing` pass (behaviour already holds); `load_scenario_resets_runtime_state_but_keeps_speed` and/or `full_power_initialisation_leaves_no_runtime_residue` FAIL if `full_power()` or `Sim::new` leaves `log`/`ledger` populated from the internal settle. If both pass, P2/P3 already clear them: go to Step 4.
+Expected: `commands_apply_at_step_boundaries`, `paused_advance_accumulates_nothing` pass. `load_scenario_resets_runtime_state_but_keeps_speed` and `constructors_leave_no_runtime_residue` fail only on the `extrema.steps` assertion (compile error `no field extrema` until Task 4). If they fail on `log`, `ledger`, `backlog_s` or `dropped_sim_time_s`, `finalize_init` from P2 is incomplete: fix it there (it must set `time = 0.0`, re-base `ledger`, clear `log`, `events`, `acked`, `accumulator`, `dropped_sim_time_s`) rather than patching constructors. Leave the two `extrema` assertions in place; Task 4 makes them compile and pass.
 
-- [ ] **Step 3: Clear runtime residue at the end of `full_power()`**
+- [ ] **Step 3: Document the boundary guarantee**
 
-In `crates/bwr-core/src/sim.rs` `full_power()`, replace
-
-```rust
-        s.time = 0.0;
-        s.acked.clear();
-        s.events.clear();
-        s
-```
-
-with
-
-```rust
-        s.time = 0.0;
-        s.acked.clear();
-        s.events.clear();
-        s.log.clear();
-        s.ledger = crate::ledger::Ledger::new(s.vessel.mass, s.vessel.energy);
-        s.domain_errors.clear();
-        s.accumulator = 0.0;
-        s
-```
-
-Add this doc comment above `pub fn apply(&mut self, cmd: Command)`:
+Add this doc comment above `pub fn apply(&mut self, cmd: Command)` in `sim.rs`:
 
 ```rust
     /// Apply one operator command. Commands are only ever applied between physics
     /// steps: the desktop shell holds the simulator mutex for the whole `advance`
     /// call, and `advance_with` applies its batch before stepping. A command can
-    /// therefore never observe or alter a half-stepped plant.
+    /// therefore never observe or alter a half-stepped plant. `LoadScenario`
+    /// rebuilds the plant through the scenario constructor and `finalize_init`,
+    /// which clears faults, log, ledger, domain errors raised after construction,
+    /// backlog, dropped time and the extrema window; `speed` and `paused` survive.
 ```
 
-- [ ] **Step 4: Run the tests**
+In `src-tauri/src/lib.rs`, above `fn sim_command`, add:
 
-Run: `cargo test --release -p bwr-core --test runtime`
-Expected: `test result: ok. 7 passed`.
+```rust
+/// Commands lock the same mutex the physics thread holds for a whole `advance`
+/// call, so they are applied strictly between physics steps.
+```
 
-- [ ] **Step 5: Deliver the initial snapshot immediately in the bridge**
+- [ ] **Step 4: Deliver the initial snapshot immediately in the bridge**
 
 Replace `createTauriBackend` in `ui/src/sim/bridge.ts` with:
 
@@ -524,41 +635,36 @@ function createTauriBackend(): SimBackend {
 }
 ```
 
-In `src-tauri/src/lib.rs`, above `fn sim_command`, add:
-
-```rust
-/// Commands lock the same mutex the physics thread holds for a whole `advance`
-/// call, so they are applied strictly between physics steps.
-```
-
-- [ ] **Step 6: Typecheck**
+- [ ] **Step 5: Typecheck**
 
 Run: `npm --prefix ui run typecheck`
 Expected: no errors.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add crates/bwr-core/src/sim.rs crates/bwr-core/tests/runtime.rs src-tauri/src/lib.rs ui/src/sim/bridge.ts
-git commit -m "fix(runtime): reset runtime state on scenario load and deliver the initial snapshot on subscribe
+git commit -m "fix(runtime): document step-boundary command application and deliver the initial snapshot on subscribe
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
+(The runtime test binary does not compile until Task 4 adds `extrema`; commit anyway, Task 4 follows immediately. If the executor's process requires green at every commit, squash Tasks 3 and 4 into one commit.)
+
 ---
 
-### Task 3: Per-step extrema ride along with every snapshot
+### Task 4: Per-step extrema, seeded from current values, consumed only by `snapshot_with_extrema`
 
 **Files:**
 - Modify: `crates/bwr-core/src/api.rs` (`Extrema`, `Snapshot.extrema`)
-- Modify: `crates/bwr-core/src/sim.rs` (`extrema` field, `step`, `take_extrema`, `snapshot_with_extrema`, `snapshot`, `full_power`)
+- Modify: `crates/bwr-core/src/sim.rs` (`extrema` field, `extrema_now`, `step`, `finalize_init`, `snapshot_with_extrema`, `snapshot`)
 - Modify: `src-tauri/src/lib.rs` (emit `snapshot_with_extrema`)
 - Modify: `ui/src/sim/types.ts`, `ui/src/sim/mock.ts`
 - Test: `crates/bwr-core/tests/runtime.rs`
 
 **Interfaces:**
-- Consumes: `Sim::level_cm()` (sensed narrow-range level after P8), `self.vessel.eos.p`, `self.core.kin.n`.
-- Produces: `api::Extrema { power_frac_max, pressure_mpa_max, level_nr_cm_min, level_nr_cm_max, steps }`, `Extrema::seed(power_frac, pressure_mpa, level_nr_cm) -> Extrema`, `Extrema::include(&mut self, power_frac, pressure_mpa, level_nr_cm)`, `Sim.extrema: Extrema`, `Sim::take_extrema(&mut self) -> Extrema`, `Sim::snapshot_with_extrema(&mut self) -> Snapshot`, `Snapshot.extrema`.
+- Consumes: `self.core.kin.n`, `self.core.thermal_power()`, `self.vessel.eos.p`, `self.level_cm()` (sensed NR level, P8), `self.core.fuel_t`, `self.core.clad_t` (P5), `self.cond.pressure()`.
+- Produces (master r2): `api::Extrema { power_frac_max, thermal_mw_max, pressure_mpa_max, level_nr_cm_min, level_nr_cm_max, fuel_t_c_max, clad_t_c_max, cond_pressure_kpa_max, steps: u32 }`, `Extrema::seed(snapshot_values: &Extrema) -> Extrema`, `Extrema::update(&mut self, current: &Extrema)`, `Sim.extrema: Extrema`, `Sim::extrema_now(&self) -> Extrema`, `Sim::snapshot_with_extrema(&mut self) -> Snapshot` (the only consumer of the window), `Snapshot.extrema`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -566,27 +672,52 @@ Append to `crates/bwr-core/tests/runtime.rs`:
 
 ```rust
 #[test]
+fn extrema_are_seeded_from_current_values_never_zeros() {
+    let sim = Sim::new(ScenarioName::FullPower);
+    let ex = sim.extrema;
+    let snap = sim.snapshot();
+    assert_eq!(ex.steps, 0);
+    assert!((ex.pressure_mpa_max - snap.vessel.pressure_mpa).abs() < 1e-12);
+    assert!((ex.level_nr_cm_min - snap.vessel.level_nr_cm).abs() < 1e-12);
+    assert!((ex.level_nr_cm_max - snap.vessel.level_nr_cm).abs() < 1e-12);
+    assert!((ex.thermal_mw_max - snap.neutronics.thermal_power_mw).abs() < 1e-9);
+    assert!((ex.fuel_t_c_max - snap.neutronics.fuel_temp_c).abs() < 1e-9);
+    assert!((ex.clad_t_c_max - snap.neutronics.clad_temp_c).abs() < 1e-9);
+    assert!((ex.cond_pressure_kpa_max - snap.condenser.pressure_kpa).abs() < 1e-9);
+    assert!(ex.power_frac_max > 0.9, "seeded from the live value, not zero");
+    // snapshot() alone reports a zero-step window of current values and never consumes the real window.
+    assert_eq!(snap.extrema.steps, 0);
+}
+
+#[test]
 fn extrema_track_every_physics_step() {
     let mut sim = Sim::new(ScenarioName::FullPower);
-    let _ = sim.take_extrema();
+    let _ = sim.snapshot_with_extrema(); // start a fresh window
     let mut p_max = f64::MIN;
     let mut l_min = f64::MAX;
     let mut l_max = f64::MIN;
+    let mut q_max = f64::MIN;
+    let mut c_max = f64::MIN;
     for _ in 0..20 {
         sim.step(DT);
-        p_max = p_max.max(sim.vessel.eos.p / 1e6);
-        l_min = l_min.min(sim.level_cm_sensed());
-        l_max = l_max.max(sim.level_cm_sensed());
+        let s = sim.snapshot();
+        p_max = p_max.max(s.vessel.pressure_mpa);
+        l_min = l_min.min(s.vessel.level_nr_cm);
+        l_max = l_max.max(s.vessel.level_nr_cm);
+        q_max = q_max.max(s.neutronics.thermal_power_mw);
+        c_max = c_max.max(s.condenser.pressure_kpa);
     }
-    let ex = sim.take_extrema();
+    let ex = sim.snapshot_with_extrema().extrema;
     assert_eq!(ex.steps, 20);
     assert!((ex.pressure_mpa_max - p_max).abs() < 1e-12);
     assert!((ex.level_nr_cm_min - l_min).abs() < 1e-12);
     assert!((ex.level_nr_cm_max - l_max).abs() < 1e-12);
-    // The window resets: a second take has no steps and is seeded with the current state.
-    let ex2 = sim.take_extrema();
+    assert!((ex.thermal_mw_max - q_max).abs() < 1e-9);
+    assert!((ex.cond_pressure_kpa_max - c_max).abs() < 1e-9);
+    // The window was re-seeded: a second take has no steps and current values.
+    let ex2 = sim.snapshot_with_extrema().extrema;
     assert_eq!(ex2.steps, 0);
-    assert!((ex2.pressure_mpa_max - sim.vessel.eos.p / 1e6).abs() < 1e-12);
+    assert!((ex2.pressure_mpa_max - sim.snapshot().vessel.pressure_mpa).abs() < 1e-12);
 }
 
 #[test]
@@ -595,7 +726,7 @@ fn extrema_expose_excursions_between_snapshots() {
     // window drops power within the window; the snapshot at the end shows low
     // power, but the extrema must still show the pre-scram peak.
     let mut sim = Sim::new(ScenarioName::FullPower);
-    let _ = sim.take_extrema();
+    let _ = sim.snapshot_with_extrema();
     sim.apply(Command::ManualScram);
     for _ in 0..20 {
         sim.step(DT);
@@ -604,62 +735,55 @@ fn extrema_expose_excursions_between_snapshots() {
     assert!(snap.neutronics.power_frac < 0.9, "power after 1 s of scram {}", snap.neutronics.power_frac);
     assert!(snap.extrema.power_frac_max > 0.95, "peak {}", snap.extrema.power_frac_max);
     assert!(snap.extrema.power_frac_max >= snap.neutronics.power_frac);
+    assert!(snap.extrema.thermal_mw_max >= snap.neutronics.thermal_power_mw);
     assert_eq!(snap.extrema.steps, 20);
-    // snapshot() alone never resets the window.
-    let plain = sim.snapshot();
-    assert_eq!(plain.extrema.steps, 0);
 }
-```
-
-`Sim::level_cm_sensed()` is the public name for the narrow-range sensor reading that P8 made `level_cm()` return. If P8 left `level_cm` private, add in `sim.rs`:
-
-```rust
-    /// Narrow-range level as the protection system and displays see it, cm from NWL.
-    pub fn level_cm_sensed(&self) -> f64 {
-        self.level_cm()
-    }
 ```
 
 - [ ] **Step 2: Run to verify they fail**
 
 Run: `cargo test --release -p bwr-core --test runtime`
-Expected: compile error `no method named take_extrema found for struct Sim`.
+Expected: compile error `no field extrema on type Sim` / `no method named snapshot_with_extrema`.
 
 - [ ] **Step 3: Implement `Extrema` and the window**
 
 In `crates/bwr-core/src/api.rs`, before `pub struct Snapshot`:
 
 ```rust
-/// Per-step extrema since the last snapshot was taken, so a 10 Hz display cannot
+/// Per-step extrema since the previous emitted snapshot, so a 10 Hz display cannot
 /// hide a 20 Hz excursion. `steps` is how many physics steps the window covers.
+/// Seeded from the current values (never zeros) and consumed only by
+/// `Sim::snapshot_with_extrema`.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Extrema {
     pub power_frac_max: f64,
+    pub thermal_mw_max: f64,
     pub pressure_mpa_max: f64,
     pub level_nr_cm_min: f64,
     pub level_nr_cm_max: f64,
+    pub fuel_t_c_max: f64,
+    pub clad_t_c_max: f64,
+    pub cond_pressure_kpa_max: f64,
     pub steps: u32,
 }
 
 impl Extrema {
-    /// Start a window at the current state.
-    pub fn seed(power_frac: f64, pressure_mpa: f64, level_nr_cm: f64) -> Self {
-        Self {
-            power_frac_max: power_frac,
-            pressure_mpa_max: pressure_mpa,
-            level_nr_cm_min: level_nr_cm,
-            level_nr_cm_max: level_nr_cm,
-            steps: 0,
-        }
+    /// Start a window: copies the current values as both min and max, `steps = 0`.
+    pub fn seed(snapshot_values: &Extrema) -> Self {
+        Self { steps: 0, ..*snapshot_values }
     }
 
-    /// Fold one physics step into the window.
-    pub fn include(&mut self, power_frac: f64, pressure_mpa: f64, level_nr_cm: f64) {
-        self.power_frac_max = self.power_frac_max.max(power_frac);
-        self.pressure_mpa_max = self.pressure_mpa_max.max(pressure_mpa);
-        self.level_nr_cm_min = self.level_nr_cm_min.min(level_nr_cm);
-        self.level_nr_cm_max = self.level_nr_cm_max.max(level_nr_cm);
+    /// Fold one physics step (`current` carries the step's values in the max/min fields).
+    pub fn update(&mut self, current: &Extrema) {
+        self.power_frac_max = self.power_frac_max.max(current.power_frac_max);
+        self.thermal_mw_max = self.thermal_mw_max.max(current.thermal_mw_max);
+        self.pressure_mpa_max = self.pressure_mpa_max.max(current.pressure_mpa_max);
+        self.level_nr_cm_min = self.level_nr_cm_min.min(current.level_nr_cm_min);
+        self.level_nr_cm_max = self.level_nr_cm_max.max(current.level_nr_cm_max);
+        self.fuel_t_c_max = self.fuel_t_c_max.max(current.fuel_t_c_max);
+        self.clad_t_c_max = self.clad_t_c_max.max(current.clad_t_c_max);
+        self.cond_pressure_kpa_max = self.cond_pressure_kpa_max.max(current.cond_pressure_kpa_max);
         self.steps += 1;
     }
 }
@@ -672,46 +796,56 @@ In `Snapshot`, after `pub dropped_sim_time_s: f64,` add:
     pub extrema: Extrema,
 ```
 
-In `sim.rs`: import `Extrema` (`use crate::api::{self, Command, Extrema, ModeSwitch, ScenarioName, Severity, Snapshot};`), add `pub extrema: Extrema,` to `Sim` after `dropped_sim_time_s`, and in `Sim::base` add `extrema: Extrema::default(),` then, at the end of `base` just before `s`:
+In `sim.rs`: import `Extrema` (`use crate::api::{self, Command, Extrema, ModeSwitch, ScenarioName, Severity, Snapshot};`), add `pub extrema: Extrema,` to `Sim` after `dropped_sim_time_s`, and in `Sim::base` add `extrema: Extrema::default(),`. Add to `impl Sim`:
 
 ```rust
-        s.extrema = Extrema::seed(s.core.kin.n, s.vessel.eos.p / 1e6, s.level_cm());
-```
-
-At the end of `Sim::step`, after `self.protection();`, add:
-
-```rust
-        self.extrema.include(self.core.kin.n, self.vessel.eos.p / 1e6, self.level_cm());
-```
-
-In `full_power()`, in the block from Task 2 Step 3, add `s.extrema = Extrema::seed(s.core.kin.n, s.vessel.eos.p / 1e6, s.level_cm());` after `s.accumulator = 0.0;`.
-
-Add these methods to `impl Sim` next to `snapshot`:
-
-```rust
-    /// Return the extrema window and start a new one at the current state.
-    pub fn take_extrema(&mut self) -> Extrema {
-        let out = self.extrema;
-        self.extrema = Extrema::seed(self.core.kin.n, self.vessel.eos.p / 1e6, self.level_cm());
-        out
+    /// Current values packed as an `Extrema` (each min and max field holds the live
+    /// value, `steps = 0`): the argument to `Extrema::seed` and `Extrema::update`.
+    pub fn extrema_now(&self) -> Extrema {
+        let level = self.level_cm();
+        Extrema {
+            power_frac_max: self.core.kin.n,
+            thermal_mw_max: self.core.thermal_power() / 1e6,
+            pressure_mpa_max: self.vessel.eos.p / 1e6,
+            level_nr_cm_min: level,
+            level_nr_cm_max: level,
+            fuel_t_c_max: self.core.fuel_t,
+            clad_t_c_max: self.core.clad_t,
+            cond_pressure_kpa_max: self.cond.pressure() / 1e3,
+            steps: 0,
+        }
     }
 
     /// Snapshot for emission: carries the extrema since the last emitted snapshot
-    /// and resets the window. `snapshot()` alone never resets it.
+    /// and re-seeds the window. This is the ONLY consumer of the window;
+    /// `snapshot()` reports a zero-step window of current values.
     pub fn snapshot_with_extrema(&mut self) -> Snapshot {
-        let extrema = self.take_extrema();
+        let window = std::mem::replace(&mut self.extrema, Extrema::seed(&self.extrema_now()));
         let mut snap = self.snapshot();
-        snap.extrema = extrema;
+        snap.extrema = window;
         snap
     }
 ```
 
-In `snapshot()`, after `dropped_sim_time_s: ...,` add `extrema: self.extrema,`.
+In `Sim::finalize_init`, add (after the sensors initialisation so `level_cm()` reads a sensed value):
+
+```rust
+        self.extrema = Extrema::seed(&self.extrema_now());
+```
+
+In `Sim::step`, at step-order position 16 (right after `self.ledger.record(dt, &flows);` and before the domain-error drain):
+
+```rust
+        let now = self.extrema_now();
+        self.extrema.update(&now);
+```
+
+In `snapshot()`, after `dropped_sim_time_s: ...,` add `extrema: Extrema::seed(&self.extrema_now()),`.
 
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --release -p bwr-core --test runtime`
-Expected: `test result: ok. 9 passed`.
+Expected: `test result: ok. 11 passed` (3 from Task 1, 1 from Task 2, 4 from Task 3, 3 from this task).
 
 - [ ] **Step 5: Emit extrema from the desktop shell**
 
@@ -725,7 +859,7 @@ In `src-tauri/src/lib.rs`, change the emission inside the worker loop:
                         };
                         s.advance(dt);
                         if now - last_emit >= Duration::from_millis(100) {
-                            // Carries per-step extrema since the last emit and resets that window.
+                            // Carries per-step extrema since the last emit and re-seeds that window.
                             Some(s.snapshot_with_extrema())
                         } else {
                             None
@@ -733,7 +867,7 @@ In `src-tauri/src/lib.rs`, change the emission inside the worker loop:
                     };
 ```
 
-`sim_snapshot` keeps using `snapshot()` so a reconnect never resets the window.
+`sim_snapshot` keeps using `snapshot()` so a reconnect never consumes the window.
 
 - [ ] **Step 6: Mirror in the UI**
 
@@ -743,39 +877,61 @@ In `src-tauri/src/lib.rs`, change the emission inside the worker loop:
 /** Per-step extrema since the previous emitted snapshot (`steps` physics steps). */
 export interface Extrema {
   powerFracMax: number;
+  thermalMwMax: number;
   pressureMpaMax: number;
   levelNrCmMin: number;
   levelNrCmMax: number;
+  fuelTCMax: number;
+  cladTCMax: number;
+  condPressureKpaMax: number;
   steps: number;
 }
 ```
 
-and in `Snapshot` after `droppedSimTimeS: number;` add `extrema: Extrema;`.
+(serde camelCase of `fuel_t_c_max` is `fuelTCMax` and of `clad_t_c_max` is `cladTCMax`; Task 6's generated contract will catch any mismatch.)
 
-`ui/src/sim/mock.ts`: import `Extrema` in the type import list; in `blankSnapshot()` add
-`extrema: { powerFracMax: 0, pressureMpaMax: 0, levelNrCmMin: 0, levelNrCmMax: 0, steps: 0 },`.
-In `private tick(realDt)`, replace the body with one that folds the mock's own sub-steps:
+In `Snapshot` after `droppedSimTimeS: number;` add `extrema: Extrema;`.
+
+`ui/src/sim/mock.ts`: import `Extrema` in the type import list; add a helper above `class MockSim`:
+
+```ts
+/** Current values as a zero-step extrema window (mirrors Sim::extrema_now). */
+function extremaNow(s: Snapshot): Extrema {
+  return {
+    powerFracMax: s.neutronics.powerFrac,
+    thermalMwMax: s.neutronics.thermalPowerMw,
+    pressureMpaMax: s.vessel.pressureMpa,
+    levelNrCmMin: s.vessel.levelNrCm,
+    levelNrCmMax: s.vessel.levelNrCm,
+    fuelTCMax: s.neutronics.fuelTempC,
+    cladTCMax: s.neutronics.cladTempC,
+    condPressureKpaMax: s.condenser.pressureKpa,
+    steps: 0,
+  };
+}
+```
+
+In `blankSnapshot()` add `extrema: { powerFracMax: 0, thermalMwMax: 0, pressureMpaMax: 0, levelNrCmMin: 0, levelNrCmMax: 0, fuelTCMax: 0, cladTCMax: 0, condPressureKpaMax: 0, steps: 0 },` and at the end of `loadScenario(...)` (after the scenario values are set) add `this.s.extrema = extremaNow(this.s);`. Replace `private tick(realDt)` with:
 
 ```ts
   private tick(realDt: number) {
     const s = this.s;
-    const ex: Extrema = {
-      powerFracMax: s.neutronics.powerFrac,
-      pressureMpaMax: s.vessel.pressureMpa,
-      levelNrCmMin: s.vessel.levelNrCm,
-      levelNrCmMax: s.vessel.levelNrCm,
-      steps: 0,
-    };
+    const ex = extremaNow(s);
     if (!s.paused) {
       let remaining = realDt * s.speed;
       while (remaining > 1e-9) {
         const dt = Math.min(0.05, remaining);
         this.step(dt);
         remaining -= dt;
-        ex.powerFracMax = Math.max(ex.powerFracMax, s.neutronics.powerFrac);
-        ex.pressureMpaMax = Math.max(ex.pressureMpaMax, s.vessel.pressureMpa);
-        ex.levelNrCmMin = Math.min(ex.levelNrCmMin, s.vessel.levelNrCm);
-        ex.levelNrCmMax = Math.max(ex.levelNrCmMax, s.vessel.levelNrCm);
+        const now = extremaNow(s);
+        ex.powerFracMax = Math.max(ex.powerFracMax, now.powerFracMax);
+        ex.thermalMwMax = Math.max(ex.thermalMwMax, now.thermalMwMax);
+        ex.pressureMpaMax = Math.max(ex.pressureMpaMax, now.pressureMpaMax);
+        ex.levelNrCmMin = Math.min(ex.levelNrCmMin, now.levelNrCmMin);
+        ex.levelNrCmMax = Math.max(ex.levelNrCmMax, now.levelNrCmMax);
+        ex.fuelTCMax = Math.max(ex.fuelTCMax, now.fuelTCMax);
+        ex.cladTCMax = Math.max(ex.cladTCMax, now.cladTCMax);
+        ex.condPressureKpaMax = Math.max(ex.condPressureKpaMax, now.condPressureKpaMax);
         ex.steps += 1;
       }
     }
@@ -794,14 +950,14 @@ Expected: no errors.
 
 ```bash
 git add crates/bwr-core/src/api.rs crates/bwr-core/src/sim.rs crates/bwr-core/tests/runtime.rs src-tauri/src/lib.rs ui/src/sim/types.ts ui/src/sim/mock.ts
-git commit -m "feat(runtime): per-step extrema travel with every emitted snapshot
+git commit -m "feat(runtime): per-step extrema seeded from live values travel with every emitted snapshot
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 4: Trend buffer keeps every snapshot and draws the extrema envelope
+### Task 5: Trend buffer keeps every snapshot and draws the extrema envelope
 
 **Files:**
 - Modify: `ui/src/sim/history.ts` (full rewrite below)
@@ -809,8 +965,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Modify: `ui/src/components/TrendPanel.tsx`
 
 **Interfaces:**
-- Consumes: `Snapshot.extrema` (Task 3).
-- Produces: `TrendSample.powerPctMax`, `.pressureMpaMax`, `.levelNrCmMin`, `.levelNrCmMax`; `Series.envelope?: { lo: (s: TrendSample) => number; hi: (s: TrendSample) => number }`.
+- Consumes: `Snapshot.extrema` (Task 4).
+- Produces: `TrendSample.powerPctMax` (thermal, from `thermalMwMax`), `.pressureMpaMax`, `.levelNrCmMin`, `.levelNrCmMax`; `Series.envelope?: { lo: (s: TrendSample) => number; hi: (s: TrendSample) => number }`.
 
 - [ ] **Step 1: Rewrite `ui/src/sim/history.ts`**
 
@@ -822,11 +978,13 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 import { useRef } from "react";
 import type { Snapshot } from "./types";
 
+const RATED_MWT = 870;
+
 export interface TrendSample {
   t: number;
   /** Thermal power, % of rated. */
   powerPct: number;
-  /** Neutron power peak over the physics steps behind this sample, % of rated. */
+  /** Thermal power peak over the physics steps behind this sample, % of rated. */
   powerPctMax: number;
   pressureMpa: number;
   pressureMpaMax: number;
@@ -843,10 +1001,11 @@ export const TREND_WINDOW_S = 600;
 
 export function sampleOf(s: Snapshot): TrendSample {
   const ex = s.extrema;
+  const powerPct = (s.neutronics.thermalPowerMw / RATED_MWT) * 100;
   return {
     t: s.timeS,
-    powerPct: (s.neutronics.thermalPowerMw / 870) * 100,
-    powerPctMax: Math.max(ex.powerFracMax, s.neutronics.powerFrac) * 100,
+    powerPct,
+    powerPctMax: Math.max((ex.thermalMwMax / RATED_MWT) * 100, powerPct),
     pressureMpa: s.vessel.pressureMpa,
     pressureMpaMax: Math.max(ex.pressureMpaMax, s.vessel.pressureMpa),
     levelNrCm: s.vessel.levelNrCm,
@@ -956,11 +1115,24 @@ In the `// traces` section, insert the band drawing immediately after `ctx.clip(
     }
 ```
 
-- [ ] **Step 3: Use the envelope on the safety-relevant charts in `TrendPanel.tsx`**
+- [ ] **Step 3: Use the envelope on thermal power, pressure and level in `TrendPanel.tsx`**
 
-Replace the pressure and level charts:
+Replace the three charts:
 
 ```tsx
+        <StripChart
+          {...common}
+          title="THERMAL POWER"
+          unit="%"
+          series={[
+            {
+              name: "P",
+              color: C.green,
+              get: (s) => s.powerPct,
+              envelope: { lo: (s) => s.powerPct, hi: (s) => s.powerPctMax },
+            },
+          ]}
+        />
         <StripChart
           {...common}
           title="RX PRESSURE"
@@ -991,8 +1163,6 @@ Replace the pressure and level charts:
         />
 ```
 
-Leave the THERMAL POWER chart without an envelope: the drawn line is thermal power while the extremum is neutron power, and mixing them on one axis would mislead.
-
 - [ ] **Step 4: Typecheck and build**
 
 Run: `npm --prefix ui run typecheck && npm --prefix ui run build`
@@ -1002,7 +1172,7 @@ Expected: no errors.
 
 Run: `npm run dev`
 1. Load FULL POWER, set speed 30×, wait 20 s, trip the turbine from the turbine panel.
-2. Expected: the RX PRESSURE chart shows an amber band above the line during the pressure rise after the trip, and the LEVEL NR chart shows a cyan band around the shrink/swell. With 1× speed the band is thin (10 Hz snapshot ≈ 2 steps); at 30× it is clearly visible (≈60 steps per snapshot).
+2. Expected: THERMAL POWER shows a green band above the line through the SRI power cut, RX PRESSURE shows an amber band above the line during the rise after the trip, LEVEL NR shows a cyan band around the shrink/swell. At 1× the bands are thin (10 Hz snapshot ≈ 2 steps); at 30× they are clearly visible (≈60 steps per snapshot).
 3. Cross-check the peak against the engine: `cargo run --release -p bwr-core --example trace -- full 120 turbinetrip@5` and confirm the printed `Pmpa` column's maximum is not above the top of the drawn band.
 
 - [ ] **Step 6: Commit**
@@ -1016,43 +1186,67 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 5: Compiler-checked UI contract generated from Rust
+### Task 6: Compiler-checked UI contract generated from Rust, with enum/nullable coverage and a unit-suffix rule
 
 **Files:**
 - Create: `crates/bwr-core/tests/contract.rs`
 - Create (generated): `ui/src/sim/contract.generated.ts`
+- Modify: `crates/bwr-core/src/reactor.rs` (only if `RodMotion::label` does not exist)
 - Modify: `.github/workflows/validate.yml`
-- Modify: `crates/bwr-core/tests/plant.rs` (delete the now-redundant `json_contract_matches_ui`, keeping the command-parse half)
+- Modify: `crates/bwr-core/tests/plant.rs` (replace `json_contract_matches_ui` with `command_json_parses`)
 
 **Interfaces:**
-- Consumes: `Sim::new`, `Sim::snapshot`, every `Command` variant from `api.rs`, `ScenarioName`, `ModeSwitch`, `LevelControlMode`.
-- Produces: `ui/src/sim/contract.generated.ts` exporting `SNAPSHOT_FIXTURES: Snapshot[]`, `COMMAND_FIXTURES: Command[]`, `SNAPSHOT_KEY_CHECK: Record<keyof Snapshot, true>`.
+- Consumes: `Sim::new`, `Sim::snapshot`, every `Command` variant, `api::{Alarm, ModeSwitch, ScenarioName, Severity, Snapshot, Unsupported}`, `bop::LevelControlMode`, `vessel::Regime` (P4), `reactor::RodMotion` (P5), `Snapshot.rods.motion: Vec<String>` (P8).
+- Produces: `ui/src/sim/contract.generated.ts` exporting `SNAPSHOT_FIXTURES: Snapshot[]`, `COMMAND_FIXTURES: Command[]`, `_exhaustive: Record<keyof Snapshot, true>`; Rust tests `ui_contract_is_generated_and_current`, `generation_is_deterministic`, `snapshot_leaf_fields_carry_unit_suffixes`.
 
-How it works: a fresh object literal assigned to a typed `const` is checked for excess properties recursively, and string-literal unions are checked contextually, so a field added in Rust but missing in `types.ts` fails `tsc`, and a wrong enum spelling fails `tsc`. `SNAPSHOT_KEY_CHECK` closes the other direction at the top level: a key present in `types.ts` but absent from the Rust output is a missing-property error. Nested fields present in `types.ts` but absent from Rust would be reported as missing properties in the fixture literal itself.
+How it works: a fresh object literal assigned to a typed `const` is checked for excess properties recursively, and string-literal unions are checked contextually, so a field added in Rust but missing in `types.ts` fails `tsc`, and a wrong enum spelling fails `tsc`. Synthesized fixtures put every enum value and both states of every nullable field into literals so every union member and every `| null` is exercised. `_exhaustive` closes the other direction at the top level: a key present in `types.ts` but absent from the Rust output is a missing-property error; nested keys present in `types.ts` but absent from Rust are missing-property errors in the fixture literals themselves.
 
-- [ ] **Step 1: Write the generator test**
+- [ ] **Step 1: Make sure `RodMotion::label` exists**
+
+Run: `grep -n "fn label" crates/bwr-core/src/reactor.rs`
+If empty, add to `impl RodMotion` in `reactor.rs` (and make `snapshot()` in `sim.rs` use it for `rods.motion` instead of any inline match):
+
+```rust
+    /// Contract string for `Snapshot.rods.motion` (mirrored in ui/src/sim/types.ts).
+    pub fn label(&self) -> &'static str {
+        match self {
+            RodMotion::Idle => "idle",
+            RodMotion::Motor { .. } => "motor",
+            RodMotion::Scram => "scram",
+            RodMotion::Sri => "sri",
+            RodMotion::MotorRunIn => "motorRunIn",
+        }
+    }
+```
+
+- [ ] **Step 2: Write the generator and the unit-suffix test**
 
 Create `crates/bwr-core/tests/contract.rs`:
 
 ```rust
 //! Generates ui/src/sim/contract.generated.ts from the Rust API so that
-//! `npm --prefix ui run typecheck` fails when types.ts and api.rs diverge.
-//! The file is rewritten only when its content changes; CI checks it is committed.
+//! `npm --prefix ui run typecheck` fails when types.ts and api.rs diverge, and
+//! enforces the unit-suffix naming rule on every Snapshot leaf field.
+//! The TS file is rewritten only when its content changes; CI checks it is committed.
 
 use std::fs;
 use std::path::PathBuf;
 
-use bwr_core::api::{Command, ModeSwitch, ScenarioName};
+use bwr_core::api::{Alarm, Command, ModeSwitch, ScenarioName, Severity, Snapshot, Unsupported};
 use bwr_core::bop::LevelControlMode;
+use bwr_core::reactor::RodMotion;
+use bwr_core::vessel::Regime;
 use bwr_core::Sim;
+use serde_json::Value;
+
+// ------------------------------------------------------------------ commands
 
 /// One example per `Command` variant. The `match` below has no wildcard, so adding a
 /// variant to `Command` fails to compile here until an example is added.
 fn all_commands() -> Vec<Command> {
-    let v = vec![
+    let mut v = vec![
         Command::SetPaused { paused: true },
         Command::SetSpeed { speed: 5.0 },
-        Command::LoadScenario { name: ScenarioName::FullPower },
         Command::ManualScram,
         Command::ResetScram,
         Command::SetModeSwitch { mode: ModeSwitch::Run },
@@ -1075,7 +1269,6 @@ fn all_commands() -> Vec<Command> {
         Command::SetVacuumPump { on: true },
         Command::SetFeedPump { index: 2, on: false },
         Command::SetCondensatePump { index: 0, on: true },
-        Command::SetLevelControl { mode: LevelControlMode::ThreeElement },
         Command::SetFcvManual { pos: 0.5 },
         Command::SetLevelSetpoint { cm: -40.0 },
         Command::SetHeaters { in_service: false },
@@ -1083,6 +1276,13 @@ fn all_commands() -> Vec<Command> {
         Command::SetIcTrain { index: 0, open: true },
         Command::AckAlarms,
     ];
+    // Every enum value that rides inside a Command: ScenarioName and LevelControlMode.
+    for name in all_scenarios() {
+        v.push(Command::LoadScenario { name });
+    }
+    for mode in all_level_modes() {
+        v.push(Command::SetLevelControl { mode });
+    }
     for c in &v {
         match c {
             Command::SetPaused { .. }
@@ -1121,25 +1321,156 @@ fn all_commands() -> Vec<Command> {
     v
 }
 
+// ------------------------------------------------------------------ enum enumerations
+// Each list is guarded by an exhaustive match so a new variant breaks the build here.
+
+fn all_scenarios() -> Vec<ScenarioName> {
+    let v = vec![ScenarioName::ColdShutdown, ScenarioName::HotStandby, ScenarioName::FullPower];
+    for s in &v {
+        match s {
+            ScenarioName::ColdShutdown | ScenarioName::HotStandby | ScenarioName::FullPower => {}
+        }
+    }
+    v
+}
+
+fn all_modes() -> Vec<ModeSwitch> {
+    let v = vec![ModeSwitch::Shutdown, ModeSwitch::Refuel, ModeSwitch::Startup, ModeSwitch::Run];
+    for m in &v {
+        match m {
+            ModeSwitch::Shutdown | ModeSwitch::Refuel | ModeSwitch::Startup | ModeSwitch::Run => {}
+        }
+    }
+    v
+}
+
+fn all_regimes() -> Vec<Regime> {
+    let v = vec![Regime::Vented, Regime::Saturated, Regime::WaterSolid, Regime::GasBlanketed];
+    for r in &v {
+        match r {
+            Regime::Vented | Regime::Saturated | Regime::WaterSolid | Regime::GasBlanketed => {}
+        }
+    }
+    v
+}
+
+fn all_severities() -> Vec<Severity> {
+    let v = vec![Severity::Info, Severity::Warning, Severity::Alarm, Severity::Trip];
+    for s in &v {
+        match s {
+            Severity::Info | Severity::Warning | Severity::Alarm | Severity::Trip => {}
+        }
+    }
+    v
+}
+
+fn all_level_modes() -> Vec<LevelControlMode> {
+    let v = vec![LevelControlMode::Manual, LevelControlMode::SingleElement, LevelControlMode::ThreeElement];
+    for m in &v {
+        match m {
+            LevelControlMode::Manual | LevelControlMode::SingleElement | LevelControlMode::ThreeElement => {}
+        }
+    }
+    v
+}
+
+fn all_motion_labels() -> Vec<&'static str> {
+    let v = vec![RodMotion::Idle, RodMotion::Motor { target: 24.0 }, RodMotion::Scram, RodMotion::Sri, RodMotion::MotorRunIn];
+    for m in &v {
+        match m {
+            RodMotion::Idle | RodMotion::Motor { .. } | RodMotion::Scram | RodMotion::Sri | RodMotion::MotorRunIn => {}
+        }
+    }
+    v.iter().map(|m| m.label()).collect()
+}
+
+// ------------------------------------------------------------------ snapshot fixtures
+
+/// Snapshots that put every enum value and both states of every nullable field into
+/// a literal, so the TS unions and `| null` members are all exercised.
+fn synthesized(base: &Snapshot) -> Vec<Snapshot> {
+    let mut out = Vec::new();
+    for mode in all_modes() {
+        let mut s = base.clone();
+        s.mode_switch = mode;
+        out.push(s);
+    }
+    for regime in all_regimes() {
+        let mut s = base.clone();
+        s.vessel.regime = regime;
+        out.push(s);
+    }
+    for severity in all_severities() {
+        let mut s = base.clone();
+        s.alarms = vec![Alarm { id: "synth".into(), text: format!("synthesized {severity:?}"), severity, acked: true }];
+        out.push(s);
+    }
+    for mode in all_level_modes() {
+        let mut s = base.clone();
+        s.feedwater.level_control_mode = mode;
+        out.push(s);
+    }
+    {
+        let mut s = base.clone();
+        let labels = all_motion_labels();
+        s.rods.motion = (0..s.rods.positions.len()).map(|i| labels[i % labels.len()].to_string()).collect();
+        out.push(s);
+    }
+    // Nullable fields, both states each: scram_reason, neutronics.period_s, rods.selected, unsupported.
+    {
+        let mut some = base.clone();
+        some.scram_reason = Some("synthesized scram".into());
+        some.neutronics.period_s = Some(60.0);
+        some.rods.selected = Some(0);
+        some.unsupported = Some(Unsupported { since_s: 1.0, reason: "synthesized".into() });
+        out.push(some);
+        let mut none = base.clone();
+        none.scram_reason = None;
+        none.neutronics.period_s = None;
+        none.rods.selected = None;
+        none.unsupported = None;
+        out.push(none);
+    }
+    out
+}
+
+fn scenario_snapshots() -> Vec<Snapshot> {
+    all_scenarios().into_iter().map(|n| Sim::new(n).snapshot()).collect()
+}
+
 fn generated_ts() -> String {
-    let scenarios = [ScenarioName::ColdShutdown, ScenarioName::HotStandby, ScenarioName::FullPower];
-    let snapshots: Vec<serde_json::Value> =
-        scenarios.iter().map(|&n| serde_json::to_value(Sim::new(n).snapshot()).expect("snapshot json")).collect();
-    let keys: Vec<String> = snapshots[0].as_object().expect("snapshot is an object").keys().cloned().collect();
-    let cmds: Vec<serde_json::Value> = all_commands().iter().map(|c| serde_json::to_value(c).expect("command json")).collect();
+    let scen = scenario_snapshots();
+    let mut fixtures: Vec<Value> = Vec::new();
+    for s in &scen {
+        fixtures.push(serde_json::to_value(s).expect("snapshot json"));
+    }
+    for s in synthesized(&scen[2]) {
+        fixtures.push(serde_json::to_value(&s).expect("snapshot json"));
+    }
+    let keys: Vec<String> = fixtures[0].as_object().expect("snapshot is an object").keys().cloned().collect();
+    let cmds: Vec<Value> = all_commands().iter().map(|c| serde_json::to_value(c).expect("command json")).collect();
 
     let mut out = String::new();
     out.push_str("// Generated by crates/bwr-core/tests/contract.rs; do not edit.\n");
-    out.push_str("// One snapshot per scenario and one example per Command variant, typed against\n");
+    out.push_str("// One snapshot per scenario, synthesized snapshots covering every enum value and both\n");
+    out.push_str("// states of every nullable field, and one example per Command variant, all typed against\n");
     out.push_str("// types.ts so `npm --prefix ui run typecheck` fails when api.rs and types.ts diverge.\n");
     out.push_str("import type { Command, Snapshot } from \"./types\";\n\n");
-    out.push_str("export const SNAPSHOT_FIXTURES: Snapshot[] = ");
-    out.push_str(&serde_json::to_string_pretty(&snapshots).expect("pretty"));
-    out.push_str(";\n\nexport const COMMAND_FIXTURES: Command[] = ");
-    out.push_str(&serde_json::to_string_pretty(&cmds).expect("pretty"));
-    out.push_str(";\n\n// Every top-level key the engine emits. A key declared in types.ts but missing here\n");
-    out.push_str("// is a missing-property error, closing the Rust -> TS direction at the top level.\n");
-    out.push_str("export const SNAPSHOT_KEY_CHECK: Record<keyof Snapshot, true> = {\n");
+    out.push_str("export const SNAPSHOT_FIXTURES: Snapshot[] = [\n");
+    for f in &fixtures {
+        out.push_str("  ");
+        out.push_str(&serde_json::to_string(f).expect("compact"));
+        out.push_str(",\n");
+    }
+    out.push_str("];\n\nexport const COMMAND_FIXTURES: Command[] = [\n");
+    for c in &cmds {
+        out.push_str("  ");
+        out.push_str(&serde_json::to_string(c).expect("compact"));
+        out.push_str(",\n");
+    }
+    out.push_str("];\n\n// Every top-level key the engine emits (reverse direction): a key declared in types.ts\n");
+    out.push_str("// but missing here is a missing-property error. Exported so noUnusedLocals accepts it.\n");
+    out.push_str("export const _exhaustive: Record<keyof Snapshot, true> = {\n");
     for k in &keys {
         out.push_str(&format!("  {k}: true,\n"));
     }
@@ -1158,36 +1489,166 @@ fn ui_contract_is_generated_and_current() {
         eprintln!("updated {} - commit it", path.display());
     }
     assert!(want.contains("export const SNAPSHOT_FIXTURES: Snapshot[]"));
-    assert_eq!(all_commands().len(), 32, "one example per Command variant plus the two SelectRod forms");
+    assert!(want.contains("export const _exhaustive: Record<keyof Snapshot, true>"));
+    // 30 fixed examples + 3 LoadScenario + 3 SetLevelControl.
+    assert_eq!(all_commands().len(), 36);
+    // 3 scenarios + 4 modes + 4 regimes + 4 severities + 3 level modes + 1 motion + 2 nullable.
+    assert_eq!(scenario_snapshots().len() + synthesized(&scenario_snapshots()[2]).len(), 21);
 }
 
 #[test]
 fn generation_is_deterministic() {
     assert_eq!(generated_ts(), generated_ts());
 }
+
+// ------------------------------------------------------------------ unit-suffix rule
+
+/// Allowed unit suffixes on Rust (snake_case) leaf field names (master plan r2, P10).
+const UNIT_SUFFIXES: &[&str] = &[
+    "_s", "_mw", "_mwe", "_we", "_mpa", "_kpa", "_pa", "_c", "_k", "_m", "_cm", "_kgs", "_kg", "_pct", "_rpm", "_hz",
+    "_deg", "_frac", "_rel", "_cps", "_j_kg", "_kj_kg",
+];
+
+/// Leaf fields that legitimately carry no unit suffix. Every entry says why. Adding an
+/// entry requires a comment naming the unit or the reason it is dimensionless.
+const DIMENSIONLESS: &[&str] = &[
+    "speed",                 // multiplier of real time
+    "effective_speed",       // multiplier of real time
+    "paused",                // bool
+    "mode_switch",           // enum
+    "scrammed",              // bool
+    "scram_reason",          // text
+    "k_eff",                 // ratio
+    "irm_range",             // range index 1..10
+    "positions",             // rod notch positions 0..48 (array)
+    "targets",               // rod notch positions 0..48 (array)
+    "layout",                // grid coordinates (array)
+    "grid_size",             // count
+    "selected",              // index
+    "scram_in_progress",     // bool
+    "motion",                // enum strings (array)
+    "total",                 // reactivity, pcm (documented in types.ts Reactivity)
+    "rods",                  // reactivity, pcm
+    "doppler",               // reactivity, pcm
+    "void",                  // reactivity, pcm
+    "moderator",             // reactivity, pcm
+    "xenon",                 // reactivity, pcm
+    "core_avg_void",         // fraction 0..1
+    "chimney_void",          // fraction 0..1
+    "exit_quality",          // fraction 0..1
+    "head_vent_open",        // bool
+    "heatup_rate_cph",       // degC per hour; candidate suffix `_cph` for master r3
+    "regime",                // enum
+    "level_nr_out_of_range", // bool
+    "msiv_pos",              // valve fraction 0..1 (array)
+    "msiv_command_open",     // bool (array)
+    "tcv_pos",               // valve fraction 0..1
+    "bypass_pos",            // valve fraction 0..1
+    "bypass_auto",           // bool
+    "bypass_manual_pos",     // valve fraction 0..1
+    "tsv_pos",               // valve fraction 0..1
+    "tripped",               // bool
+    "breaker_closed",        // bool
+    "cw_pumps",              // bool (array)
+    "vacuum_pump_on",        // bool
+    "running",               // bool
+    "condensate_pumps",      // bool (array)
+    "fcv_pos",               // valve fraction 0..1
+    "fcv_manual_pos",        // valve fraction 0..1
+    "level_control_mode",    // enum
+    "heaters_in_service",    // bool
+    "valve_pos",             // valve fraction 0..1
+    "command_open",          // bool
+    "steam_valve_pos",       // valve fraction 0..1
+    "return_valve_pos",      // valve fraction 0..1 (array)
+    "available",             // bool
+    "id",                    // text
+    "text",                  // text
+    "severity",              // enum
+    "acked",                 // bool
+    "reason",                // text (Unsupported.reason)
+    "fuel_envelope_exceeded",// bool
+    "steps",                 // count (Extrema.steps)
+];
+
+fn to_snake(camel: &str) -> String {
+    let mut s = String::with_capacity(camel.len() + 4);
+    for ch in camel.chars() {
+        if ch.is_ascii_uppercase() {
+            s.push('_');
+            s.push(ch.to_ascii_lowercase());
+        } else {
+            s.push(ch);
+        }
+    }
+    s
+}
+
+/// Collect leaf field names (snake_case). Objects recurse; arrays of objects recurse into
+/// the first element; arrays of scalars and scalars are leaves; empty arrays are skipped
+/// (another fixture covers them).
+fn leaves(v: &Value, out: &mut Vec<String>) {
+    if let Value::Object(map) = v {
+        for (k, val) in map {
+            match val {
+                Value::Object(_) => leaves(val, out),
+                Value::Array(items) => match items.first() {
+                    Some(Value::Object(_)) => leaves(&items[0], out),
+                    Some(_) => out.push(to_snake(k)),
+                    None => {}
+                },
+                _ => out.push(to_snake(k)),
+            }
+        }
+    }
+}
+
+#[test]
+fn snapshot_leaf_fields_carry_unit_suffixes() {
+    let scen = scenario_snapshots();
+    let mut all: Vec<String> = Vec::new();
+    for s in scen.iter().chain(synthesized(&scen[2]).iter()) {
+        leaves(&serde_json::to_value(s).unwrap(), &mut all);
+    }
+    all.sort();
+    all.dedup();
+    let mut bad = Vec::new();
+    for leaf in &all {
+        // `_max` / `_min` are modifiers (Extrema fields); the unit precedes them.
+        let base = leaf.strip_suffix("_max").or_else(|| leaf.strip_suffix("_min")).unwrap_or(leaf);
+        let suffixed = UNIT_SUFFIXES.iter().any(|suf| base.ends_with(suf));
+        if !suffixed && !DIMENSIONLESS.contains(&base) {
+            bad.push(leaf.clone());
+        }
+    }
+    assert!(bad.is_empty(), "leaf fields without a unit suffix and not in DIMENSIONLESS: {bad:?}");
+    // The allowlist must not rot: every entry still names a real field.
+    let stale: Vec<&&str> = DIMENSIONLESS.iter().filter(|d| !all.iter().any(|l| l == **d || l.trim_end_matches("_max").trim_end_matches("_min") == **d)).collect();
+    assert!(stale.is_empty(), "DIMENSIONLESS entries that no longer exist: {stale:?}");
+}
 ```
 
-- [ ] **Step 2: Run it and inspect the generated file**
+- [ ] **Step 3: Run it and inspect the generated file**
 
 Run: `cargo test --release -p bwr-core --test contract`
-Expected: `test result: ok. 2 passed`, stderr line `updated .../ui/src/sim/contract.generated.ts - commit it`.
+Expected: `test result: ok. 3 passed`, stderr line `updated .../ui/src/sim/contract.generated.ts - commit it`. If `snapshot_leaf_fields_carry_unit_suffixes` fails, the message lists the offending fields: either a P3–P8 field is misnamed (fix it in its owning package's file and `types.ts`) or it is a genuine dimensionless field (add it to `DIMENSIONLESS` with a reason comment). Do not weaken `UNIT_SUFFIXES`.
 
-Run: `head -20 ui/src/sim/contract.generated.ts && grep -c '"timeS"' ui/src/sim/contract.generated.ts`
-Expected: the header comment, the import line, and `3` (one snapshot per scenario).
+Run: `head -8 ui/src/sim/contract.generated.ts && grep -c '"timeS"' ui/src/sim/contract.generated.ts`
+Expected: the header comment, the import line, and `21`.
 
-- [ ] **Step 3: Prove the check bites**
+- [ ] **Step 4: Prove the check bites in both directions and on enums**
 
-Temporarily add `bogus: number;` to `interface Snapshot` in `ui/src/sim/types.ts`, run `npm --prefix ui run typecheck`.
-Expected: errors in `contract.generated.ts`: `Property 'bogus' is missing in type ...` (fixtures) and `Property 'bogus' is missing in type` for `SNAPSHOT_KEY_CHECK`.
-Revert the edit. Then temporarily rename `effectiveSpeed` to `effectiveSpeedX` in `types.ts`, typecheck.
-Expected: `Object literal may only specify known properties, and 'effectiveSpeed' does not exist in type 'Snapshot'`. Revert.
+1. Add `bogus: number;` to `interface Snapshot` in `ui/src/sim/types.ts`; run `npm --prefix ui run typecheck`. Expected: `Property 'bogus' is missing` errors on the fixtures and on `_exhaustive`. Revert.
+2. Rename `effectiveSpeed` to `effectiveSpeedX` in `types.ts`; typecheck. Expected: `Object literal may only specify known properties, and 'effectiveSpeed' does not exist in type 'Snapshot'`. Revert.
+3. Change `export type Regime = ...` in `types.ts` to drop `"gasBlanketed"`; typecheck. Expected: `Type '"gasBlanketed"' is not assignable to type 'Regime'` on the synthesized fixture. Revert.
+4. Change `unsupported: ... | null` to non-nullable; typecheck. Expected: `Type 'null' is not assignable`. Revert.
 
 Run: `npm --prefix ui run typecheck`
 Expected: clean.
 
-- [ ] **Step 4: Replace the hand-written key check in `tests/plant.rs`**
+- [ ] **Step 5: Replace the hand-written key check in `tests/plant.rs`**
 
-In `crates/bwr-core/tests/plant.rs`, replace the body of `json_contract_matches_ui` so it keeps only the command-parse half (the key presence half is now covered by `tests/contract.rs`):
+In `crates/bwr-core/tests/plant.rs`, delete `json_contract_matches_ui` and add:
 
 ```rust
 #[test]
@@ -1207,9 +1668,7 @@ fn command_json_parses() {
 }
 ```
 
-(Delete the old `json_contract_matches_ui` function entirely.)
-
-- [ ] **Step 5: CI freshness check**
+- [ ] **Step 6: CI freshness check**
 
 In `.github/workflows/validate.yml`, in the job that runs `cargo test --release -p bwr-core`, add immediately after that step:
 
@@ -1218,16 +1677,14 @@ In `.github/workflows/validate.yml`, in the job that runs `cargo test --release 
         run: git diff --exit-code -- ui/src/sim/contract.generated.ts
 ```
 
-- [ ] **Step 6: Run everything**
+- [ ] **Step 7: Run everything and commit**
 
-Run: `cargo test --release -p bwr-core && npm --prefix ui run typecheck && git diff --exit-code -- ui/src/sim/contract.generated.ts`
-Expected: all tests pass; typecheck clean; `git diff` exits 0 after the file is staged (it is new, so stage it first in Step 7 and re-run the diff check as `git diff --cached`... simpler: commit, then `git diff --exit-code` is trivially clean).
-
-- [ ] **Step 7: Commit**
+Run: `cargo test --release -p bwr-core && npm --prefix ui run typecheck`
+Expected: all tests pass; typecheck clean.
 
 ```bash
-git add crates/bwr-core/tests/contract.rs crates/bwr-core/tests/plant.rs ui/src/sim/contract.generated.ts .github/workflows/validate.yml
-git commit -m "test(contract): generate ui/src/sim/contract.generated.ts from the Rust API and check it in CI
+git add crates/bwr-core/tests/contract.rs crates/bwr-core/tests/plant.rs crates/bwr-core/src/reactor.rs crates/bwr-core/src/sim.rs ui/src/sim/contract.generated.ts .github/workflows/validate.yml
+git commit -m "test(contract): generate ui/src/sim/contract.generated.ts with enum and nullable coverage, enforce unit suffixes, check freshness in CI
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 cargo test --release -p bwr-core --test contract && git diff --exit-code -- ui/src/sim/contract.generated.ts
@@ -1237,7 +1694,7 @@ Expected: the final diff check exits 0 (regeneration is idempotent).
 
 ---
 
-### Task 6: Browser mock is unmistakably a demo; optional recorded-snapshot replay
+### Task 7: Browser mock is unmistakably a demo; recorded-snapshot replay
 
 **Files:**
 - Modify: `ui/src/sim/mock.ts` (header, replay mode)
@@ -1246,7 +1703,7 @@ Expected: the final diff check exits 0 (regeneration is idempotent).
 - Create (generated): `ui/src/sim/recorded/fullPower.json`
 
 **Interfaces:**
-- Consumes: `Sim::snapshot_with_extrema` (Task 3), `Command::TripTurbine`.
+- Consumes: `Sim::snapshot_with_extrema` (Task 4), `Command::TripTurbine`.
 - Produces: `ui/src/sim/recorded/fullPower.json` (array of `Snapshot`, one per sim-second, 120 entries); `?replay=1` URL switch.
 
 - [ ] **Step 1: Relabel the mock**
@@ -1371,10 +1828,10 @@ Commands in replay mode are ignored by design (the recording cannot respond); th
 - [ ] **Step 5: Typecheck, build, verify**
 
 Run: `npm --prefix ui run typecheck && npm --prefix ui run build`
-Expected: clean. `vite build` output includes the JSON as part of the mock chunk only (the Tauri path lazy-imports `./mock`, so the recording is not loaded in the desktop app).
+Expected: clean. The recording is only in the lazily imported mock chunk, never in the desktop path.
 
 Run: `npm run ui:dev`, open the printed URL with `?replay=1`.
-Expected: amber "UI DEMO" banner; sim clock advances one second per second from the recording; a turbine trip alarm appears at t ≈ 5 s prefixed `[RECORDED]`.
+Expected: amber "UI DEMO" banner; sim clock advances one second per second from the recording; a turbine trip alarm appears at t ≈ 5 s prefixed `[RECORDED]`; the RX PRESSURE envelope band is visible because the recorded frames carry 20-step extrema.
 
 - [ ] **Step 6: Commit**
 
@@ -1387,57 +1844,109 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 7: Validation report generator (`--report`) and the fidelity record
+### Task 8: Validation report generator (`--report`) and the fidelity record
 
 **Files:**
 - Modify: `crates/bwr-core/examples/validation.rs` (add `--report`)
 - Create: `docs/validation/results.md`
 
 **Interfaces:**
-- Consumes (P2): `bwr_core::validation::{standard_cases, run_case, compare, Tolerance, Trace, Metrics}`, `bwr_core::sim::DT`, `docs/validation/cases.csv` with header `id,scenario,purpose,reference,tolerance_class` (tolerance_class is `numerical` or `physical`), `docs/validation/baseline/<id>.csv`.
-- Produces: `--report` prints Markdown tables; `docs/validation/results.md`.
+- Consumes (P2/P9): `bwr_core::validation::{standard_cases, run_case, compare, Tolerance, Trace, Metrics}`, `Metrics.{peak, min, first_event_time, max_abs_mass_residual_kg, max_abs_energy_residual_j, integrated}`, `Tolerance::{numerical, physical, source_comparison(&str)}`, `Trace::from_csv(&str)`, `bwr_core::sim::DT`, `docs/validation/cases.csv` with header `id,scenario,duration_s,purpose,reference,tolerance_class,role,status` (parsed by header name), `docs/validation/baseline/<id>.csv`, trace schema v2 columns `power_frac_max_int`, `pressure_pa_max_int`, `level_nr_cm_min_int`.
+- Produces: `--report` prints two Markdown tables (validation, conservation); `docs/validation/results.md`.
 
-- [ ] **Step 1: Add the report function**
+- [ ] **Step 1: Add the report functions**
 
-Add to `crates/bwr-core/examples/validation.rs` (keep P2's existing `main` behaviour for the no-flag and `--write-baseline` paths; add a `--report` branch that calls `report()`):
+Add to `crates/bwr-core/examples/validation.rs` (keep P2's existing `main` behaviour for the no-flag and baseline-writing paths; add a `--report` branch that calls `report()`):
 
 ```rust
 use std::collections::BTreeMap;
 
-/// Rows of docs/validation/cases.csv keyed by case id: (purpose, reference, tolerance_class).
-fn case_register() -> BTreeMap<String, (String, String, String)> {
+use bwr_core::validation::{compare, run_case, standard_cases, Metrics, Tolerance, Trace};
+
+struct CaseRow {
+    purpose: String,
+    reference: String,
+    tolerance_class: String,
+    role: String,
+    status: String,
+    /// The raw CSV line, handed to Tolerance::source_comparison for source-comparison cases.
+    raw: String,
+}
+
+/// docs/validation/cases.csv parsed by header name (locked header:
+/// id,scenario,duration_s,purpose,reference,tolerance_class,role,status).
+fn case_register() -> BTreeMap<String, CaseRow> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/validation/cases.csv");
     let text = std::fs::read_to_string(path).expect("docs/validation/cases.csv");
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#'));
+    let header: Vec<String> = lines.next().expect("cases.csv header").split(',').map(|c| c.trim().to_string()).collect();
+    let idx = |name: &str| header.iter().position(|h| h == name).unwrap_or_else(|| panic!("cases.csv lacks column `{name}`"));
+    let (i_id, i_purpose, i_ref, i_tol, i_role, i_status) =
+        (idx("id"), idx("purpose"), idx("reference"), idx("tolerance_class"), idx("role"), idx("status"));
     let mut out = BTreeMap::new();
-    for line in text.lines().skip(1) {
-        let cols: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
-        if cols.len() < 5 {
+    for line in lines {
+        let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+        if cols.len() < header.len() {
             continue;
         }
-        out.insert(cols[0].to_string(), (cols[2].to_string(), cols[3].to_string(), cols[4].to_string()));
+        out.insert(
+            cols[i_id].to_string(),
+            CaseRow {
+                purpose: cols[i_purpose].to_string(),
+                reference: cols[i_ref].to_string(),
+                tolerance_class: cols[i_tol].to_string(),
+                role: cols[i_role].to_string(),
+                status: cols[i_status].to_string(),
+                raw: line.to_string(),
+            },
+        );
     }
     out
 }
 
-/// Print Markdown tables for docs/validation/results.md.
+fn tolerance_for(row: &CaseRow) -> Tolerance {
+    match row.tolerance_class.as_str() {
+        "numerical" => Tolerance::numerical(),
+        "physical" => Tolerance::physical(),
+        _ => Tolerance::source_comparison(&row.raw),
+    }
+}
+
+/// Peak from the per-step interval column when present, else the sampled column.
+fn peak_of(m: &Metrics, base: &str) -> Option<(f64, f64)> {
+    m.peak.get(&format!("{base}_max_int")).or_else(|| m.peak.get(base)).copied()
+}
+
+fn min_of(m: &Metrics, base: &str) -> Option<(f64, f64)> {
+    m.min.get(&format!("{base}_min_int")).or_else(|| m.min.get(base)).copied()
+}
+
+fn fmt_at(v: Option<(f64, f64)>, scale: f64, digits: usize) -> String {
+    match v {
+        Some((x, t)) => format!("{:.*} @ {:.1} s", digits, x * scale, t),
+        None => "n/a".into(),
+    }
+}
+
+fn integrated(m: &Metrics, key: &str) -> String {
+    m.integrated.get(key).map(|v| format!("{v:.3e}")).unwrap_or_else(|| "n/a".into())
+}
+
+/// Print the Markdown tables for docs/validation/results.md. Exit 1 if any case fails.
 fn report() {
     let register = case_register();
-    println!("| Case | Purpose | Tolerance class | Reference | Max |mass residual| kg | Max |energy residual| J | First event | Result |");
-    println!("|---|---|---|---|---|---|---|---|");
+    let mut rows: Vec<(String, CaseRow, Metrics, Trace, String)> = Vec::new();
     let mut failures = 0usize;
-    for case in bwr_core::validation::standard_cases() {
-        let (purpose, reference, class) = register
-            .get(case.id)
-            .cloned()
-            .unwrap_or_else(|| ("(not in cases.csv)".into(), "none".into(), "numerical".into()));
-        let tol = if class == "physical" { bwr_core::validation::Tolerance::physical() } else { bwr_core::validation::Tolerance::numerical() };
-        let trace = bwr_core::validation::run_case(&case, bwr_core::sim::DT);
+    for case in standard_cases() {
+        let row = register.remove_or_default(case.id);
+        let tol = tolerance_for(&row);
+        let trace = run_case(&case, bwr_core::sim::DT);
         let m = trace.metrics();
         let baseline_path = format!("{}/../../docs/validation/baseline/{}.csv", env!("CARGO_MANIFEST_DIR"), case.id);
         let result = match std::fs::read_to_string(&baseline_path) {
             Ok(text) => {
-                let reference_trace = bwr_core::validation::Trace::from_csv(case.id, &text).expect("baseline csv");
-                let violations = bwr_core::validation::compare(&reference_trace.metrics(), &m, &tol);
+                let reference = Trace::from_csv(&text).expect("baseline csv");
+                let violations = compare(&reference.metrics(), &m, &tol);
                 if violations.is_empty() {
                     "PASS".to_string()
                 } else {
@@ -1450,6 +1959,14 @@ fn report() {
                 "NO BASELINE".to_string()
             }
         };
+        rows.push((case.id.to_string(), row, m, trace, result));
+    }
+
+    println!("### Validation results");
+    println!();
+    println!("| Case | Role | Status | Purpose | Tolerance class | Reference | Peak pressure MPa | Peak power % | Min level cm | First event | Result |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|");
+    for (id, row, m, _, result) in &rows {
         let first_event = m
             .first_event_time
             .iter()
@@ -1457,14 +1974,65 @@ fn report() {
             .map(|(k, t)| format!("{k} @ {t:.1} s"))
             .unwrap_or_else(|| "none".into());
         println!(
-            "| `{}` | {} | {} | {} | {:.3e} | {:.3e} | {} | {} |",
-            case.id, purpose, class, reference, m.max_abs_mass_residual_kg, m.max_abs_energy_residual_j, first_event, result
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            id,
+            row.role,
+            row.status,
+            row.purpose,
+            row.tolerance_class,
+            row.reference,
+            fmt_at(peak_of(m, "pressure_pa"), 1e-6, 3),
+            fmt_at(peak_of(m, "power_frac"), 100.0, 1),
+            fmt_at(min_of(m, "level_nr_cm"), 1.0, 0),
+            first_event,
+            result
+        );
+    }
+
+    println!();
+    println!("### Transfer allocation and conservation");
+    println!();
+    println!("| Case | Max abs mass residual kg | Max abs energy residual J | Feed kg | Steam kg | IC steam kg | IC return kg | RWCU kg | Vent kg | Core J | IC J | Loss J | Inventory-exhausted events |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    for (id, _, m, trace, _) in &rows {
+        let exhausted = trace.events.iter().filter(|(_, t)| t.contains("InventoryExhausted")).count();
+        println!(
+            "| `{}` | {:.3e} | {:.3e} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            id,
+            m.max_abs_mass_residual_kg,
+            m.max_abs_energy_residual_j,
+            integrated(m, "feed_kg"),
+            integrated(m, "steam_kg"),
+            integrated(m, "ic_steam_kg"),
+            integrated(m, "ic_return_kg"),
+            integrated(m, "rwcu_kg"),
+            integrated(m, "vent_kg"),
+            integrated(m, "core_j"),
+            integrated(m, "ic_j"),
+            integrated(m, "loss_j"),
+            exhausted
         );
     }
     println!();
     println!("{} case(s) outside tolerance or without baseline.", failures);
     if failures > 0 {
         std::process::exit(1);
+    }
+}
+
+trait RemoveOrDefault {
+    fn remove_or_default(&mut self, id: &str) -> CaseRow;
+}
+impl RemoveOrDefault for BTreeMap<String, CaseRow> {
+    fn remove_or_default(&mut self, id: &str) -> CaseRow {
+        self.remove(id).unwrap_or_else(|| CaseRow {
+            purpose: "(not in cases.csv)".into(),
+            reference: "none".into(),
+            tolerance_class: "numerical".into(),
+            role: "unregistered".into(),
+            status: "unregistered".into(),
+            raw: String::new(),
+        })
     }
 }
 ```
@@ -1481,11 +2049,11 @@ In `main`, add before the existing argument handling:
 - [ ] **Step 2: Run it**
 
 Run: `cargo run --release -p bwr-core --example validation -- --report`
-Expected: one Markdown row per standard case, every row `PASS`, final line `0 case(s) outside tolerance or without baseline.` If any row is `FAIL` or `NO BASELINE`, that is a real finding from Packages 2–9: do not edit baselines to make it pass; record it in `results.md` "Open findings" and stop to report it.
+Expected: both tables, one row per standard case, every validation row `PASS`, no row with role `unregistered`, final line `0 case(s) outside tolerance or without baseline.` If any row is `FAIL`, `NO BASELINE` or `unregistered`, that is a real finding from Packages 2–9: do not edit baselines or `cases.csv` to make it pass; record it under "Open findings" in `results.md` and stop to report it.
 
 - [ ] **Step 3: Write `docs/validation/results.md`**
 
-Create the file with this structure, filling every table from the commands shown (paste the `--report` output under "Validation results"; copy supported-range rows from the four model docs; count assumption statuses with the one-liner):
+Create the file with this structure, filling every table from the commands shown (paste the `--report` output under sections 4 and 4.1; copy supported-range rows from the four model docs; count assumption statuses with the one-liner):
 
 ```markdown
 # BWRX-300 Simulator Fidelity Record
@@ -1543,14 +2111,33 @@ assumptions are `docs/model/assumptions.md`.
 
 Command: `cargo run --release -p bwr-core --example validation -- --report`
 Method and tolerance classes: `docs/validation/method.md`. Baselines under
-`docs/validation/baseline/` are regression evidence, not physical truth.
+`docs/validation/baseline/` are regression evidence, not physical truth. Peak and
+minimum columns come from the per-physics-step interval columns of the trace
+(`*_max_int`, `*_min_int`), so sampled rows cannot hide an excursion.
 
-(paste the report tables here)
+(paste the "Validation results" table here)
 
-### Calibration vs. validation split
+### 4.1 Transfer allocation and conservation
 
-List, from `docs/validation/cases.csv`, which cases were used to calibrate parameters
-(column `purpose` = calibration) and which are reserved validation cases.
+Every outflow the vessel cannot supply is bounded at the transfer-allocation point
+(`Vessel::step`, master step order items 8–9) and every downstream component consumes
+the applied flow, so the ledger residuals below close to the numerical tolerance in
+`docs/validation/method.md`. The "Inventory-exhausted events" column counts the steps
+in which the allocation ratio was below 1; it is zero for every case inside the
+envelope. Package 3's coupled low-inventory regression (`tests/conservation.rs`) shows
+the condenser hotwell gaining exactly what the vessel released, and Package 9's
+scenarios keep the same closure through faults and paired failures.
+
+(paste the "Transfer allocation and conservation" table here)
+
+Numerical residual tolerance (from `method.md`): mass `<tol> kg`, energy `<tol> J`.
+Largest observed: mass `<value> kg` in `<case>`, energy `<value> J` in `<case>`.
+
+### 4.2 Calibration vs. validation split
+
+From `docs/validation/cases.csv` column `role`: list the calibration cases (parameters
+tuned on them), the validation cases (held out), and the plausibility cases (no public
+trace; conservation, analytical and ordering evidence only).
 
 ## 5. Paired-failure exploration (Package 9)
 
@@ -1561,12 +2148,16 @@ left its envelope (or "stayed inside"), and the last supported observation.
 ## 6. Runtime guarantees (Package 10)
 
 - Commands apply only between physics steps (`tests/runtime.rs::commands_apply_at_step_boundaries`).
-- No simulation time is discarded silently: backlog up to 60 s, beyond that counted
-  in `droppedSimTimeS` and shown in the top bar (`advance_never_loses_time_silently`).
-- Every emitted snapshot carries per-step extrema (`extrema_expose_excursions_between_snapshots`);
-  the pressure and level trends draw them as an envelope.
-- `ui/src/sim/contract.generated.ts` is regenerated by `cargo test` and type-checked
-  against `types.ts`; CI fails if it is stale.
+- No simulation time is discarded silently, in the engine or the shell: backlog up to
+  60 s, beyond that counted in `droppedSimTimeS` and shown in the top bar
+  (`advance_never_loses_time_silently`, `shell_stall_is_accounted_not_clamped`).
+- Every emitted snapshot carries per-step extrema seeded from live values
+  (`extrema_are_seeded_from_current_values_never_zeros`, `extrema_expose_excursions_between_snapshots`);
+  the thermal power, pressure and level trends draw them as an envelope.
+- `ui/src/sim/contract.generated.ts` is regenerated by `cargo test`, covers every enum
+  value and both states of every nullable field, and is type-checked against `types.ts`;
+  every Snapshot leaf field carries a unit suffix or is on the explicit dimensionless
+  allowlist (`snapshot_leaf_fields_carry_unit_suffixes`); CI fails if the file is stale.
 - The browser mock is labelled "UI DEMO" and is never used inside the desktop app.
 
 ## 7. Desktop smoke checklist
@@ -1580,12 +2171,15 @@ from the pushed build (CI artifacts), so record the commit hash tested.
    to 0, clears alarms, and shows no DROPPED chip.
 3. At FULL POWER set 30×: `EFF` reads within 10 % of 30 and is not amber on a
    laptop-class machine. Note the value.
-4. Trip the turbine by hand. Confirm: SRI event, bypass opens, RX PRESSURE chart
-   shows the amber envelope band above the line during the rise, LEVEL NR shows
-   the cyan band through the shrink.
-5. Compare the chart's pressure peak with
+4. Put the laptop to sleep for 2 minutes at 30× and wake it: a DROPPED chip appears
+   with about 3400 s (2 min × 30 − 200 s run − 60 s backlog) and the log shows one
+   "Simulation overloaded" line.
+5. Trip the turbine by hand. Confirm: SRI event, bypass opens, THERMAL POWER shows the
+   green band through the power cut, RX PRESSURE shows the amber envelope band above
+   the line during the rise, LEVEL NR shows the cyan band through the shrink.
+6. Compare the chart's pressure peak with
    `cargo run --release -p bwr-core --example trace -- full 120 turbinetrip@5`.
-6. Reload the UI with the dev server running (Vite HMR): panels repopulate at once
+7. Reload the UI with the dev server running (Vite HMR): panels repopulate at once
    and the trend buffer restarts without a stale sample.
 
 ## 8. Limitations
@@ -1604,31 +2198,31 @@ from the pushed build (CI artifacts), so record the commit hash tested.
 
 ## Open findings
 
-(Any `FAIL` / `NO BASELINE` rows from the report, with the owning package.)
+(Any `FAIL` / `NO BASELINE` / `unregistered` rows from the report, with the owning package.)
 ```
 
 - [ ] **Step 4: Fill every table**
 
-Run the three commands named in the file and paste their output. For Section 1 copy the envelope rows verbatim from the four model documents. For Section 5 copy the Package 9 table. Replace `<git rev-parse --short HEAD>` and the date. The file must contain no `...` cells when committed.
+Run the three commands named in the file and paste their output. For Section 1 copy the envelope rows verbatim from the four model documents. For Section 4.1 fill the tolerance and largest-observed line from `method.md` and the conservation table. For Section 5 copy the Package 9 table. Replace `<git rev-parse --short HEAD>` and the date. The file must contain no `...`, `<tol>`, `<value>` or `<case>` placeholders when committed.
 
-Run: `grep -n '\.\.\.' docs/validation/results.md`
+Run: `grep -nE '\.\.\.|<tol>|<value>|<case>|2026-MM-DD' docs/validation/results.md`
 Expected: no output.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/bwr-core/examples/validation.rs docs/validation/results.md
-git commit -m "docs(validation): publish the fidelity record and add --report to the validation runner
+git commit -m "docs(validation): publish the fidelity record with validation and conservation tables from --report
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 8: README matches the executable
+### Task 9: README matches the executable
 
 **Files:**
-- Modify: `README.md` (Status table, Playing hints that reference removed behaviour, Project layout, Data sources)
+- Modify: `README.md` (Status table, Project layout, Data sources)
 
 **Interfaces:**
 - Consumes: the final state of Packages 3–9 as reflected in `docs/validation/results.md`.
@@ -1644,22 +2238,22 @@ Replace the `## Status` section's table with rows that describe what the engine 
 | Reactivity | 57 bottom-entry rods with radial and axial worth, Doppler on fuel temperature, void, moderator temperature from the core inlet and boiling lengths, xenon-135 / iodine-135; shutdown-margin check with the strongest rod out |
 | Decay heat | Exponential-group fit to the public reference table in `docs/model/decay-heat-reference.csv`, with finite irradiation history |
 | Fuel | Two-node fuel and cladding temperatures; degraded cooling when the core uncovers; a FUEL THERMAL MODEL ENVELOPE EXCEEDED flag instead of a damage prediction (no peak-cladding or CPR model) |
-| Vessel | Mass and energy balance with IAPWS-IF97 saturation tables plus liquid compressibility; vented, saturated, water-solid and gas-blanketed regimes; collapsed and mixture levels kept separate |
+| Vessel | Mass and energy balance with IAPWS-IF97 saturation tables plus liquid compressibility; vented, saturated, water-solid and gas-blanketed regimes; collapsed and mixture levels kept separate; every outflow bounded by inventory and the bound propagated to every consumer |
 | Natural circulation | Core flow from the downcomer / core + chimney density difference with drift-flux voids and hydrostatic head that follows the actual downcomer level |
 | Steam | Two main steam lines with individual MSIV flows, a lumped line/header volume, turbine stop valve, turbine control valves, bypass to the condenser, head vent |
 | Turbine-generator | EHC pressure regulator, speed governor, shaft dynamics, synchroscope, generator breaker, overspeed, extraction steam accounted in the shaft balance |
 | Condenser | Circulating water pumps, vacuum pump, air in-leakage, hotwell with explicit makeup / reject to a declared condensate storage inventory |
 | Feedwater | 2 condensate + 3 feed pumps with pump curves and coastdown, equal-percentage control valve, manual / 1-element / 3-element level control with bumpless transfer, extraction heating, RWCU reject |
 | Isolation condensers | 3 trains with steam supply and parallel condensate return valves, tube inventory, pool heat-up and boil-off, unavailability and noncondensable-gas sensitivity |
-| Protection | Mode switch, scram, rod blocks, MSIV isolation, IC auto-start, Select Rod Insert, L8 trips, all driven by lagged, range-limited sensor readings; the full cause-and-effect matrix is `docs/model/protection.csv` |
-| Runtime | Fixed 50 ms physics step, honest time accounting with effective-speed display, per-step extrema on the trends, generated UI contract |
+| Protection | Mode switch, scram, rod blocks, MSIV isolation, IC auto-start, Select Rod Insert, L8 trips, driven by lagged, range-limited sensor readings; the full cause-and-effect matrix is `docs/model/protection.csv` |
+| Runtime | Fixed 50 ms physics step, honest time accounting in engine and shell with an effective-speed display, per-step extrema on the trends, generated and type-checked UI contract |
 ```
 
 - [ ] **Step 2: Fix the prose that no longer matches**
 
-- In the paragraph under Status, keep the scenarios sentence.
-- In "Playing", keep the hints; they still hold. Remove nothing unless a model doc says the behaviour changed (check `docs/model/power-conversion.md` for the feedwater-heating hint).
-- In "Project layout", change the `tests/plant.rs` sentence to: "`tests/` holds per-subsystem transient tests, `tests/runtime.rs` for time accounting and command boundaries, and `tests/contract.rs`, which generates `ui/src/sim/contract.generated.ts` so the UI types cannot drift from the engine."
+- Keep the scenarios sentence under Status.
+- In "Playing", keep the hints; remove nothing unless a model doc says the behaviour changed (check `docs/model/power-conversion.md` for the feedwater-heating hint).
+- In "Project layout", change the `tests/plant.rs` sentence to: "`tests/` holds per-subsystem transient tests, `tests/runtime.rs` for time accounting and command boundaries, and `tests/contract.rs`, which generates `ui/src/sim/contract.generated.ts` so the UI types cannot drift from the engine and enforces unit suffixes on every field name."
 - Change "`ui/src/sim/types.ts` is the contract with the engine" to "`ui/src/sim/types.ts` mirrors the engine's `api.rs` and is checked by the generated `contract.generated.ts`".
 - Add after the `tools` bullet: "`docs/model` is the evidence register (sources, parameters with status, assumptions, ESBWR applicability) and one document per subsystem; `docs/validation` is the validation method, case register, regression baselines and the published fidelity record `results.md`."
 
@@ -1699,7 +2293,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 9: Final verification, design audit, release push
+### Task 10: Final verification, design audit, release push
 
 **Files:**
 - No new files. Possibly `ui/src/**` edits from the design audit.
@@ -1707,7 +2301,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - [ ] **Step 1: Engine**
 
 Run: `cargo test --release -p bwr-core`
-Expected: all tests pass, including `tests/runtime.rs` (9 tests) and `tests/contract.rs` (2 tests).
+Expected: all tests pass, including `tests/runtime.rs` (11 tests) and `tests/contract.rs` (3 tests).
 
 Run: `cargo test --release -p bwr-core -- --ignored`
 Expected: the long-duration ICS endurance tests from Package 7 pass (72 h and 7 day cases).
@@ -1732,7 +2326,7 @@ Expected: a bundle under `target/release/bundle/` for this platform. Then walk t
 
 - [ ] **Step 5: Front-end design audit (CLAUDE.md mandatory)**
 
-Invoke the `fda:quick` skill on `ui/src` (TopBar effective-speed chip, dropped chip, demo banner, trend envelope). Apply its severity 3–4 fixes and practical severity 2 fixes; re-run `npm --prefix ui run typecheck && npm --prefix ui run build`.
+Invoke the `fda:quick` skill on `ui/src` (TopBar effective-speed chip, dropped chip, demo banner, trend envelopes). Apply its severity 3–4 fixes and practical severity 2 fixes; re-run `npm --prefix ui run typecheck && npm --prefix ui run build`.
 
 - [ ] **Step 6: Commit and push**
 
@@ -1748,16 +2342,26 @@ Expected: CI `physics`, `ui`, `validate`, and `desktop` jobs green on GitHub; th
 
 ---
 
-## Self-review against the spec (Package 10 bullets)
+## Self-review against the spec (Package 10 bullets) and the master checklist
 
 | Spec bullet | Task |
 |---|---|
-| Keep Rust authoritative; make browser mock unmistakably a UI demonstration, using recorded Rust snapshots when useful. A browser physics port is a separate decision. | Task 6 (banner, header, `?replay=1`; no port) |
-| Generate API types from Rust or add a complete contract check covering commands, field names, units, enums, and nullability. | Task 5 (fixtures typed against `Snapshot`/`Command`, key check; units live in the `types.ts` doc comments and `api.rs` field names, both checked by name) |
-| Verify command application at deterministic physics boundaries, scenario reset, pause, reconnect, and initial snapshot delivery. | Task 2 |
-| Preserve simulation-time accounting under acceleration and overload. Report effective speed rather than silently discarding accumulated time. | Task 1 |
-| Verify that display sampling and trend decimation do not hide excursions used to assess safety behavior. | Tasks 3, 4 |
-| Run full engine validation, UI typecheck/build, and desktop smoke tests using the Rust backend. | Task 9 (+ checklist in Task 7) |
-| Publish supported ranges, source revisions, outstanding assumptions, validation results, and limitations for every subsystem. | Tasks 7, 8 |
+| Keep Rust authoritative; make browser mock unmistakably a UI demonstration, using recorded Rust snapshots when useful. A browser physics port is a separate decision. | Task 7 (banner, header, `?replay=1`; no port) |
+| Generate API types from Rust or add a complete contract check covering commands, field names, units, enums, and nullability. | Task 6 (fixtures typed against `Snapshot`/`Command`; synthesized enum and nullable fixtures; `_exhaustive` reverse key check; unit-suffix test with explicit dimensionless allowlist; CI freshness) |
+| Verify command application at deterministic physics boundaries, scenario reset, pause, reconnect, and initial snapshot delivery. | Task 3 |
+| Preserve simulation-time accounting under acceleration and overload. Report effective speed rather than silently discarding accumulated time. | Tasks 1 (engine, defect 9) and 2 (shell, defect 11) |
+| Verify that display sampling and trend decimation do not hide excursions used to assess safety behavior. | Tasks 4, 5 (defect 10) |
+| Run full engine validation, UI typecheck/build, and desktop smoke tests using the Rust backend. | Task 10 (+ checklist in Task 8) |
+| Publish supported ranges, source revisions, outstanding assumptions, validation results, and limitations for every subsystem. | Tasks 8, 9 (results.md includes the transfer-allocation and conservation subsection) |
 
-Type-consistency check: `Extrema` field names (`power_frac_max`, `pressure_mpa_max`, `level_nr_cm_min`, `level_nr_cm_max`, `steps`) are identical in `api.rs`, the master contract, `types.ts` (camelCase), `mock.ts`, `history.ts`, and `tests/runtime.rs`. `effective_speed` / `dropped_sim_time_s` ↔ `effectiveSpeed` / `droppedSimTimeS` in all of `sim.rs`, `api.rs`, `types.ts`, `mock.ts`, `TopBar.tsx`. `snapshot_with_extrema` is used by `lib.rs`, `record_snapshots.rs`, and the runtime tests; `snapshot()` never resets the window.
+Master checklist:
+
+- Every spec bullet maps to a task: see table.
+- No placeholders: the only `...`/`<...>` tokens are inside the `results.md` template and Task 8 Step 4 greps them out before commit.
+- Names match master r2: `MAX_STEPS_PER_ADVANCE`, `MAX_BACKLOG_S`, `effective_speed`, `dropped_sim_time_s`, `advance_with`, `snapshot_with_extrema` (sole consumer), `Extrema` with all nine fields and `seed(&Extrema)`, `finalize_init`, `faults: Vec<Fault>`, `Trace::from_csv(&str)`, `Tolerance::source_comparison(&str)`, `Metrics.integrated`, cases.csv header `id,scenario,duration_s,purpose,reference,tolerance_class,role,status`, `RodMotion::{Idle, Motor, Scram, Sri, MotorRunIn}` labels `"idle" | "motor" | "scram" | "sri" | "motorRunIn"`, `Regime::{Vented, Saturated, WaterSolid, GasBlanketed}`. The earlier `take_extrema` and `level_cm_sensed` names are gone.
+- Derives rule: `Extrema` derives `Clone, Copy, Debug, Default, Serialize, Deserialize` with camelCase.
+- Every new constant has a `parameters.csv` row: `MAX_STEPS_PER_ADVANCE`, `MAX_BACKLOG_S` (Task 1), `SHELL_WALL_DT_CLAMP_S` (Task 2).
+- Every Snapshot change has `types.ts` and `mock.ts` steps (Tasks 1, 4) and the contract test guards them (Task 6).
+- Every defect fix has a failing test or demonstration first (Task 1 Step 1, Task 2 Step 1, Task 4 Step 1).
+- Applied transfers: P10 adds no transfer consumers; the conservation table reads `Ledger.integrated`, which records applied flows.
+- Type consistency: `Extrema` field names are identical in `api.rs`, master, `types.ts` (camelCase: `fuelTCMax`, `cladTCMax`), `mock.ts`, `history.ts`, `tests/runtime.rs`; `effective_speed`/`dropped_sim_time_s` ↔ `effectiveSpeed`/`droppedSimTimeS` in `sim.rs`, `api.rs`, `types.ts`, `mock.ts`, `TopBar.tsx`; `snapshot_with_extrema` is used by `lib.rs`, `record_snapshots.rs`, and the runtime tests; `snapshot()` never consumes the window.
