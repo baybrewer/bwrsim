@@ -1,10 +1,10 @@
 # Package 6: Steam, Turbine, Condenser and Feedwater Refinement — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Names and signatures are governed by `docs/superpowers/plans/2026-10-20-refinement-master.md` ("Shared interface contract", section P6). Packages 1–5 are complete when this plan starts: `Ledger`/`BoundaryFlows` (P2), `Fault` (P2), `validation.rs` (P2), `DomainError` (P3), `Regime` (P4), `RodMotion` (P5) all exist.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Names and signatures are governed by `docs/superpowers/plans/2026-10-20-refinement-master.md` **revision r2** ("Shared interface contract", section P6; "Shared `Sim::step` order"; "Locked CSV headers"; the Derives rule; the log-line convention in the P2 validation section). Packages 1–5 are complete when this plan starts: `Ledger`/`BoundaryFlows` with `Sim::last_flows()` (P2), `Fault` as `Vec<Fault>` with `find_fault` (P2), `validation.rs` with trace schema v2 (P2), `DomainError` and the transfer-allocation step (P3), `Regime` (P4), `RodMotion` (P5) all exist. This plan was reconciled to r2: the energy balance is the master's control-volume definition, every downstream consumer of a vessel transfer uses the applied (post-allocation) value, and all log lines follow `"<key>: <detail>"`.
 
 **Goal:** Make the main steam, turbine-generator, condenser and feedwater models conserve mass and energy explicitly, represent independently consequential valves and boundary inventories, honour injected equipment faults, and pass steady and transient balance tests with documented uncertainty.
 
-**Architecture:** `bop.rs` gains a per-line MSIV flow solution, a lumped steam-line storage node, a turbine stop valve, explicit extraction work, an explicit condensate storage tank boundary, and feed-pump speed states. `sim.rs` assembles a one-line `EnergyBalance` every step. Faults reach `bop.rs` through three small plain structs (`SteamFaults`, `CondenserFaults`, `FeedFaults`) built by `Sim` from `Sim.faults`, so `bop.rs` never depends on `Sim`.
+**Architecture:** `bop.rs` gains a per-line MSIV flow solution, a lumped steam-line storage node, a turbine stop valve, explicit extraction work, an explicit condensate storage tank boundary, and feed-pump speed states. Steam flows are computed as **requests** (master step 5), the vessel bounds them at the transfer-allocation point (step 8), and `Sim` scales `w_line`, `w_tcv`, `w_bypass` and the RWCU reject to the applied values (step 9) before the line storage commit (step 10), turbine (11) and condenser (12) consume them. `sim.rs` assembles the master's control-volume `EnergyBalance` every step. Faults reach `bop.rs` through three small plain structs (`SteamFaults`, `CondenserFaults`, `FeedFaults`) built by `Sim::bop_faults()` from `Sim.faults` (a `Vec<Fault>`, read with `has_fault`/`find_fault`), so `bop.rs` never depends on `Sim`.
 
 **Tech Stack:** Rust 2021, serde; TypeScript 5.6 for the contract mirror; the Package 2 validation runner.
 
@@ -24,7 +24,9 @@ See the master plan "Global Constraints". Package-specific:
 
 ---
 
-## New names introduced by this package (beyond the master contract)
+## Names used by this package
+
+Constants `MSIV_DP_FRACTION` through `RWCU_REJECT_MAX_KGS`, the P6 struct fields (`SteamLine { mass, p, energy }`, `Turbine.p_extraction`/`p_losses`, `Condenser { cst_mass, makeup_flow, reject_flow, hotwell_energy }`, `Feedwater.pump_speed`), the fault views, and the P6 signatures are now **in the master contract (r2)**; the table below restates them for implementers and marks the few names that remain package-local (allowed: nothing outside P6 consumes them).
 
 | Name | Where | Value / meaning |
 |---|---|---|
@@ -40,22 +42,25 @@ See the master plan "Global Constraints". Package-specific:
 | `CST_CAPACITY_KG` | `params.rs` | `2.0e6` kg. ASSUMED |
 | `CST_MASS_INITIAL` | `params.rs` | `1.5e6` kg. ASSUMED |
 | `HOTWELL_MAKEUP_KGS` | `params.rs` | `30.0` kg/s (was a literal). ASSUMED |
-| `HOTWELL_MAKEUP_ON` / `HOTWELL_REJECT_ON` | `params.rs` | `0.40` / `0.85` hotwell fraction (were literals). ASSUMED |
+| `HOTWELL_MAKEUP_ON` / `HOTWELL_REJECT_ON` | `params.rs` | `0.40` / `0.85` hotwell fraction (were literals). ASSUMED. Package-local |
 | `FW_STATIC_DP` | `params.rs` | `0.15e6` Pa (was a literal). ASSUMED |
 | `FW_PUMP_COASTDOWN_S` | `params.rs` | `5.0` s first-order pump speed time constant. ASSUMED |
 | `SRI_TRIGGER_POWER_FRAC` | `params.rs` | `0.4` (was a literal in `sim.rs`). ASSUMED |
 | `RWCU_REJECT_MAX_KGS` | `params.rs` | `15.0` kg/s (was a literal). ASSUMED |
-| `line_flow(dp, pos)` | `bop.rs` | per-line flow through friction + MSIV |
-| `SteamFaults`, `CondenserFaults`, `FeedFaults` | `bop.rs` | plain fault-view structs |
-| `SteamSystem::vessel_steam_flow()` | `bop.rs` | `w_line.iter().sum()` |
-| `SteamSystem::init_line_steady(p_vessel)` | `bop.rs` | sets `line` to the quasi-steady header state |
-| `SteamLine::at_pressure(p)`, `SteamLine::step(...)` | `bop.rs` | storage node |
+| `line_flow(dp, pos)` | `bop.rs` | per-line flow through friction + MSIV (series resistance, master r2) |
+| `SteamFaults`, `CondenserFaults`, `FeedFaults` | `bop.rs` | fault views; all derive `Clone, Copy, Debug, Default` |
+| `SteamSystem::vessel_steam_flow()` | `bop.rs` | `w_line.iter().sum()` — the vessel's REQUESTED steam outflow |
+| `SteamSystem::init_line_steady(p_vessel)` | `bop.rs` | sets `line` to the quasi-steady header state (scenario build) |
+| `SteamLine::at_pressure(p)` | `bop.rs` | storage node constructor; `SteamLine` derives `Clone, Copy, Debug` and carries `energy = mass * u_g(p)` |
+| `SteamSystem::step_line(dt, w_in_applied)` | `bop.rs` | commits applied flows into the line node (master step 10). Package-local name |
 | `steam::sat_rho_g(rho)` | `steam.rs` | inverse of `rho_g` on the table |
-| `Feedwater::set_mode(mode, level_cm, steam_flow)` | `bop.rs` | bumpless transfer |
-| `Sim::bop_faults()` | `sim.rs` | builds the three fault views |
-| `Sim::house_load()` | `sim.rs` | extracted from `snapshot()` |
-| `Sim::bypass_available()` | `sim.rs` | condenser availability AND `!BypassUnavailable` |
-| `Condenser.overflow_kg`, `Condenser.deficit_kg` | `bop.rs` | counted (never silent) hotwell clamp amounts |
+| `Feedwater::set_mode(mode)` | `bop.rs` | bumpless transfer (master signature); re-tracks the integral on the next `step()` |
+| `Turbine::kinetic_energy()` | `bop.rs` | shaft kinetic energy, J; storage term. Package-local name |
+| `Sim::bop_faults()` | `sim.rs` | builds the three fault views from `Sim.faults` via `has_fault`/`find_fault` |
+| `Sim::house_load()` | `sim.rs` | extracted from `snapshot()`. Package-local |
+| `Sim::bypass_available()` | `sim.rs` | condenser availability AND `!BypassUnavailable`. Package-local |
+| `Condenser.overflow_kg`, `Condenser.deficit_kg` | `bop.rs` | counted (never silent) hotwell clamp amounts. Package-local |
+| `H_CST_EXCHANGE` assumption | `assumptions.md` | CST makeup/reject exchanged at hotwell enthalpy (no CST temperature state) |
 
 ---
 
@@ -357,8 +362,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Test: `crates/bwr-core/tests/power_conversion.rs`
 
 **Interfaces:**
-- Produces: `pub struct SteamLine { pub mass: f64, pub p: f64 }`, `SteamLine::at_pressure(p) -> Self`, `SteamLine::step(&mut self, dt, w_in: impl Fn(f64)->f64, w_out: impl Fn(f64)->f64) -> (f64, f64)`, `SteamSystem::init_line_steady(&mut self, p_vessel: f64, tsv_open: bool)`, `steam::sat_rho_g(rho_g: f64) -> Sat`. `compute_flows(&mut self, dt: f64, p: f64, tsv_open: bool)` (adds `dt`).
-- Vessel steam outflow in `VesselInputs.w_steam` becomes `steam.vessel_steam_flow()`.
+- Produces (master r2): `#[derive(Clone, Copy, Debug)] pub struct SteamLine { pub mass: f64, pub p: f64, pub energy: f64 }` with `energy = mass * u_g(p)`; `SteamLine::at_pressure(p) -> Self`; `SteamSystem::init_line_steady(&mut self, p_vessel: f64, tsv_open: bool)` (Task 4 drops `tsv_open`); `steam::sat_rho_g(rho_g: f64) -> Sat`; `compute_flows(&mut self, dt: f64, p: f64, tsv_open: bool)` computes **requested** flows (Task 4 drops `tsv_open`); `SteamSystem::step_line(&mut self, dt: f64, w_in_applied: f64)` commits applied flows (master step 10).
+- `VesselInputs.w_steam` becomes the request `steam.vessel_steam_flow()`; after `vessel.step` returns `flows`, `Sim` scales `w_line`, `w_tcv`, `w_bypass` by `flows.w_steam / request` (master step 9) before `step_line`, turbine and condenser run.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -368,19 +373,26 @@ Append to `crates/bwr-core/tests/power_conversion.rs`:
 use bwr_core::bop::SteamLine;
 
 #[test]
-fn steam_line_node_holds_mass_at_pressure() {
+fn steam_line_node_holds_mass_and_energy_at_pressure() {
     let l = SteamLine::at_pressure(7.0e6);
-    let rho = bwr_core::steam::sat_p(7.0e6).rho_g;
-    assert!((l.mass - V_STEAM_LINE_M3 * rho).abs() < 1e-6);
-    // No flow: pressure does not change.
-    let mut l2 = l.clone();
-    l2.step(DT, |_| 0.0, |_| 0.0);
-    assert!((l2.p - 7.0e6).abs() < 10.0, "p drifted to {}", l2.p);
-    // Pure outflow of 470 kg/s: pressure must fall.
-    let mut l3 = l.clone();
-    l3.step(DT, |_| 0.0, |_| STEAM_FLOW_RATED);
-    assert!(l3.p < 7.0e6 - 1.0e4, "p {}", l3.p);
-    assert!((l3.mass - (l.mass - STEAM_FLOW_RATED * DT)).abs() < 1e-3);
+    let s = bwr_core::steam::sat_p(7.0e6);
+    assert!((l.mass - V_STEAM_LINE_M3 * s.rho_g).abs() < 1e-6);
+    assert!((l.energy - l.mass * s.u_g()).abs() < 1.0, "energy {}", l.energy);
+    // No net flow through a steady system: pressure does not change.
+    let mut sys = SteamSystem::new(true, true);
+    sys.tcv_pos = 0.85;
+    sys.init_line_steady(7.2e6, true);
+    let p0 = sys.line.p;
+    sys.compute_flows(DT, 7.2e6, true);
+    sys.step_line(DT, sys.vessel_steam_flow());
+    assert!((sys.line.p - p0).abs() < 1.0e3, "steady line drifted {} -> {}", p0, sys.line.p);
+    // Pure outflow (applied inflow zero) must drop pressure and conserve node mass exactly.
+    let m0 = sys.line.mass;
+    let w_out = sys.w_tcv + sys.w_bypass;
+    sys.step_line(DT, 0.0);
+    assert!(sys.line.p < p0, "p {}", sys.line.p);
+    assert!((sys.line.mass - (m0 - w_out * DT)).abs() < 1e-6);
+    assert!((sys.line.energy - sys.line.mass * bwr_core::steam::sat_p(sys.line.p).u_g()).abs() < 1.0);
 }
 
 #[test]
@@ -411,6 +423,17 @@ fn turbine_trip_line_pressure_spike_is_bounded() {
     }
     assert!(peak > p0 + 0.02e6, "storage should show a rise before bypass takes over: {}", peak - p0);
     assert!(peak < p0 + 0.3e6, "spike {} MPa", (peak - p0) / 1e6);
+}
+
+#[test]
+fn steam_consumers_see_applied_flows() {
+    // Master step 9: after vessel allocation, w_line/w_tcv/w_bypass hold APPLIED values,
+    // which at adequate inventory equal the vessel's applied steam outflow exactly.
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 60.0);
+    let applied = sim.last_flows().w_steam;
+    assert!((sim.steam.vessel_steam_flow() - applied).abs() < 1e-9, "post-step w_line must be applied");
+    assert!(applied > 0.9 * STEAM_FLOW_RATED, "sanity: near rated flow");
 }
 ```
 
@@ -452,52 +475,42 @@ In `params.rs` after `K_MSIV_OPEN` add:
 pub const V_STEAM_LINE_M3: f64 = 60.0;
 ```
 
-- [ ] **Step 5: Implement `SteamLine` and make `compute_flows` dynamic**
+- [ ] **Step 5: Implement `SteamLine` and split `compute_flows` into request + commit**
 
 In `bop.rs`, before `pub struct SteamSystem`, add:
 
 ```rust
 /// Lumped saturated-steam storage in the main steam lines, header and chest.
-#[derive(Clone, Debug)]
+/// `energy` is internal energy, mass * u_g(p), kept for the plant energy balance.
+#[derive(Clone, Copy, Debug)]
 pub struct SteamLine {
     pub mass: f64,
     pub p: f64,
+    pub energy: f64,
 }
 
 impl SteamLine {
     pub fn at_pressure(p: f64) -> Self {
         let p = p.max(P_ATM);
-        Self { mass: V_STEAM_LINE_M3 * sat_p(p).rho_g, p }
+        let s = sat_p(p);
+        let mass = V_STEAM_LINE_M3 * s.rho_g;
+        Self { mass, p, energy: mass * s.u_g() }
     }
 
     fn mass_at(p: f64) -> f64 {
         V_STEAM_LINE_M3 * sat_p(p).rho_g
     }
 
-    /// Advance one step with inflow and outflow given as functions of node
-    /// pressure. Fully implicit: the new pressure solves
-    /// mass(p) = mass + dt * (w_in(p) - w_out(p)), which is monotone in p.
-    /// Returns the flows evaluated at the new pressure.
-    pub fn step(&mut self, dt: f64, w_in: impl Fn(f64) -> f64, w_out: impl Fn(f64) -> f64) -> (f64, f64) {
-        let g = |p: f64| Self::mass_at(p) - self.mass - dt * (w_in(p) - w_out(p));
-        let (mut lo, mut hi) = (1.0e3, 16.5e6);
-        for _ in 0..60 {
-            let mid = 0.5 * (lo + hi);
-            if g(mid) < 0.0 {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        let p = 0.5 * (lo + hi);
-        self.p = p;
-        self.mass = Self::mass_at(p);
-        (w_in(p), w_out(p))
+    /// Set pressure and energy consistent with the current mass.
+    fn refresh(&mut self) {
+        let s = crate::steam::sat_rho_g(self.mass / V_STEAM_LINE_M3);
+        self.p = s.p;
+        self.energy = self.mass * s.u_g();
     }
 }
 ```
 
-Add `pub line: SteamLine,` to `SteamSystem` and `line: SteamLine::at_pressure(P_ATM),` in `new`. Replace `compute_flows` with:
+Add `pub line: SteamLine,` to `SteamSystem` and `line: SteamLine::at_pressure(P_ATM),` in `new`. Replace `compute_flows` with the request predictor plus the applied-flow commit:
 
 ```rust
     /// Set the line node to the quasi-steady header state for dome pressure `p` (used at scenario build).

@@ -1,14 +1,14 @@
 # Package 3: Numerical and Conservation Defects — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Read `docs/superpowers/plans/2026-10-20-refinement-master.md` first; its interface contract wins over anything here.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Read `docs/superpowers/plans/2026-10-20-refinement-master.md` (revision r2) first; its interface contract wins over anything here. This plan is reconciled to master r2 (rejection semantics, transfer allocation, no kinetics work cap, `KIN_N_FLOOR`, trace schema v2).
 
 **Goal:** Make every known numerical and conservation defect in `crates/bwr-core` visible through a failing test, then correct it so that mass and energy close to numerical tolerance and unsupported states are reported as explicit domain errors instead of silent clamps.
 
-**Architecture:** Add `src/domain.rs` (`DomainError`) and plumb it through `Kinetics`, `Core`, `Vessel`, and `Sim` so each subsystem rejects states outside its envelope. Fix the four model defects (core coverage double-correction, kinetics floor collapse, one-step rod reactivity lag, IC pool energy discard) and the two silent clamps (vessel 1 000 kg floor, EOS bisection range). Finish with edge-state and time-step convergence tests and a reviewed baseline regeneration.
+**Architecture:** Add `src/domain.rs` (`DomainError`) and plumb it through `Kinetics`, `Core`, `Vessel`, and `Sim` so each subsystem rejects states outside its envelope, with the rejection semantics fixed by master r2 ("what commits on failure"). Fix the five model defects (core coverage double-correction, kinetics floor collapse, zero-power period NaN, one-step rod reactivity lag, IC pool energy discard) and the two silent clamps (vessel 1 000 kg floor, EOS bisection range), and make every downstream consumer use the APPLIED transfers from the vessel's allocation step (master defect 13). Finish with edge-state and time-step convergence tests, measured numerical tolerances, and a reviewed baseline regeneration.
 
 **Tech Stack:** Rust 2021, serde/serde_json (dev), TypeScript mirror in `ui/src/sim/types.ts`. No new dependencies.
 
-**Depends on:** Package 2 complete: `src/ledger.rs` (`Ledger`, `BoundaryFlows`), `src/faults.rs`, `src/validation.rs` (`run_case`, `standard_cases`, `Trace::metrics`), `Sim.log`, `Sim.ledger`, `Vessel::step -> BoundaryFlows`, `examples/validation.rs` with compare and `--write` modes, and `docs/validation/baseline/*.csv`.
+**Depends on:** Packages 1 and 2 complete. From Package 2: `src/ledger.rs` (`Ledger` with `integrated`, `BoundaryFlows` with the IC ports `w_ic_steam`/`w_ic_return`/`h_ic_return`), `src/faults.rs` (`Sim.faults: Vec<Fault>`), `src/validation.rs` (`run_case`, `standard_cases`, `Trace::metrics`, trace schema v2 with 59 columns), `Sim.log`, `Sim.ledger`, `Sim::last_flows() -> &BoundaryFlows` (the applied flows of the most recent step, stored on `Sim`), `Sim::finalize_init`, `Vessel::step -> BoundaryFlows`, `tests/common/mod.rs` (owns `run()`), `examples/validation.rs` with compare and `--write` modes, and `docs/validation/baseline/*.csv`. From Package 1: `docs/model/parameters.csv` with its locked header.
 
 ## Global Constraints
 
@@ -28,7 +28,7 @@ All constraints in the master plan apply. Package-specific:
 |---|---|---|
 | `DomainError::reason(&self) -> String` | `src/domain.rs` | Human-readable text for alarms and logs |
 | `Sim::domain_error(&mut self, e: DomainError)` (pub) | `src/sim.rs` | Dedup-by-variant push, log, alarm |
-| `KIN_H_MAX`, `KIN_PROMPT_SAFETY`, `KIN_MAX_SUBSTEPS`, `KIN_EXCESS_MAX` | `src/kinetics.rs` | Adaptive substep rule and supported reactivity ceiling |
+| `KIN_H_MAX`, `KIN_PROMPT_SAFETY`, `KIN_EXCESS_MAX`, `KIN_N_FLOOR` | `src/kinetics.rs` | Adaptive substep rule, supported reactivity ceiling (physical, no work cap), period-estimator floor |
 | `Vessel.exhausted: Option<f64>` | `src/vessel.rs` | Deficit kg when outflows were bounded this step |
 | `Vessel.last_error: Option<DomainError>` | `src/vessel.rs` | EOS rejection, drained by `Sim::step` |
 | `T_EOS_MIN`, `T_EOS_MAX` | `src/vessel.rs` | EOS bisection envelope, 1.0 and 349.5 degC |
@@ -36,8 +36,10 @@ All constraints in the master plan apply. Package-specific:
 | `IcStep.pool_cooling_w` | `src/ic.rs` | Fifth field on the master's `IcStep`: idle pool cooling reported as a boundary flow |
 | `IcTrain::step(dt, t_sat, h_fg, steam_available)` | `src/ic.rs` | New `h_fg` parameter (J/kg at vessel pressure) |
 | `CP_WATER`, `H_FG_ATM`, `POOL_BOIL_T`, `POOL_IDLE_COOLING_K_PER_S` | `src/ic.rs` | Named pool constants |
-| `cmd_is_finite(&Command) -> bool` | `src/sim.rs` | Rejects non-finite numeric commands |
-| `assert_finite(&Snapshot)`, `run(&mut Sim, f64)` | `tests/common/mod.rs` | Shared test helpers |
+| `cmd_is_finite(&Command) -> bool` | `src/sim.rs` | Rejects non-finite numeric commands (master non-finite inputs rule) |
+| `assert_finite(&Snapshot)` | `tests/common/mod.rs` | Appended to Package 2's file (`run()` already lives there; the file is NOT re-created) |
+
+All kinetics constants above are in the master r2 contract; they are listed here because this package introduces them into the code. `KIN_MAX_SUBSTEPS` from the r1 draft is **removed**: a work cap would reject the existing 100 s / 120 s kinetics unit tests and its threshold depended on `dt`. `KIN_EXCESS_MAX` is the sole, physical, envelope.
 
 ---
 
@@ -50,32 +52,19 @@ All constraints in the master plan apply. Package-specific:
 - Modify: `crates/bwr-core/src/sim.rs` (field, helper, alarm, snapshot)
 - Modify: `crates/bwr-core/tests/plant.rs` (`json_contract_matches_ui` key list)
 - Modify: `ui/src/sim/types.ts`, `ui/src/sim/mock.ts`
-- Create: `crates/bwr-core/tests/common/mod.rs` (if Package 2 already created it, append)
+- Modify: `crates/bwr-core/tests/common/mod.rs` (owned by Package 2; this task only APPENDS `assert_finite`)
+- Modify: `crates/bwr-core/src/validation.rs` (populate the `unsupported` trace column)
 - Create: `crates/bwr-core/tests/numerics.rs`
 
 **Interfaces:**
-- Consumes: `Sim.log: Vec<(f64, String)>` from Package 2.
+- Consumes: `Sim.log: Vec<(f64, String)>`, `Sim::finalize_init`, `tests/common/mod.rs::run`, trace schema v2 from Package 2 (the `unsupported` column exists and is emitted as 0.0).
 - Produces: `DomainError` (master contract, six variants), `DomainError::reason()`, `Sim.domain_errors: Vec<(f64, DomainError)>`, `pub fn Sim::domain_error(&mut self, e: DomainError)`, `api::Unsupported { since_s, reason }`, `Snapshot.unsupported: Option<Unsupported>`, alarm id `unsupported` severity `Trip`.
 
 - [ ] **Step 1: Write the failing test**
 
-Create `crates/bwr-core/tests/common/mod.rs` (or append these two functions if it exists):
+Append to Package 2's `crates/bwr-core/tests/common/mod.rs` (do not re-create the file; `run()` already exists there):
 
 ```rust
-//! Helpers shared by the integration test files.
-#![allow(dead_code)]
-
-use bwr_core::api::Snapshot;
-use bwr_core::sim::DT;
-use bwr_core::Sim;
-
-pub fn run(sim: &mut Sim, seconds: f64) {
-    let steps = (seconds / DT).round() as usize;
-    for _ in 0..steps {
-        sim.step(DT);
-    }
-}
-
 /// Fields that are legitimately `null` in the JSON contract (see ui/src/sim/types.ts).
 const NULLABLE: [&str; 4] = [
     "snapshot.scramReason",
@@ -154,6 +143,20 @@ fn domain_errors_are_deduplicated_logged_and_alarmed() {
     sim.apply(Command::LoadScenario { name: ScenarioName::FullPower });
     assert!(sim.domain_errors.is_empty());
     assert!(sim.snapshot().unsupported.is_none());
+}
+
+#[test]
+fn domain_errors_raised_during_initialisation_survive_finalize_init() {
+    // finalize_init (Package 2) clears log/events/ledger but must RETAIN domain
+    // errors, re-stamped at t = 0: an invalid initial condition must stay visible.
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 5.0);
+    sim.domain_error(DomainError::PropertyOutOfRange { what: "init".into(), value: 1.0 });
+    sim.finalize_init();
+    assert_eq!(sim.time, 0.0);
+    assert_eq!(sim.domain_errors.len(), 1);
+    assert_eq!(sim.domain_errors[0].0, 0.0, "error must be re-stamped at t = 0");
+    assert!(sim.snapshot().unsupported.is_some());
 }
 ```
 
@@ -296,7 +299,18 @@ In `snapshot()`, after `scram_reason: self.scram_reason.clone(),`:
                 .map(|(t, e)| api::Unsupported { since_s: *t, reason: e.reason() }),
 ```
 
-`LoadScenario` already replaces `*self`, which clears `domain_errors`. Do not touch `ResetScram`.
+`LoadScenario` goes through the scenario constructors and therefore through `Sim::finalize_init` (Package 2), which starts a fresh `domain_errors`. In `finalize_init`, add the retention rule (master "Scenario construction and bookkeeping"): before the clears, take the current `domain_errors` and re-insert them re-stamped at `t = 0.0`:
+
+```rust
+        // An invalid initial condition must stay visible after the bookkeeping reset.
+        let kept: Vec<(f64, DomainError)> = self.domain_errors.drain(..).map(|(_, e)| (0.0, e)).collect();
+        // ... existing finalize_init clears ...
+        self.domain_errors = kept;
+```
+
+Do not touch `ResetScram`.
+
+In `src/validation.rs`, the trace row builder (Package 2) emits the `unsupported` column as `0.0`. Change that expression to `if sim.domain_errors.is_empty() { 0.0 } else { 1.0 }` and update the "populated from Package N" note for `unsupported` in `docs/validation/method.md` from "Package 3 (pending)" to implemented.
 
 - [ ] **Step 6: Mirror in the UI and the contract test**
 
@@ -327,7 +341,7 @@ Expected: exit 0.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/bwr-core/src/domain.rs crates/bwr-core/src/lib.rs crates/bwr-core/src/api.rs crates/bwr-core/src/sim.rs crates/bwr-core/tests/common/mod.rs crates/bwr-core/tests/numerics.rs crates/bwr-core/tests/plant.rs ui/src/sim/types.ts ui/src/sim/mock.ts
+git add crates/bwr-core/src/domain.rs crates/bwr-core/src/lib.rs crates/bwr-core/src/api.rs crates/bwr-core/src/sim.rs crates/bwr-core/src/validation.rs crates/bwr-core/tests/common/mod.rs crates/bwr-core/tests/numerics.rs crates/bwr-core/tests/plant.rs ui/src/sim/types.ts ui/src/sim/mock.ts docs/validation/method.md
 git commit -m "feat(core): explicit DomainError and unsupported-state reporting
 
 Adds domain.rs, Sim::domain_errors (first occurrence per variant), the
@@ -342,6 +356,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `crates/bwr-core/src/vessel.rs` (`Vessel` struct, `new`, `update_level`, `core_coverage`)
+- Modify: `crates/bwr-core/src/validation.rs` (populate the `collapsed_level_m` trace column)
 - Modify: `crates/bwr-core/tests/numerics.rs`
 
 **Interfaces:**
@@ -431,6 +446,8 @@ Replace `core_coverage`:
 
 The `CORE UNCOVERED` alarm in `sim.rs` (`if self.vessel.core_coverage() < 0.999`) and the `htc_factor` passed to `Core::step` both call this function and need no edit.
 
+In `src/validation.rs`, the trace row builder emits `collapsed_level_m` as `0.0` (schema v2, "populated from Package 3"). Change that expression to `sim.vessel.collapsed_level_z` and update the pending note in `docs/validation/method.md`.
+
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --release -p bwr-core`
@@ -439,7 +456,7 @@ Expected: all pass, including `core_coverage_uses_mixture_level_without_second_v
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/bwr-core/src/vessel.rs crates/bwr-core/tests/numerics.rs
+git add crates/bwr-core/src/vessel.rs crates/bwr-core/src/validation.rs crates/bwr-core/tests/numerics.rs docs/validation/method.md
 git commit -m "fix(vessel): core coverage no longer applies a second void correction
 
 level_z is the mixture level (level_from_volume already distributes liquid
@@ -464,13 +481,15 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `DomainError::PromptSupercritical`.
-- Produces: `Kinetics::advance(&mut self, rho: f64, s: f64, dt: f64) -> Result<usize, DomainError>` (returns substeps used); `Core::step(..) -> Result<f64, DomainError>`; constants `KIN_H_MAX = 1.0e-3`, `KIN_PROMPT_SAFETY = 0.25`, `KIN_MAX_SUBSTEPS = 20_000`, `KIN_EXCESS_MAX = 0.2`.
+- Produces: `Kinetics::advance(&mut self, rho: f64, s: f64, dt: f64) -> Result<usize, DomainError>` (returns substeps used; state untouched on Err); `Core::step(..) -> Result<f64, DomainError>` (on Err: rods already moved by `step_rods`, xenon/decay/fuel NOT advanced); constants `KIN_H_MAX = 1.0e-3`, `KIN_PROMPT_SAFETY = 0.25`, `KIN_EXCESS_MAX = 0.2`, `KIN_N_FLOOR = 1e-12`. There is NO work cap.
 
-**Baseline defect (verified in code):** `step()` computes `lhs = 1 - dt*(rho - BETA)/GEN_TIME - ...`. With the fixed 1 ms substep used by `Core::step`, `lhs <= 0` once `rho` exceeds about 0.046 dk/k, and `n1 = (rhs/lhs).max(1e-14)` then silently drives power to the floor instead of growing.
+**Baseline defects (verified in code; master defects 2 and 12):**
+- Defect 2: `step()` computes `lhs = 1 - dt*(rho - BETA)/GEN_TIME - ...`. With the fixed 1 ms substep used by `Core::step`, `lhs <= 0` once `rho` exceeds about 0.046 dk/k, and `n1 = (rhs/lhs).max(1e-14)` then silently drives power to the floor instead of growing.
+- Defect 12: `Kinetics::equilibrium(0.0)` followed by `step()` computes `let ip = (n1 / n0).ln() / dt;` with `n0 = 0`, giving an infinite `inv_period` (ln of inf), then NaN once a later ratio is 0/0 or inf is mixed into the smoothing lag.
 
-**Envelope decision:** the substep count alone does not bound reactivity usefully at `dt = 0.05` (20 000 substeps corresponds to `rho - BETA ≈ 4 dk/k`), so the supported ceiling is an explicit constant `KIN_EXCESS_MAX = 0.2` dk/k above `BETA`. Point kinetics with lumped feedback is not a credible model of such excursions in any case; the ceiling is recorded as an assumption in `parameters.csv`.
+**Envelope decision (master r2):** the supported ceiling is the physical constant `KIN_EXCESS_MAX = 0.2` dk/k above `BETA`, recorded as an assumption in `parameters.csv`. There is NO substep work cap: a cap would reject the legitimate long calls in the existing unit tests (100 s and 120 s advances) and any threshold expressed in substeps would change meaning with `dt`. The substep count at fixed `h` is linear in `dt` and bounded in practice by `Sim`'s 0.05 s plant step (50 substeps at `rho <= BETA`, up to 5 000 at the `KIN_EXCESS_MAX` ceiling where `h = 0.25*GEN_TIME/0.2 = 5e-5 s`).
 
-- [ ] **Step 1: Demonstrate the baseline collapse**
+- [ ] **Step 1: Demonstrate the two baseline defects**
 
 Append to `tests/numerics.rs` (temporary, old signature):
 
@@ -484,10 +503,19 @@ fn baseline_kinetics_collapses_to_floor() {
     println!("baseline n after 50 ms at rho=0.05: {}", k.n);
     assert_eq!(k.n, 1e-14, "baseline clamps to the neutron floor instead of growing");
 }
+
+#[test]
+fn baseline_zero_power_period_is_not_finite() {
+    // Defect 12: equilibrium(0.0) then step() divides by n0 = 0 in the log-rate.
+    let mut k = Kinetics::equilibrium(0.0);
+    k.advance(0.0, 8.0e-6, 0.002, 2); // source startup from true zero power
+    println!("baseline inv_period from zero power: {}", k.inv_period);
+    assert!(!k.inv_period.is_finite(), "baseline period meter is inf/NaN from zero power");
+}
 ```
 
-Run: `cargo test --release -p bwr-core --test numerics baseline_kinetics_collapses_to_floor -- --nocapture`
-Expected: PASS with printed `baseline n after 50 ms at rho=0.05: 0.00000000000001`. Paste that line into the Task 3 commit body, then delete this test.
+Run: `cargo test --release -p bwr-core --test numerics baseline_ -- --nocapture`
+Expected: both PASS, printing `baseline n after 50 ms at rho=0.05: 0.00000000000001` and a non-finite `inv_period` (inf or NaN). Paste both printed lines into the Task 3 commit body, then delete these two tests.
 
 - [ ] **Step 2: Write the failing test for the corrected behaviour**
 
@@ -503,17 +531,69 @@ fn kinetics_rejects_prompt_supercritical_instead_of_collapsing() {
     assert!(k.n > 1.0, "power must grow above prompt critical, got {}", k.n);
     assert!(k.inv_period > 0.0);
 
-    // Far beyond the envelope: explicit rejection, state untouched.
+    // Beyond the physical envelope: explicit rejection, state untouched
+    // (rejection semantics: Kinetics unchanged on Err).
     let mut k = Kinetics::equilibrium(1.0);
     let before = k.clone();
     let err = k.advance(0.3, 0.0, 0.05).unwrap_err();
     assert!(matches!(err, DomainError::PromptSupercritical { rho } if (rho - 0.3).abs() < 1e-12));
     assert_eq!(k.n, before.n);
     assert_eq!(k.c, before.c);
+    assert_eq!(k.inv_period, before.inv_period);
 
     // Ordinary operation uses the 1 ms substep.
     let mut k = Kinetics::equilibrium(1.0);
     assert_eq!(k.advance(0.0, 0.0, 0.05).unwrap(), 50);
+
+    // No work cap: a 100 s call at rho = 0 is 100_000 substeps, as at baseline.
+    let mut k = Kinetics::equilibrium(1.0);
+    assert_eq!(k.advance(0.0, 0.0, 100.0).unwrap(), 100_000);
+    assert!((k.n - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn period_meter_is_finite_from_zero_power() {
+    // Defect 12. Source startup from true zero power: n grows, period stays finite.
+    let mut k = Kinetics::equilibrium(0.0);
+    for _ in 0..1000 {
+        k.advance(0.0, 8.0e-6, 0.05).unwrap();
+        assert!(k.inv_period.is_finite(), "inv_period went non-finite at n = {}", k.n);
+    }
+    assert!(k.n > 0.0);
+
+    // Zero source at zero power: nothing moves, period reads zero.
+    let mut k = Kinetics::equilibrium(0.0);
+    k.advance(0.0, 0.0, 1.0).unwrap();
+    assert_eq!(k.n, 0.0);
+    assert_eq!(k.inv_period, 0.0);
+
+    // Deep shutdown decay toward the floor never produces a non-finite period.
+    let mut k = Kinetics::equilibrium(1e-9);
+    for _ in 0..200 {
+        k.advance(-0.1, 0.0, 0.05).unwrap();
+        assert!(k.inv_period.is_finite());
+    }
+}
+
+#[test]
+fn core_step_err_leaves_xenon_decay_and_fuel_unadvanced() {
+    // Rejection semantics for Core::step (master r2): on Err the rods have already
+    // moved (step_rods runs first in Sim::step) but xenon, decay heat and fuel
+    // temperature commit nothing, and Sim keeps the previous q_core.
+    use bwr_core::reactor::Core;
+    let mut core = Core::new(1.0, ROD_FULL_OUT, 550.0);
+    core.rho_total = 0.3; // force a PromptSupercritical rejection
+    let xe = core.xenon.clone();
+    let decay = core.decay.clone();
+    let fuel_t = core.fuel_t;
+    let n = core.kin.n;
+    let err = core.step(0.05, 287.0, 1.0).unwrap_err();
+    assert!(matches!(err, DomainError::PromptSupercritical { .. }));
+    assert_eq!(core.kin.n, n);
+    assert_eq!(core.xenon.iodine, xe.iodine);
+    assert_eq!(core.xenon.xenon, xe.xenon);
+    assert_eq!(core.decay.d, decay.d);
+    assert_eq!(core.fuel_t, fuel_t);
 }
 ```
 
@@ -536,11 +616,15 @@ use crate::params::{BETA, BETA_FRAC, GEN_TIME, LAMBDA_DN};
 pub const KIN_H_MAX: f64 = 1.0e-3;
 /// Substep is limited so that h * (rho - BETA) / GEN_TIME <= this factor.
 pub const KIN_PROMPT_SAFETY: f64 = 0.25;
-/// Work guard per `advance` call.
-pub const KIN_MAX_SUBSTEPS: usize = 20_000;
-/// Supported reactivity ceiling above BETA, dk/k. Beyond this the lumped point
-/// model is not a credible description and the step is rejected.
+/// Supported reactivity ceiling above BETA, dk/k (a physical envelope, not a work
+/// cap). Beyond this the lumped point model is not a credible description and the
+/// step is rejected. There is deliberately no substep work cap: long advances
+/// (e.g. 100 s at rho = 0) are legitimate and their cost is linear in dt.
 pub const KIN_EXCESS_MAX: f64 = 0.2;
+/// Floor for the period estimator only: inv_period contribution is 0 when the
+/// starting population is below this, and max(n, KIN_N_FLOOR) is used inside the
+/// log so the meter stays finite from zero power (baseline defect 12).
+pub const KIN_N_FLOOR: f64 = 1e-12;
 
 #[derive(Clone, Debug)]
 pub struct Kinetics {
@@ -580,7 +664,13 @@ impl Kinetics {
             self.c[i] = (self.c[i] + dt * BETA * BETA_FRAC[i] / GEN_TIME * n1) / (1.0 + dt * LAMBDA_DN[i]);
         }
         self.n = n1;
-        let ip = if n0 > 0.0 && n1 > 0.0 { (n1 / n0).ln() / dt } else { 0.0 };
+        // Period meter: finite by construction (defect 12). No contribution while
+        // the population is below the floor; the log uses floored values.
+        let ip = if n0 < KIN_N_FLOOR {
+            0.0
+        } else {
+            (n1.max(KIN_N_FLOOR) / n0.max(KIN_N_FLOOR)).ln() / dt
+        };
         // Smooth the period meter like a real log-rate amplifier.
         let a = (dt / 1.0).min(1.0);
         self.inv_period += (ip - self.inv_period) * a;
@@ -588,22 +678,24 @@ impl Kinetics {
     }
 
     /// Advance by `dt` with adaptive substeps:
-    /// h = min(KIN_H_MAX, KIN_PROMPT_SAFETY * GEN_TIME / max(rho - BETA, 0)).
-    /// Returns the number of substeps used, or Err (state untouched) when
-    /// `rho - BETA > KIN_EXCESS_MAX`, the substep count would exceed
-    /// KIN_MAX_SUBSTEPS, or the implicit denominator is nonpositive.
+    /// h = min(KIN_H_MAX, KIN_PROMPT_SAFETY * GEN_TIME / max(rho - BETA, 0));
+    /// substeps = ceil(dt / h), with no work cap. Returns the number of substeps
+    /// used, or Err (state untouched) when `rho - BETA > KIN_EXCESS_MAX`, an input
+    /// is not finite, or the implicit denominator is still nonpositive.
     pub fn advance(&mut self, rho: f64, s: f64, dt: f64) -> Result<usize, DomainError> {
+        if !rho.is_finite() {
+            return Err(DomainError::PropertyOutOfRange { what: "kinetics rho".into(), value: rho });
+        }
+        if !s.is_finite() {
+            return Err(DomainError::PropertyOutOfRange { what: "kinetics source".into(), value: s });
+        }
         let excess = rho - BETA;
         if excess > KIN_EXCESS_MAX {
             return Err(DomainError::PromptSupercritical { rho });
         }
         let h_prompt = if excess > 0.0 { KIN_PROMPT_SAFETY * GEN_TIME / excess } else { f64::INFINITY };
         let h = KIN_H_MAX.min(h_prompt);
-        let steps = (dt / h).ceil().max(1.0);
-        if steps > KIN_MAX_SUBSTEPS as f64 {
-            return Err(DomainError::PromptSupercritical { rho });
-        }
-        let steps = steps as usize;
+        let steps = (dt / h).ceil().max(1.0) as usize;
         let h = dt / steps as f64;
         let saved = self.clone();
         for _ in 0..steps {
@@ -681,6 +773,8 @@ with
 
 and change the last line of that function from `q_conv + p * DIRECT_COOLANT_HEAT` to `Ok(q_conv + p * DIRECT_COOLANT_HEAT)`. (Task 4 removes the `self.rods.step(dt)` line.)
 
+The `?` on `kin.advance` sits BEFORE the xenon, decay-heat and fuel-temperature updates, which is exactly the master's rejection semantics: on Err nothing in `Core` beyond the rods commits. The test `core_step_err_leaves_xenon_decay_and_fuel_unadvanced` (Step 2) pins this; do not reorder those updates above the kinetics call. `Sim`-level forcing of the same Err is impractical (`update_reactivity` recomputes `rho_total` from real state each step), so the `Sim` side of the rule, keeping the previous `q_core`, is covered by the match arm below rather than a dedicated test.
+
 In `crates/bwr-core/src/sim.rs`, `Sim::step`, replace
 
 ```rust
@@ -710,12 +804,12 @@ Expected: all pass, including the three kinetics unit tests and `kinetics_reject
 
 Append to `docs/model/parameters.csv`, using its header's column order (Package 1), one row each:
 
-| name | value | unit | definition | status | notes |
+| id | value | unit | definition | status | notes |
 |---|---|---|---|---|---|
-| `KIN_H_MAX` | 1.0e-3 | s | largest kinetics substep | numerical (assumed) | resolves lambda_6 = 3.01 1/s with h*lambda = 0.003 |
-| `KIN_PROMPT_SAFETY` | 0.25 | - | bound on h*(rho-beta)/Lambda | numerical (assumed) | keeps the backward-Euler denominator > 0.75 |
-| `KIN_MAX_SUBSTEPS` | 20000 | - | work guard per advance call | numerical (assumed) | |
-| `KIN_EXCESS_MAX` | 0.2 | dk/k | supported reactivity above beta | assumed envelope | lumped point kinetics is not credible beyond this; rejected as DomainError |
+| `KIN_H_MAX` | 1.0e-3 | s | largest kinetics substep | assumed | numerical; resolves lambda_6 = 3.01 1/s with h*lambda = 0.003 |
+| `KIN_PROMPT_SAFETY` | 0.25 | - | bound on h*(rho-beta)/Lambda | assumed | numerical; keeps the backward-Euler denominator > 0.75 |
+| `KIN_EXCESS_MAX` | 0.2 | dk/k | supported reactivity above beta | assumed | model envelope; lumped point kinetics is not credible beyond this; rejected as DomainError (no work cap exists) |
+| `KIN_N_FLOOR` | 1e-12 | - | period-estimator population floor | assumed | numerical; affects the period meter only, never `n` itself |
 
 - [ ] **Step 8: Commit**
 
