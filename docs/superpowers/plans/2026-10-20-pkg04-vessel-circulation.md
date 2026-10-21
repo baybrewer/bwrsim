@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2021, serde, Python 3 + CoolProp (`tools/gen_steam_table.py`), existing `validation` module from Package 2.
 
-**Prerequisites (assumed complete, master r2):** Package 1 (`docs/model/*.csv` with the locked headers, `assumptions.md`, `tests/register.rs` enforcing a `parameters.csv` row per constant), Package 2 (`ledger.rs` with `BoundaryFlows` incl. `w_ic_steam`/`w_ic_return`/`h_ic_return` and `Ledger.integrated`; `validation.rs` with trace schema v2 (`N_TRACE_COLS = 59`, columns `gas_mass_kg`, `t_coolant_c`, `moderator_t_c` emitted as 0.0 until this package); `standard_cases()` with ids `fp_steady_600`, `hs_steady_600`, `cs_steady_600`; `Sim::finalize_init()` as the constructor epilogue that re-bases the ledger), Package 3 (`domain.rs::DomainError`, `Vessel.collapsed_level_z`, `Vessel.exhausted: Option<f64>`, `Vessel.last_error: Option<DomainError>`, `pub const T_EOS_MIN/T_EOS_MAX` in `vessel.rs`, `solve_eos` returning `Result` with the master rejection semantics, outflow bounding in `Vessel::step` as the transfer-allocation point, `core_coverage` fix, `Sim::step` order steps 1–17).
+**Prerequisites (assumed complete, master r2):** Package 1 (`docs/model/*.csv` with the locked headers, `assumptions.md`, `tests/register.rs` enforcing a `parameters.csv` row per constant), Package 2 (`ledger.rs` with `BoundaryFlows` incl. `w_ic_steam`/`w_ic_return`/`h_ic_return` and `Ledger.integrated`; `validation.rs` with trace schema v2 (`N_TRACE_COLS = 58`, the master's `TRACE_COLUMNS` array verbatim; columns `gas_mass_kg`, `t_coolant_c`, `moderator_t_c` emitted as 0.0 until this package; this package adds, removes and reorders no column); `standard_cases()` with ids `fp_steady_600`, `hs_steady_600`, `cs_steady_600`; `Sim::finalize_init()` as the constructor epilogue that re-bases the ledger), Package 3 (`domain.rs::DomainError`, `Vessel.collapsed_level_z`, `Vessel.exhausted: Option<f64>`, `Vessel.last_error: Option<DomainError>`, `pub const T_EOS_MIN/T_EOS_MAX` in `vessel.rs`, `solve_eos` returning `Result` with the master rejection semantics, outflow bounding in `Vessel::step` as the transfer-allocation point, `core_coverage` fix, `Sim::step` order steps 1–17).
 
 **Derives rule (master r2):** `Regime` derives `Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize` with `#[serde(rename_all = "camelCase")]`; the replacement `Eos` keeps the baseline derives `Clone, Copy, Debug`. Both appear verbatim in Task 3 Step 3.
 
@@ -20,8 +20,11 @@ See master plan "Global Constraints". In addition for this package:
 
 - "Do not calibrate all behavior to one assumed full-power flow." `k_fric` stays calibrated at one rated point, but flow must be tested at other power levels and levels.
 - "Density-wave or regional stability claims remain limited to evidence actually demonstrated." This package makes no stability claim; `docs/model/vessel.md` says so.
-- No coefficient retuning (`VOID_COEF`, `MOD_TEMP_COEF`, `DOPPLER_A`, `CORE_FLOW_RATED`, `LOOP_INERTIA`) in this package. If a test can only pass by retuning, stop and record the finding.
-- Baseline traces in `docs/validation/baseline/` are regenerated only in Task 7, after the before/after metric differences are pasted into the commit body.
+- No coefficient retuning (`VOID_COEF`, `MOD_TEMP_COEF`, `DOPPLER_A`, `LOOP_INERTIA`) in this package. `CORE_FLOW_RATED` is never retuned to make a test pass; its evidence basis (Package 1 assigned the re-derivation of this power-scaled value to this package, A-007) is resolved in Task 5b, where its value changes only if the geometry/head derivation supports a different value. If any other test can only pass by retuning, stop and record the finding (`docs/validation/findings.md`, P3 Finding policy).
+- Baseline traces in `docs/validation/baseline/` are regenerated only in Task 7, following the master's baseline regeneration protocol (report file, classification, gates green, `--write` once, report and baselines committed together).
+- **Register-row rule (master):** every constant added in a task gets its `parameters.csv` row, and every new `A-0nn` it cites gets its `assumptions.md` table row, in that same task; `cargo test --release -p bwr-core --test register` runs at every task boundary. Assumption ids allocated to this package: `A-040`..`A-047`; applicability ids `E-40`..`E-42`; source ids `SRC-IAPWS-IF97`, `SRC-KELL-1975`, `SRC-COOLPROP`.
+- **Verification commands keep cargo's exit status:** every gate runs `cargo` without a pipe. Diagnostics are read from a saved log (`cargo <args> > /tmp/<name>.log 2>&1; echo "exit=$?"`, then `grep`/`head` on the log), never from `cargo ... | head/tail/grep`. Where a pipe is unavoidable the command starts with `set -o pipefail`. A failed command stops the task before any commit or baseline write, and the full log goes into the task's report or commit body.
+- **Tolerances are declared before the run** and are never adjusted after a failure (master). A physical assertion that fails is investigated; if the model is right and the predeclared bound is not, the failure is recorded under the Finding policy (`docs/validation/findings.md`, `F-nnn`, test `#[ignore = "F-nnn"]`), not re-thresholded.
 
 ---
 
@@ -39,26 +42,30 @@ See master plan "Global Constraints". In addition for this package:
 | `crates/bwr-core/src/validation.rs` | Modify | Populate trace schema v2 columns `gas_mass_kg`, `t_coolant_c` (Task 3) and `moderator_t_c` (Task 6) in `run_case` sampling |
 | `ui/src/sim/types.ts`, `ui/src/sim/mock.ts` | Modify | `Regime` type and `vessel.regime` field |
 | `crates/bwr-core/tests/vessel_transients.rs` | Create | Shrink/swell, heatup, cooldown, pressure step, low level, steady consistency, water-solid, conservation |
-| `docs/model/parameters.csv`, `assumptions.md`, `esbwr-applicability.csv`, `sources.csv`, `coverage.md` | Modify | Register rows for every constant and borrowed concept |
-| `docs/validation/baseline/*.csv`, `docs/validation/method.md` | Modify | Regenerated baselines with change log |
+| `docs/model/parameters.csv`, `assumptions.md`, `esbwr-applicability.csv`, `sources.csv`, `coverage.md` | Modify | Register rows for every constant and borrowed concept, in the task that introduces each |
+| `crates/bwr-core/tests/register.rs` | Modify | `BORROWED` entry for `CORE_FLOW_RATED` updated with its status (Task 5b) |
+| `docs/validation/reports/<date>-pkg04.md`, `docs/validation/baseline/*.csv` | Create / Modify | Baseline regeneration report and regenerated baselines (Task 7) |
+| `docs/superpowers/plans/2026-10-20-refinement-master.md` | Modify (Task 3 Step 8, same commit) | Append the shared P4 extensions later packages consume (`Eos.p_steam`/`p_gas`, `Vessel::steam_available`, `P_EOS_MAX`, `DISSOLVED_GAS_CAPACITY_KG`, the steam-request/gas-sweep contract) |
 
 Call sites of the removed `Eos.subcooled` / `Eos.solid` booleans (all must be updated in Task 3):
 
 | File | Location | Replacement |
 |---|---|---|
 | `vessel.rs` | `Eos` struct, `solve_eos` | new struct / new function |
-| `vessel.rs` | `Vessel::new` initial `eos: Eos { ..subcooled: true, solid: false }` | `Eos { t, p: P_ATM, p_steam: 0.0, p_gas: 0.0, x: 0.0, regime: Regime::Vented }` |
-| `vessel.rs` | `update_level` `if self.eos.subcooled { rho_liquid } else { sat_t.rho_f }` | `compressed_liquid_rho(self.eos.t, self.eos.p)` |
-| `vessel.rs` | `step` vent `!self.eos.subcooled`; `h_liq`; `w_steam = if subcooled {0}` | steam-space composition split and cap, no regime match (Task 4) |
-| `vessel.rs` | `sat_for_core` | `sat_p(self.eos.p)` unconditionally |
+| `vessel.rs` | `Vessel::new` initial `eos: Eos { ..subcooled: true, solid: false }` | `Eos { t, p: p0, p_steam: sg.p, p_gas: p0 - sg.p, x: 0.0, regime }` with `p0 = max(p_sat(t), P_ATM)` (Task 3 Step 4, full constructor shown) |
+| `vessel.rs` | `update_level` `if self.eos.subcooled { rho_liquid } else { sat_t.rho_f }` | `compressed_liquid_rho(self.eos.t, self.eos.p - self.eos.p_gas)` (one liquid-density model, Task 3 Step 4) |
+| `vessel.rs` | `step` vent `!self.eos.subcooled`; `h_liq`; `w_steam = if subcooled {0}` | steam-space cap, liquid cap and gas sweep, no regime match (Task 4) |
+| `vessel.rs` | `sat_for_core` | `sat_p(self.eos.p)` unconditionally (`p <= P_EOS_MAX` guarantees no table clamp) |
 | `sim.rs` | `step`: `compute_flows(if self.vessel.eos.subcooled { P_ATM } else { p }, ...)` | `compute_flows(p, ...)` |
-| `sim.rs` | `step`: `let steam_avail = !self.vessel.eos.subcooled;` | `let steam_avail = self.vessel.steam_available();` |
+| `sim.rs` | `step` (P3 Task 5 form): `let w_steam_available = if self.vessel.eos.subcooled { 0.0 } else { (self.vessel.mass * self.vessel.eos.x / dt).max(0.0) };` | `let w_steam_available = if self.vessel.steam_available() { (self.vessel.mass * self.vessel.eos.x / dt).max(0.0) } else { 0.0 };` (the finite vapour-inventory hint is retained; the IC `request`/`commit` and `ic_ratio` lines are untouched) |
 | `sim.rs` | `protection`: `isolated_at_power = ... && !self.vessel.eos.subcooled && ...` | `&& self.vessel.steam_available() &&` |
 | `sim.rs` | `active_alarms`: `if self.vessel.eos.solid` | `if self.vessel.eos.regime == Regime::WaterSolid` |
 | `sim.rs` | `active_alarms`: `if !self.msivs_open() && !self.vessel.eos.subcooled` | `&& self.vessel.steam_available()` |
 | `sim.rs` | `active_alarms`: `if !self.cond.available_for_bypass() && !self.vessel.eos.subcooled && p > 1.0e6` | `&& self.vessel.steam_available() && p > 1.0e6` |
 | `bop.rs` | none | (takes pressures only) |
-| Package 3 tests (`tests/numerics.rs`, `tests/conservation.rs`) | any `solve_eos(m, e)` | `solve_eos(m, e, 0.0, false)` |
+| Package 3 tests (`tests/numerics.rs`, `tests/conservation.rs`) | any `solve_eos(m, e)` | `solve_eos(m, e, 0.0, false)`; the P3 assertion `solve_eos(m, f64::NAN)` → `EosOutOfRange` becomes `PropertyOutOfRange { what: "energy" }` (master non-finite rule, Task 3 Step 3) |
+
+Before the Task 3 compile gate run `grep -rn "\.subcooled\|\.solid\b\|Eos {" crates/bwr-core/src crates/bwr-core/tests crates/bwr-core/examples` and resolve every hit against this table; the expected remaining hits are the `Eos {` literals written by this plan.
 
 ---
 
@@ -83,27 +90,43 @@ Status: Package 4 of the refinement program. Model owner file: `crates/bwr-core/
 
 | Quantity | Supported range | Outside the range |
 |---|---|---|
-| Water temperature `t` | 1 .. 349.5 degC (saturation table 1..350 degC, `steam::T_TABLE_MIN/MAX`) | `DomainError::EosOutOfRange` |
-| Total pressure `p` | 0.1 MPa (vented) .. 8.62 MPa design (`VESSEL_DESIGN_PRESSURE`); alarmed above design; water-solid pressure up to 2 x design | `DomainError::PropertyOutOfRange { what: "water-solid pressure" }` above 2 x design |
-| Noncondensable partial pressure | 0 .. 2 x design | `DomainError::PropertyOutOfRange { what: "gas partial pressure" }` |
-| Water inventory | from exhaustion (`DomainError::InventoryExhausted`, Package 3) to water-solid | — |
-| Static quality `x` | 0 .. 1 | clamped by volume (cannot leave) |
+| Water temperature `t` | 1 .. 349.5 degC (`vessel::T_EOS_MIN/MAX`; saturation table 1..350 degC, `steam::T_TABLE_MIN/MAX`) | `DomainError::EosOutOfRange` |
+| Total pressure `p` (every regime) | `p_sat(1 degC)` (sealed vacuum) .. `P_EOS_MAX` = 16.0 MPa, the numerical property limit: every `sat_p(p)` lookup below it is inside the table (no clamping; `P_EOS_MAX < p_sat(T_EOS_MAX)` is a unit test). The design-pressure alarm (`VESSEL_DESIGN_PRESSURE` 8.62 MPa, Sim alarm) is a separate, lower, operational limit | `DomainError::PropertyOutOfRange { what: "total pressure" }` |
+| Water-solid temperature | 1 .. `T_COMPRESSED_MAX` = 300 degC (linear-compressibility domain, section 4) | `DomainError::PropertyOutOfRange { what: "water-solid temperature" }` |
+| Free noncondensable gas with no gas space | none: a vessel holding free gas (`gas_mass > DISSOLVED_GAS_CAPACITY_KG`) cannot go water-solid | `DomainError::PropertyOutOfRange { what: "gas space volume" }` |
+| Water inventory | 0 kg (zero-water endpoint, section 2) .. water-solid; outflows are bounded to the inventory and the shortfall is `DomainError::InventoryExhausted` (Package 3) | — |
+| Static quality `x` | 0 .. 1 (saturation-only EOS). A state whose volume-derived quality exceeds 1 (less water than the saturated-vapour mass `V_VESSEL_FLUID * rho_g(t)`) is superheated vapour, which this EOS does not represent | `DomainError::EosOutOfRange` |
 | Water level | 0 .. `VESSEL_HEIGHT` (26.7 m); narrow-range display is relative to `Z_NWL` | — |
+| Arguments (`dt`, every `VesselInputs` field, every `solve_eos` argument) | finite; `dt > 0`; `mass >= 0`; `gas_mass >= 0` | `DomainError::PropertyOutOfRange { what: <argument name> }` (`mass < 0` is `EosOutOfRange`, as in Package 3) |
 
 The simulation keeps running after a `DomainError`; for the offending step the vessel
 rolls `mass`, `energy` and `gas_mass` back to their entry values and reports
 `BoundaryFlows::default()` (nothing applied), `Vessel.last_error` is set, and the Sim
 raises `MODEL ENVELOPE EXCEEDED`. When outflows must be bounded to the available
-inventory, `Vessel.exhausted` carries the deficit and the bounded flows are applied.
+inventory, `Vessel.exhausted` carries the deficit, the bounded flows are applied and
+committed (down to exactly zero water), and `InventoryExhausted` is reported in the
+same step (master: the allocation ratio differs from 1 only in a step that reports
+exhaustion).
 
 ## 2. State variables
 
 - `mass` kg of water (liquid + steam), `energy` J of water internal energy plus vessel
   metal sensible heat (`METAL_HEAT_CAP * t`), `gas_mass` kg of noncondensable gas (air,
-  `R_AIR = 287 J/kg/K`), `head_vent_open`.
+  `R_AIR = 287 J/kg/K`; total of free and dissolved gas), `head_vent_open`.
 - Derived each step by `solve_eos(mass, energy, gas_mass, head_vent_open)`: temperature `t`,
   steam partial pressure `p_steam = p_sat(t)`, gas partial pressure `p_gas`, total `p`,
   quality `x`, and `regime`.
+- Gas partition: gas up to `DISSOLVED_GAS_CAPACITY_KG` (1 kg, ASSUMED, A-040) is held in
+  solution and exerts no partial pressure; only the free gas `max(gas_mass -
+  DISSOLVED_GAS_CAPACITY_KG, 0)` contributes `p_gas` and is swept out through the steam
+  lines and the vent. Air solubility at 0.1 MPa is about 20 mg per kg of water, i.e. a
+  few kg for the full inventory, so 1 kg is the right order; it is a constant capacity,
+  not Henry's law. The partition makes `p_gas` continuous as the free gas vanishes.
+- Zero-water endpoint: `mass == 0` is a valid state (the bounded allocation can drain the
+  vessel to exactly zero). `t` is then the metal temperature `energy / METAL_HEAT_CAP`
+  (must lie in the EOS range), `p_steam = 0`, `p = p_gas`, `x = 1`, level 0, and the
+  regime label is `Vented` or `GasBlanketed`. It is a diagnostic state: nothing further
+  can be withdrawn, every request is reported as `InventoryExhausted`, and feed refills it.
 
 ## 3. Regimes
 
@@ -111,59 +134,93 @@ inventory, `Vessel.exhausted` carries the deficit and the bounded flows are appl
 |---|---|---|
 | `Vented` | head vent open | `p = p_sat(t) + p_gas`; vent flow drives `p -> P_ATM` (air ingress below, steam+gas egress above) |
 | `Saturated` | vent closed, steam space present, `p_gas <= p_sat(t)` | `p = p_sat(t) + p_gas` (p_gas is 0 after purging) |
-| `GasBlanketed` | vent closed, steam space present, `p_gas > p_sat(t)` | `p = p_sat(t) + p_gas`, with `p_gas = gas_mass * R_AIR * T_K / V_gas` |
-| `WaterSolid` | `mass * v_f(t) >= V_VESSEL_FLUID` | `p = p_sat(t) + (mass * v_f(t) - V) / (V * kappa_f(t))` (liquid compressibility) |
+| `GasBlanketed` | vent closed, steam space present, `p_gas > p_sat(t)` | `p = p_sat(t) + p_gas`, with `p_gas = free_gas * R_AIR * T_K / V_gas` |
+| `WaterSolid` | `mass * v_f(t) >= V_VESSEL_FLUID` and no free gas | `p = p_sat(t) + (mass * v_f(t) - V) / (V * kappa_f(t))` (liquid compressibility) |
 
 Regime is a label for display, alarms and tests only; no physical quantity or outflow
-depends on it (outflows are split by the steam-space composition, section 4, and
-`steam_available` depends on `p_steam` and the water-solid condition alone). `solve_eos`
-is a pure function; `Vessel::step` applies a hysteresis band of `REGIME_HYSTERESIS`
-(1.05) to the Saturated/GasBlanketed label so it cannot chatter when `p_gas ~ p_sat`.
-Pressure is continuous across every boundary: Vented/Saturated differ only by the vent
-flag; Saturated/GasBlanketed share `p = p_sat + p_gas`; at the water-solid boundary the
-compressibility term is zero. Only the pressure derivative is discontinuous at the
-water-solid boundary (tested by `regime_boundaries_are_continuous_and_cross_once`).
+depends on it (outflows are bounded by the steam-space and liquid inventories, section
+4, and `steam_available` depends on `p_steam` and the water-solid condition alone).
+`solve_eos` is a pure function; `Vessel::step` applies a hysteresis band of
+`REGIME_HYSTERESIS` (1.05) to the Saturated/GasBlanketed label so it cannot chatter
+when `p_gas ~ p_sat`. The Sim raises the `gas_blanket` warning when the label is
+`GasBlanketed` above `GAS_BLANKET_ALARM_T_C` (90 degC).
 
-A gas-blanketed vessel cannot be driven water-solid in the model: as the gas space
-vanishes `p_gas` rises without bound and `PropertyOutOfRange { what: "gas space volume"
-| "gas partial pressure" }` is raised before the water-solid branch is reached. Gas
-dissolution is not modelled (A-P4-1); only gas below `WATER_SOLID_GAS_TOLERANCE_KG`
-(1 kg) is treated as dissolved. A vessel below 100 degC with the vent closed and no gas
-sits at `p_sat(t)` below atmospheric (a sealed vessel draws vacuum); air in-leakage is
-not modelled (A-P4-8).
+Continuity claims, each with its test: Vented/Saturated differ only by the vent flag
+(`regime_boundaries_are_continuous_and_cross_once` (b)); Saturated/GasBlanketed share
+`p = p_sat + p_gas` ((a)); at the water-solid boundary with no free gas the
+compressibility term is zero, so pressure is continuous and only its derivative jumps
+((c)); with dissolved gas only (`gas_mass <= DISSOLVED_GAS_CAPACITY_KG`) the approach to
+and departure from water-solid are the same as with no gas, because the dissolved gas
+exerts no pressure on either side (`water_solid_boundary_with_dissolved_gas_is_continuous`,
+finite-step crossing in both directions). No continuity is claimed for free gas: a
+vessel holding free gas cannot be driven water-solid in the model; as the gas space
+vanishes `p_gas` rises and `PropertyOutOfRange { what: "total pressure" | "gas space
+volume" }` is raised before the water-solid branch is reached ((d)). Filling a cold,
+air-filled vessel solid is therefore outside the envelope (A-040) even with the vent
+open, because sweeping through the vent never removes the last of the free gas. A vessel
+below 100 degC with the vent closed and no free gas sits at `p_sat(t)` below
+atmospheric (a sealed vessel draws vacuum); air in-leakage is not modelled (A-047).
 
 ## 4. Equations
 
 - Energy: `E = mass * (u_f + x (u_g - u_f)) + METAL_HEAT_CAP * t`; the noncondensable gas
-  internal energy is neglected (A-P4-3).
-- Quality from volume: `x = (V/mass - v_f) / (v_g - v_f)` clamped to 0..1.
-- Liquid density: `rho = rho_f(t) * (1 + kappa_f(t) * (p - p_sat(t)))`
-  (`steam::compressed_liquid_rho`), used for level, downcomer density and the
-  downcomer transport lag.
+  internal energy is neglected (A-042).
+- Quality from volume: `x = (V/mass - v_f) / (v_g - v_f)`. `x < 0` is water-solid;
+  `x > 1` (at `mass > 0`) is superheated vapour and is rejected (`EosOutOfRange`), never
+  clamped. Volume closure `mass * ((1 - x) v_f + x v_g) == V` holds for every accepted
+  two-phase state (`eos_volume_closure`).
+- One liquid-density model: the liquid is evaluated at the water-only pressure
+  `p - p_gas`, i.e. `rho = compressed_liquid_rho(t, p - p_gas) = rho_f(t) * (1 +
+  kappa_f(t) * max(p - p_gas - p_sat(t), 0))`. In the two-phase regimes `p - p_gas =
+  p_sat(t)` and this is the saturated-liquid density used by the EOS volume closure,
+  the level inversion, the core and chimney column densities and the downcomer head and
+  transport lag, so equal-temperature non-boiling columns have zero buoyancy
+  (`isothermal_non_boiling_vessel_has_no_driving_head`). When water-solid (`p_gas = 0`)
+  it is the compressed density that defines the pressure, and the level closure
+  `mass / rho == V` holds (`eos_volume_closure`). The compression of the liquid by the
+  gas partial pressure is neglected everywhere; it is bounded by `kappa_f(t) * p_gas`,
+  below 0.1 % of liquid volume for `p_gas <= 0.5 MPa` and `t <= 300 degC`
+  (`gas_compression_of_liquid_is_negligible`, A-042). Linear compressibility is
+  supported for `t <= T_COMPRESSED_MAX` (300 degC) and `p - p_sat <= 10 MPa` with a
+  density error limit of 0.5 % against IAPWS-IF97 (`compressed_liquid_reference_grid`,
+  measured maxima in parameters.csv `KAPPA_F_TABLE` notes); near the critical point the
+  linear law fails (about 5 % at 349.5 degC), which is why water-solid states above
+  `T_COMPRESSED_MAX` are rejected.
+- Liquid enthalpy `h_liquid(t)` is the saturated-liquid enthalpy; for compressed liquid
+  the neglected term is `v_f (p - p_sat)`, about 8 % at 20 degC / 7 MPa, 0.9 % at
+  215 degC / 7 MPa (feedwater) and below 0.2 % above 285 degC (A-046,
+  `liquid_enthalpy_reference_grid`). The vessel energy balance and the ledger use the
+  same `h` values, so this is an accuracy bias, not a conservation error.
 - Boiling in the core is evaluated at the total vessel pressure `p` (`sat_for_core`),
   so a cold, air-filled vessel at 0.1 MPa does not boil until 100 degC. The downcomer
-  hydrostatic head on the core inlet pressure is neglected (A-P4-5).
-- Outflows from the steam space (steam lines and head vent) leave as steam and gas in
-  proportion to their masses in the steam space, `y_steam = m_steam / (m_steam + m_gas)`
-  with `m_steam = mass * x`; steam leaves at `h_g(p_steam)` and gas carries no energy
-  (A-P4-3). No more steam can leave in a step than the steam space holds
-  (`mass * x / dt`), so steam outflow goes to zero continuously as the vessel approaches
-  water-solid; the shortfall is an unmet request that the Sim allocation step scales
-  downstream (master step 9). Gas swept out through the steam lines is removed from
-  `gas_mass` (this is how trapped air is purged during heatup, A-P4-4). No liquid ever
-  leaves through the steam lines or the vent.
+  hydrostatic head on the core inlet pressure is neglected (A-044).
+- Steam-line contract (shared with the Sim, master step 8/9): `VesselInputs.w_steam` is
+  a request for STEAM (water) mass. The applied steam is the request bounded by the
+  steam-space inventory `mass * x / dt`; a binding cap is an inventory shortfall and is
+  reported as `InventoryExhausted` with the deficit. Free gas is swept out of the dome
+  along with the steam in the dome mass ratio `free_gas / m_steam` (bounded by the free
+  gas inventory), outside the water ledger and never counted against the steam request,
+  so composition never produces an allocation shortfall. Gas leaving through the steam
+  lines is removed from `gas_mass` (this is how trapped air is purged during heatup,
+  A-043); it is not modelled downstream (the condenser's own air model is untouched).
+  Steam leaves at `h_g(p_steam)` and gas carries no energy (A-042).
+- RWCU (`w_liquid_out`) is bounded by the liquid inventory `mass * (1 - x) / dt + w_feed`
+  and reported the same way; the vessel can therefore be drained to exactly zero liquid
+  and then, by steam withdrawal, to zero water (`final_drain_commits_bounded_flows`).
+  No liquid ever leaves through the steam lines or the vent.
 - Natural circulation head (section 6).
 
 ## 5. Head vent
 
 `w_vent = C_HEAD_VENT * (p - P_ATM) + VENT_BOILOFF_KGS_PER_K * max(t - 100, 0)` kg/s
-of steam-space fluid (steam + gas by composition) out when `p > P_ATM`; air ingress
-`C_HEAD_VENT * (P_ATM - p)` kg/s of gas (no energy) when `p < P_ATM`. Both coefficients
-are ASSUMED (parameters.csv). A water-solid vessel has no steam space and the vent
-passes nothing: water-solid pressure is bounded only by the envelope check (2 x design
-pressure, `PropertyOutOfRange`). This is a declared limitation (A-P4-2), not a plant
-claim. Vented gas is outside the water ledger; vented steam is recorded in
-`BoundaryFlows.w_vent` at `h_steam`.
+of steam-space fluid (steam and free gas in the dome mass ratio) out when `p > P_ATM`;
+air ingress `C_HEAD_VENT * (P_ATM - p)` kg/s of gas (no energy) when `p < P_ATM`. Both
+coefficients are ASSUMED (parameters.csv). The vent steam is bounded by the steam-space
+inventory like the line steam (a binding cap is reported). A water-solid vessel has no
+steam space and the vent passes nothing, neither steam nor liquid: water-solid pressure
+is bounded only by the envelope check (`P_EOS_MAX`, `PropertyOutOfRange`). This is a
+declared limitation (A-041), not a plant claim. Vented gas is outside the water ledger;
+vented steam is recorded in `BoundaryFlows.w_vent` at `h_steam`.
 
 ## 6. Natural circulation
 
@@ -179,9 +236,23 @@ loop_closed = clamp((level_z - Z_TAF) / LOOP_FADE_M, 0, 1)
 
 At or above the chimney top this is identical to the baseline formula. Below the chimney
 top the head falls with the submerged column heights. Below `Z_TAF + LOOP_FADE_M` the
-separated-liquid return path is lost and flow decays to `W_MIN` (A-P4-6).
-`k_fric` is calibrated once at rated conditions; flows at 30 %, 60 % and decay-heat
-conditions are reported, not calibrated (table filled in Task 8):
+separated-liquid return path is lost and flow decays to `W_MIN` (A-045).
+
+Rated reference and loss coefficient: `CORE_FLOW_RATED` was inherited from an ESBWR
+value scaled by thermal power, which the master forbids; Task 5b resolves its basis
+(status `derived` with an interval from a geometry-based loss estimate, or
+`unavailable` with the ESBWR-scaled origin recorded, never endorsed; result in
+parameters.csv and E-40). `k_fric` is calibrated once at that reference
+(`steady_points_balance_momentum` verifies the momentum balance closes at every
+tested point). Off-rated flows are reported, not calibrated, and are gated only by
+predeclared envelope checks (`flow_is_positive_and_rises_with_power`): finite and
+positive everywhere; decay-heat (single-phase) flow below the 30 % (boiling) flow,
+because void buoyancy exceeds liquid thermal expansion; and 30..100 % flows within
+0.5..1.5 x `CORE_FLOW_RATED`, a plausibility envelope declared before the run. No
+ordering of the 30/60/100 % flows is asserted: the shape of the natural-circulation
+power/flow curve (two-phase friction grows with power as fast as the void head) has no
+BWRX reference, and the measured curve, monotonic or not, is recorded below as a
+finding of the model, not a plant claim (table filled in Task 8):
 
 | Condition | Core flow kg/s | Core void | Chimney void |
 |---|---|---|---|
@@ -203,10 +274,17 @@ baseline use of the bulk saturation temperature for `MOD_TEMP_COEF`.
 
 | Behaviour | Test |
 |---|---|
-| Property reference points | `steam::tests::reference_points_iapws`, `compressibility_in_published_range` |
+| Property reference points (IF97 verification tables) | `steam::tests::reference_points_if97`, `compressibility_reference_20c`, `compressed_liquid_reference_grid`, `liquid_enthalpy_reference_grid` |
 | EOS round-trip in every regime | `vessel::tests::eos_roundtrip_all_regimes` |
+| EOS argument validation and finite outputs | `vessel::tests::solve_eos_rejects_invalid_arguments`, `eos_outputs_are_finite` |
+| Volume closure, vapour-domain exit, zero-water endpoint | `vessel::tests::eos_volume_closure`, `eos_rejects_superheated_vapour`, `eos_zero_water_endpoint` |
+| Total-pressure envelope without table clamping | `vessel::tests::total_pressure_envelope_has_no_hidden_clamp` |
 | EOS bisection monotonicity across the water-solid branch | `vessel::tests::state_energy_is_monotonic_in_temperature` |
-| Regime boundaries continuous, label changes once | `vessel_transients::regime_boundaries_are_continuous_and_cross_once` |
+| Neglected gas compression of the liquid is bounded | `steam::tests::gas_compression_of_liquid_is_negligible` |
+| Step argument validation leaves state unchanged | `vessel_transients::step_rejects_invalid_arguments_unchanged` |
+| Regime boundaries continuous, label changes once | `vessel_transients::regime_boundaries_are_continuous_and_cross_once`, `water_solid_boundary_with_dissolved_gas_is_continuous` |
+| Steam-space / liquid caps report exhaustion; downstream sees applied flows | `vessel_transients::steam_space_cap_binds_and_reports_deficit`, `final_drain_commits_bounded_flows`, `rwcu_cap_keeps_setpoint_and_feeds_condenser_applied_flow` |
+| Isothermal non-boiling columns have no buoyancy | `vessel_transients::isothermal_non_boiling_vessel_has_no_driving_head` |
 | Vented heatup purges air, ledger closes | `vessel_transients::vented_heatup_purges_air_and_closes_ledger` |
 | Cold vented vessel at atmospheric pressure | `vessel_transients::cold_vented_vessel_is_atmospheric` |
 | Heatup with trapped air | `vessel_transients::closed_vessel_heatup_transitions_gas_to_saturated` |
@@ -252,47 +330,117 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 Append inside the existing `mod tests`:
 
 ```rust
+    /// Verification values printed in the IF97 release itself (sources.csv
+    /// SRC-IAPWS-IF97: IAPWS R7-97(2012), Tables 35 and 36 for region 4, Table 5 for
+    /// region 1). They are the primary formulation's own check points, independent of
+    /// the CoolProp-generated table.
     #[test]
-    fn reference_points_iapws() {
-        // (p Pa, Tsat degC, v_f m3/kg, v_g m3/kg, h_f J/kg, h_g J/kg) from standard
-        // IAPWS-IF97 saturation tables (sources.csv: SRC-IAPWS-TABLES).
-        let pts = [
-            (100.0e3, 99.61, 0.001043, 1.6941, 417.51e3, 2675.0e3),
-            (1.0e6, 179.88, 0.001127, 0.19436, 762.51e3, 2777.1e3),
-            (7.0e6, 285.83, 0.001352, 0.027378, 1267.5e3, 2772.6e3),
-        ];
-        let rel = |a: f64, b: f64| ((a - b) / b).abs();
-        for (p, t, vf, vg, hf, hg) in pts {
+    fn reference_points_if97() {
+        // Table 36: T_sat(p) in K at 0.1, 1 and 10 MPa.
+        for (p, t_k) in [(0.1e6, 372.755919), (1.0e6, 453.035632), (10.0e6, 584.149488)] {
             let s = sat_p(p);
-            assert!((s.t - t).abs() < 0.3, "Tsat({p}) = {}", s.t);
-            assert!(rel(s.v_f(), vf) < 3e-3, "v_f({p}) = {}", s.v_f());
-            assert!(rel(s.v_g(), vg) < 3e-3, "v_g({p}) = {}", s.v_g());
-            assert!(rel(s.h_f, hf) < 3e-3, "h_f({p}) = {}", s.h_f);
-            assert!(rel(s.h_g, hg) < 3e-3, "h_g({p}) = {}", s.h_g);
+            assert!((s.t + 273.15 - t_k).abs() < 0.05, "Tsat({p}) = {} K vs {t_k}", s.t + 273.15);
+        }
+        // Table 35: p_sat(T) in Pa at 300, 500 and 600 K.
+        for (t_k, p) in [(300.0, 0.353658941e4), (500.0, 0.263889776e7), (600.0, 0.123443146e8)] {
+            let s = sat_t(t_k - 273.15);
+            assert!(((s.p - p) / p).abs() < 2e-3, "psat({t_k} K) = {} vs {p}", s.p);
+        }
+        // Table 5, region 1 (compressed liquid): (T K, p Pa, v m3/kg, h J/kg).
+        // Density is the direct check of compressed_liquid_rho; enthalpy pins the
+        // size of the saturated-liquid approximation (A-046), see
+        // liquid_enthalpy_reference_grid.
+        let rel = |a: f64, b: f64| ((a - b) / b).abs();
+        for (t_k, p, v, _h) in [
+            (300.0, 3.0e6, 0.100215168e-2, 0.115331273e6),
+            (300.0, 80.0e6, 0.971180894e-3, 0.184142828e6),
+            (500.0, 3.0e6, 0.120241800e-2, 0.975542239e6),
+        ] {
+            let t = t_k - 273.15;
+            let rho = compressed_liquid_rho(t, p);
+            // 80 MPa is far outside the supported 10 MPa domain: only the two in-domain
+            // points carry the 0.5 % limit; the 80 MPa point documents the linear law's
+            // drift (predeclared 2 %).
+            let lim = if p > 10.0e6 { 2e-2 } else { 5e-3 };
+            assert!(rel(rho, 1.0 / v) < lim, "rho({t} degC, {p} Pa) = {rho} vs {}", 1.0 / v);
         }
     }
 
+    /// Isothermal compressibility of liquid water at 20 degC, 4.589e-10 1/Pa
+    /// (sources.csv SRC-KELL-1975, Table at 20 degC: 45.89e-6 1/bar). Independent of
+    /// the generator; the table value is a finite difference of IF97 region 1.
     #[test]
-    fn compressibility_in_published_range() {
-        // Isothermal compressibility of liquid water: ~4.59e-10 1/Pa at 20 degC;
-        // rises to the 1e-9 range near 300 degC. Executor: after regenerating the
-        // table, print sat_t(300.0).kappa_f and tighten the 300 degC bounds to +/-10 %
-        // of the CoolProp value in this test and in parameters.csv.
+    fn compressibility_reference_20c() {
         let k20 = sat_t(20.0).kappa_f;
-        assert!(k20 > 4.4e-10 && k20 < 4.7e-10, "kappa_f(20) = {k20}");
+        assert!(((k20 - 4.589e-10) / 4.589e-10).abs() < 2e-2, "kappa_f(20) = {k20}");
+        // Sanity band only (no independent 300 degC reference is cited): the
+        // compressibility grows toward the critical point.
         let k300 = sat_t(300.0).kappa_f;
-        assert!(k300 > 1.5e-9 && k300 < 3.5e-9, "kappa_f(300) = {k300}");
-        let ratio = compressed_liquid_rho(20.0, 7.0e6) / rho_liquid(20.0);
-        assert!(ratio > 1.0030 && ratio < 1.0034, "7 MPa compression at 20 degC = {ratio}");
+        assert!(k300 > 1.0e-9 && k300 < 4.0e-9, "kappa_f(300) = {k300}");
         // At or below saturation pressure the correction is zero.
         assert_eq!(compressed_liquid_rho(150.0, 0.1e6), rho_liquid(150.0));
+    }
+
+    /// Reference grid for the linear-compressibility density over the supported
+    /// domain (t <= T_COMPRESSED_MAX, p - p_sat <= 10 MPa) plus the envelope corner
+    /// P_EOS_MAX. Reference densities are IAPWS-IF97 via CoolProp, written by
+    /// `python3 tools/gen_steam_table.py --grid` (a reproducible command, SRC-COOLPROP;
+    /// the model under test is the linear law, not the table). Error limit 0.5 %,
+    /// declared before the grid was generated. The executor pastes the printed rows
+    /// into GRID verbatim and records the measured maximum in parameters.csv.
+    #[test]
+    fn compressed_liquid_reference_grid() {
+        // (t degC, p Pa, rho_ref kg/m3) rows from `gen_steam_table.py --grid`.
+        const GRID: &[(f64, f64, f64)] = &[
+            // <paste rows: t in {20, 100, 200, 250, 300}; p in {p_sat+1e6, p_sat+5e6, p_sat+10e6, 16.0e6}>
+        ];
+        assert!(GRID.len() >= 20, "grid not pasted");
+        let mut worst = 0.0f64;
+        for &(t, p, rho_ref) in GRID {
+            let e = ((compressed_liquid_rho(t, p) - rho_ref) / rho_ref).abs();
+            worst = worst.max(e);
+            assert!(e < 5e-3, "rho({t}, {p}) error {e:.3e}");
+        }
+        println!("compressed_liquid_rho max error over the supported grid: {worst:.3e}");
+    }
+
+    /// The saturated-liquid enthalpy approximation for compressed liquid (A-046):
+    /// the neglected term is v_f (p - p_sat), so the error is bounded by
+    /// 1.5 * v_f * (p - p_sat) / h_f, declared from that identity before the run.
+    /// Reference enthalpies are IF97 (same `--grid` command, column 4).
+    #[test]
+    fn liquid_enthalpy_reference_grid() {
+        // (t degC, p Pa, h_ref J/kg) at p = 7.2e6 for t in {20, 100, 215, 285}.
+        const GRID: &[(f64, f64, f64)] = &[
+            // <paste rows from `gen_steam_table.py --grid` (enthalpy section)>
+        ];
+        assert!(GRID.len() >= 4, "grid not pasted");
+        for &(t, p, h_ref) in GRID {
+            let s = sat_t(t);
+            let bound = 1.5 * s.v_f() * (p - s.p).max(0.0) / s.h_f;
+            let e = ((h_liquid(t) - h_ref) / h_ref).abs();
+            assert!(e < bound.max(1e-3), "h_liquid({t}) at {p} Pa: error {e:.3e} vs bound {bound:.3e}");
+            println!("h_liquid({t}) at {p} Pa: error {e:.3e} (bound {bound:.3e})");
+        }
+    }
+
+    /// Bound on the compression neglected in the two-phase volume closure (A-042):
+    /// kappa_f(t) * p_gas below 1e-3 for p_gas <= 0.5 MPa and t <= 300 degC.
+    #[test]
+    fn gas_compression_of_liquid_is_negligible() {
+        let mut t = T_TABLE_MIN;
+        while t <= 300.0 {
+            let k = sat_t(t).kappa_f;
+            assert!(k * 0.5e6 < 1e-3, "kappa_f({t}) * 0.5 MPa = {}", k * 0.5e6);
+            t += 1.0;
+        }
     }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test --release -p bwr-core steam::tests -- --nocapture`
-Expected: compile error `no field kappa_f on type Sat` and `cannot find function compressed_liquid_rho`.
+Run: `cargo test --release -p bwr-core steam::tests > /tmp/p4t2.log 2>&1; echo "exit=$?"; grep -n "error\[" /tmp/p4t2.log`
+Expected: nonzero exit; compile errors `no field kappa_f on type Sat`, `cannot find function compressed_liquid_rho`, `cannot find value T_TABLE_MIN`.
 
 - [ ] **Step 3: Update the generator script**
 
@@ -302,45 +450,85 @@ Replace the whole of `tools/gen_steam_table.py` with:
 """Generate the saturated-water table embedded in bwr-core (IAPWS-IF97 via CoolProp).
 
 Run: python3 tools/gen_steam_table.py > crates/bwr-core/src/steam_table.rs
+     python3 tools/gen_steam_table.py --grid     # reference grids for steam.rs tests
+     python3 tools/gen_steam_table.py --kappa 20 300   # kappa_f diagnostics at given degC
 
 Columns: T [degC], p_sat [Pa], rho_f [kg/m3], rho_g [kg/m3], h_f [J/kg], h_g [J/kg],
 kappa_f [1/Pa]. kappa_f is the isothermal compressibility of the saturated liquid,
 (1/rho) d(rho)/dp, from a finite difference of IF97 liquid density evaluated 0.1 MPa
 and 0.3 MPa above saturation (both points lie in IF97 region 1 up to 350 degC).
 """
+import sys
+
 import CoolProp.CoolProp as CP
 
 F = "IF97::Water"
-rows = []
-T = 1.0
-while T <= 350.0 + 1e-9:
-    Tk = T + 273.15
-    p = CP.PropsSI("P", "T", Tk, "Q", 0, F)
-    rf = CP.PropsSI("D", "T", Tk, "Q", 0, F)
-    rg = CP.PropsSI("D", "T", Tk, "Q", 1, F)
-    hf = CP.PropsSI("H", "T", Tk, "Q", 0, F)
-    hg = CP.PropsSI("H", "T", Tk, "Q", 1, F)
+
+
+def kappa(Tk, p):
     p1, p2 = p + 1.0e5, p + 3.0e5
     r1 = CP.PropsSI("D", "T", Tk, "P", p1, F)
     r2 = CP.PropsSI("D", "T", Tk, "P", p2, F)
-    kf = (r2 - r1) / (r1 * (p2 - p1))
-    rows.append((T, p, rf, rg, hf, hg, kf))
-    T += 1.0
+    return (r2 - r1) / (r1 * (p2 - p1))
 
-print("// Generated by tools/gen_steam_table.py from IAPWS-IF97 (CoolProp). Do not edit by hand.")
-print("// Columns: T [degC], p_sat [Pa], rho_f [kg/m3], rho_g [kg/m3], h_f [J/kg], h_g [J/kg], kappa_f [1/Pa]")
-print(f"pub const SAT_TABLE: [[f64; 7]; {len(rows)}] = [")
-for r in rows:
-    print("    [" + ", ".join(f"{v:.6e}" for v in r) + "],")
-print("];")
+
+def table():
+    rows = []
+    T = 1.0
+    while T <= 350.0 + 1e-9:
+        Tk = T + 273.15
+        p = CP.PropsSI("P", "T", Tk, "Q", 0, F)
+        rf = CP.PropsSI("D", "T", Tk, "Q", 0, F)
+        rg = CP.PropsSI("D", "T", Tk, "Q", 1, F)
+        hf = CP.PropsSI("H", "T", Tk, "Q", 0, F)
+        hg = CP.PropsSI("H", "T", Tk, "Q", 1, F)
+        rows.append((T, p, rf, rg, hf, hg, kappa(Tk, p)))
+        T += 1.0
+    print("// Generated by tools/gen_steam_table.py from IAPWS-IF97 (CoolProp). Do not edit by hand.")
+    print("// Columns: T [degC], p_sat [Pa], rho_f [kg/m3], rho_g [kg/m3], h_f [J/kg], h_g [J/kg], kappa_f [1/Pa]")
+    print(f"pub const SAT_TABLE: [[f64; 7]; {len(rows)}] = [")
+    for r in rows:
+        print("    [" + ", ".join(f"{v:.6e}" for v in r) + "],")
+    print("];")
+
+
+def grid():
+    """Reference rows for steam.rs compressed_liquid_reference_grid / liquid_enthalpy_reference_grid."""
+    print("// density grid: (t degC, p Pa, rho kg/m3)")
+    for T in (20.0, 100.0, 200.0, 250.0, 300.0):
+        Tk = T + 273.15
+        ps = CP.PropsSI("P", "T", Tk, "Q", 0, F)
+        for p in (ps + 1.0e6, ps + 5.0e6, ps + 10.0e6, 16.0e6):
+            if p <= ps:
+                continue
+            print(f"            ({T:.1f}, {p:.6e}, {CP.PropsSI('D', 'T', Tk, 'P', p, F):.6e}),")
+    print("// enthalpy grid: (t degC, p Pa, h J/kg)")
+    for T in (20.0, 100.0, 215.0, 285.0):
+        Tk = T + 273.15
+        print(f"            ({T:.1f}, 7.200000e+06, {CP.PropsSI('H', 'T', Tk, 'P', 7.2e6, F):.6e}),")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--grid":
+        grid()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--kappa":
+        for T in map(float, sys.argv[2:]):
+            Tk = T + 273.15
+            print(f"kappa_f({T:g} degC) = {kappa(Tk, CP.PropsSI('P', 'T', Tk, 'Q', 0, F)):.6e} 1/Pa")
+    else:
+        table()
 ```
 
-- [ ] **Step 4: Regenerate the table**
+- [ ] **Step 4: Regenerate the table and the reference grids**
 
 Run: `python3 -c "import CoolProp; print(CoolProp.__version__)"` (if this fails: `pip3 install CoolProp`, which is a tool-side Python package already required by the baseline script, not a new project dependency).
 Run: `python3 tools/gen_steam_table.py > crates/bwr-core/src/steam_table.rs`
 Run: `head -4 crates/bwr-core/src/steam_table.rs && grep -c '^\s*\[' crates/bwr-core/src/steam_table.rs`
 Expected: header mentions `kappa_f`, type `[[f64; 7]; 350]`, 350 rows. Record the CoolProp version in `docs/model/sources.csv` (Step 7).
+Run: `python3 tools/gen_steam_table.py --grid > /tmp/p4grid.txt && cat /tmp/p4grid.txt`
+Paste the density rows into `compressed_liquid_reference_grid::GRID` and the enthalpy rows into `liquid_enthalpy_reference_grid::GRID` verbatim (Step 1). The grid is reference data for the linear law, generated once and committed with the tests; the limits (0.5 %, `1.5 v_f dp / h_f`) were declared in Step 1 before this command ran and are not changed if a point fails: a failing point narrows the supported domain (`T_COMPRESSED_MAX`, the 10 MPa bound) in Step 5 and in `docs/model/vessel.md`, recorded in the commit body.
+Run: `python3 tools/gen_steam_table.py --kappa 20 300`
+Expected: two lines; the 20 degC value is the diagnostic recorded in `KAPPA_F_TABLE` notes (Step 7). It is a generator diagnostic, not evidence; the evidence for `kappa_f` is `compressibility_reference_20c` (Kell 1975) and `reference_points_if97` (IF97 Table 5 densities).
 
 - [ ] **Step 5: Update `steam.rs`**
 
@@ -396,10 +584,18 @@ fn lerp(a: Sat, b: Sat, f: f64) -> Sat {
 Append after `rho_liquid`:
 
 ```rust
-/// Density of compressed liquid water at `t` (degC) and total pressure `p` (Pa):
-/// rho_f(t) * (1 + kappa_f(t) * (p - p_sat(t))). Linear in pressure, which is
-/// accurate to better than 0.1 % up to 10 MPa above saturation. At or below the
-/// saturation pressure the saturated-liquid density is returned.
+/// Upper temperature of the supported linear-compressibility domain, degC. Above it
+/// kappa_f grows too fast toward the critical point for the linear law (about 5 %
+/// density error at 349.5 degC); the water-solid EOS branch rejects hotter states.
+pub const T_COMPRESSED_MAX: f64 = 300.0;
+
+/// Density of compressed liquid water at `t` (degC) and liquid pressure `p` (Pa):
+/// rho_f(t) * (1 + kappa_f(t) * (p - p_sat(t))). Linear in pressure. Supported
+/// domain: t <= T_COMPRESSED_MAX and p - p_sat(t) <= 10 MPa, where the density error
+/// against IAPWS-IF97 is below 0.5 % (`compressed_liquid_reference_grid`; measured
+/// maximum in parameters.csv KAPPA_F_TABLE). Outside that domain the law is still
+/// evaluated (continuity) but is not an accuracy claim. At or below the saturation
+/// pressure the saturated-liquid density is returned.
 pub fn compressed_liquid_rho(t: f64, p: f64) -> f64 {
     let s = sat_t(t);
     s.rho_f * (1.0 + s.kappa_f * (p - s.p).max(0.0))
@@ -408,23 +604,32 @@ pub fn compressed_liquid_rho(t: f64, p: f64) -> f64 {
 
 - [ ] **Step 6: Run the tests**
 
-Run: `cargo test --release -p bwr-core steam::tests -- --nocapture`
-Expected: `known_points`, `reference_points_iapws`, `compressibility_in_published_range` all `ok`. Then run `cargo test --release -p bwr-core` to confirm nothing else broke (the extra column is only read through `row()`).
+Run: `cargo test --release -p bwr-core steam::tests -- --nocapture > /tmp/p4t2.log 2>&1; echo "exit=$?"; grep -n "test result\|max error\|h_liquid(" /tmp/p4t2.log`
+Expected: `exit=0`; `known_points`, `reference_points_if97`, `compressibility_reference_20c`, `compressed_liquid_reference_grid`, `liquid_enthalpy_reference_grid`, `gas_compression_of_liquid_is_negligible` all `ok`; the printed maximum density error and the four enthalpy errors are the measured maxima recorded in Step 7. Then run `cargo test --release -p bwr-core` (exit 0) to confirm nothing else broke (the extra column is only read through `row()`).
 
 - [ ] **Step 7: Register rows**
 
-Append to `docs/model/sources.csv` (use the column order of the Package 1 header) a row with id `SRC-IAPWS-TABLES`, title "Saturated water and steam tables (IAPWS-IF97 values as tabulated in standard thermodynamics texts)", revision "IF97 (2007)", jurisdiction "n/a", document kind "accepted methodology", retrieval date today, and in notes the three reference points used in `reference_points_iapws`. Update the existing CoolProp/IAPWS row (or add `SRC-COOLPROP`) with the CoolProp version printed in Step 4.
-
-Append to `docs/model/parameters.csv` (locked header `id,value,unit,definition,reference_state,source_design,status,source_ids,interval_lo,interval_hi,assumption_id,location,notes`), filling `<k20>` with the value printed by `compressibility_in_published_range`:
+Retrieve the IF97 release and compute its checksum: `curl -sSL -o /tmp/IF97-Rev.pdf http://www.iapws.org/relguide/IF97-Rev.pdf && shasum -a 256 /tmp/IF97-Rev.pdf`. Append to `docs/model/sources.csv` (header `id,document_id,title,revision,date,jurisdiction,url,section,retrieval_date,sha256,kind,notes`):
 
 ```csv
-KAPPA_F_TABLE,table,1/Pa,isothermal compressibility of saturated liquid (SAT_TABLE column 7),saturation line 1..350 degC,water property,confirmed,SRC-IAPWS-TABLES;SRC-COOLPROP,,,,crates/bwr-core/src/steam_table.rs,finite difference of IF97 region-1 density 0.1-0.3 MPa above saturation; 20 degC value <k20>
-T_TABLE_MIN,1.0,degC,first saturation-table temperature,,water property,confirmed,SRC-IAPWS-TABLES,,,,crates/bwr-core/src/steam.rs,
-T_TABLE_MAX,350.0,degC,last saturation-table temperature,,water property,confirmed,SRC-IAPWS-TABLES,,,,crates/bwr-core/src/steam.rs,
+SRC-IAPWS-IF97,IAPWS-R7-97(2012),Revised Release on the IAPWS Industrial Formulation 1997 for the Thermodynamic Properties of Water and Steam,R7-97(2012),2012,-,http://www.iapws.org/relguide/IF97-Rev.pdf,Table 5 (region 1 verification: T=300 K p=3 MPa and 80 MPa; T=500 K p=3 MPa); Table 35 (p_sat at 300/500/600 K); Table 36 (T_sat at 0.1/1/10 MPa),<today>,<sha256 from shasum>,standard,primary formulation; its printed verification values are the independent reference points in steam::tests::reference_points_if97
+SRC-KELL-1975,KELL-1975,Density Thermal Expansivity and Compressibility of Liquid Water from 0 to 150 degC (G. S. Kell; J. Chem. Eng. Data 20 pp. 97-105),1975,1975,-,https://doi.org/10.1021/je60064a005,Table of isothermal compressibility at 1 atm: 45.89e-6 1/bar at 20 degC,<today>,none,journal,print reference for steam::tests::compressibility_reference_20c; value transcribed from the table
+SRC-COOLPROP,COOLPROP,CoolProp IF97 backend used by tools/gen_steam_table.py,<version printed in Step 4>,<today>,-,https://github.com/CoolProp/CoolProp,IF97::Water backend,<today>,none,software,generator of SAT_TABLE and of the reference grids in steam::tests; not an independent reference for the table itself
+```
+
+If `curl` cannot reach the IF97 URL, set `sha256` to `none` and `kind` to `standard`, and write `retrieval failed <date>; verification values transcribed from the R7-97(2012) print` in notes: the register test accepts `none`, and the row is honest about what was retrieved. If a `SRC-COOLPROP`-like row already exists from Package 1, update it instead of adding one.
+
+Append to `docs/model/parameters.csv` (locked header `id,value,unit,definition,reference_state,source_design,status,source_ids,interval_lo,interval_hi,assumption_id,location,notes`), filling `<k20>` from the `--kappa` diagnostic (Step 4), `<rho_max>` from the `compressed_liquid_reference_grid` print and `<h_errs>` from the `liquid_enthalpy_reference_grid` prints (Step 6):
+
+```csv
+KAPPA_F_TABLE,table,1/Pa,isothermal compressibility of saturated liquid (SAT_TABLE column 7),saturation line 1..350 degC,physics,confirmed,SRC-IAPWS-IF97;SRC-KELL-1975;SRC-COOLPROP,none,none,,crates/bwr-core/src/steam_table.rs,finite difference of IF97 region-1 density 0.1-0.3 MPa above saturation; generator diagnostic kappa_f(20 degC) = <k20>; linear law max density error over the supported grid (t <= 300 degC; dp <= 10 MPa; 16 MPa corner) = <rho_max>; h_liquid errors at 7.2 MPa: <h_errs>
+T_TABLE_MIN,1.0,degC,first saturation-table temperature,-,physics,confirmed,SRC-IAPWS-IF97,none,none,,crates/bwr-core/src/steam.rs,
+T_TABLE_MAX,350.0,degC,last saturation-table temperature,-,physics,confirmed,SRC-IAPWS-IF97,none,none,,crates/bwr-core/src/steam.rs,
+T_COMPRESSED_MAX,300.0,degC,upper temperature of the supported linear-compressibility domain,-,numerical,derived,SRC-IAPWS-IF97;SRC-COOLPROP,none,none,,crates/bwr-core/src/steam.rs,chosen so the linear law stays within 0.5 % of IF97 density up to 10 MPa above saturation; about 5 % at 349.5 degC
 ```
 
 Run: `cargo test --release -p bwr-core --test register`
-Expected: pass (every constant has a row).
+Expected: exit 0 (every constant has a row; every source id exists; no `UNRETRIEVED` field).
 
 - [ ] **Step 8: Commit**
 

@@ -30,11 +30,13 @@ Inherited verbatim from the master's Global Constraints section. Package-specifi
 | File | Action | Responsibility |
 |---|---|---|
 | `docs/model/core.md` | Create | Core model specification: geometry, conventions, mechanisms, envelope, uncertainty |
-| `docs/model/decay-heat-reference.csv` | Create | Transcribed public decay-heat table (`t_s,p_over_p0,source`) |
-| `docs/model/parameters.csv` | Modify | Rows for every constant touched here |
-| `docs/model/assumptions.md` | Modify | A-050 .. A-058 |
-| `docs/model/esbwr-applicability.csv` | Modify | Rows for DCD Ch. 4.3, 4.6, 15 borrowings |
-| `tools/fit_decay_heat.py` | Rewrite | Fit `DECAY_GROUPS` to the reference CSV; fail if error > 5 % |
+| `docs/model/decay-heat-reference.csv` | Create (only if the reference is retrieved, Task 6) | Transcribed public decay-heat table (`t_s,p_over_p0,source_id,table,page`); immutable after transcription check |
+| `docs/validation/findings.md` | Modify (P3 creates) | F-nnn entries: decay-heat reference retrieval outcome; fit-gate outcome; SDM pair criterion |
+| `docs/validation/reports/<date>-pkg05.md` | Create | Complete compare-mode output and metric classification before baseline regeneration (master protocol) |
+| `docs/model/parameters.csv` | Modify | Rows for every constant touched here, each in the task that touches the constant |
+| `docs/model/assumptions.md` | Modify | Table rows A-050 .. A-053 (P1 schema); A-001, A-003, A-004, A-005 are reused, not duplicated |
+| `docs/model/esbwr-applicability.csv` | Modify | E-01 closed from `pending`; new rows for DCD Ch. 4.6 and Ch. 15 borrowings |
+| `tools/fit_decay_heat.py` | Rewrite | Fit `DECAY_GROUPS` to the reference CSV; report residuals; exit 1 above `--max-rel-err` |
 | `crates/bwr-core/src/params.rs` | Modify | New constants; remove `FUEL_RESISTANCE` |
 | `crates/bwr-core/src/reactor.rs` | Modify | `RodMotion`, `Rods` restructure, `ReactivityCoeffs`, `clad_t`, two-node update, `after_history`, SDM |
 | `crates/bwr-core/src/sim.rs` | Modify | Call-site migration, stuck-fault mirroring, envelope detection, `full_power_with`, alarms |
@@ -44,7 +46,9 @@ Inherited verbatim from the master's Global Constraints section. Package-specifi
 | `ui/src/sim/types.ts`, `ui/src/sim/mock.ts` | Modify | Contract mirror |
 | `README.md` | Modify | Decay-heat and core-damage wording |
 
-Names from the master (r2) that this package owns: `RodMotion { Idle, Motor { target }, Scram, Sri, MotorRunIn }`, `Rods { motion, stuck }` and its method set, `ReactivityCoeffs { void, doppler, mod_t, xenon_worth }`, `Core { clad_t, coeffs }`, `DecayHeat::after_history`, `Sim::full_power_with`, `GAP_RESISTANCE_K_PER_W`, `CLAD_COOLANT_RESISTANCE_K_PER_W`, `CLAD_HEAT_CAP_J_PER_K`, `FUEL_MODEL_T_MAX_C`, `UNCOVERED_ENVELOPE_S`, `IRRADIATION_HISTORY_S`. Names introduced beyond the master: `Sim::uncovered_s`, `Sim::fuel_envelope_exceeded()`, `Sim::vessel_force_uncovered_for_test()` (test hook), `examples/sensitivity.rs`.
+Names from the master (r2) that this package owns: `RodMotion { Idle, Motor { target }, Scram, Sri, MotorRunIn }`, `Rods { motion, stuck }` and its method set, `ReactivityCoeffs { void, doppler, mod_t, xenon_worth }`, `Core { clad_t, coeffs }`, `DecayHeat::after_history`, `Sim::full_power_with`, `GAP_RESISTANCE_K_PER_W`, `CLAD_COOLANT_RESISTANCE_K_PER_W`, `CLAD_HEAT_CAP_J_PER_K`, `FUEL_MODEL_T_MAX_C`, `UNCOVERED_ENVELOPE_S`, `IRRADIATION_HISTORY_S`. Names introduced beyond the master: `Rods::last_error` (the master dt rule's `last_error` field for the void-returning `Rods::step`; forwarded into `Core.last_error` by `Core::step_rods` and drained by `Sim::step` at step 17), `Rods::refresh_stuck(&[bool])`, `Sim::uncovered_s`, `Sim::clad_t_step_max`, `Sim::fuel_envelope_exceeded()`, `CORE_COVERED_FRAC`, `Q_FUEL_RATED`, `DECAY_FIT_MAX_REL_ERR` (Task 6, retrieved branch only), `examples/sensitivity.rs`. No production-only test hooks are added; tests build low-inventory states through `Vessel::new`.
+
+Two semantics this plan fixes that the master leaves open (listed again under "Master amendments" at the end): `Rods::scram_hydraulic` and `Rods::motor_run_in` command only rods with `pos > 0.0` (a rod already at 0 stays `Idle`, so a latched scram can be re-asserted every step without `scramming()` sticking true), and a rod that becomes stuck while any mechanism owns it is parked `Idle` by `refresh_stuck` (its outstanding command is dropped; TGT = POS).
 
 Derives (master Derives rule): `RodMotion` derives `Clone, Copy, Debug, PartialEq`; `ReactivityCoeffs` derives `Clone, Copy, Debug` (plus a manual `Default`); `Rods` and `Core` keep `Clone, Debug`.
 
@@ -76,10 +80,10 @@ a specific inadequacy).
 | Thermal power | 870 MWt | confirmed | GE 005N9751 (sources.csv) |
 | Fuel bundles | 240 GNF2 | confirmed | GE 005N9751 |
 | Control rods | 57, bottom entry, fine-motion drives (FMCRD) | confirmed | GE 005N9751 |
-| Active fuel length | 3.81 m | assumed | typical GNF2; A-050 |
-| Rod position convention | 0 = full in, 48 = full out, 2 positions per notch | assumed | legacy BWR convention; A-051 |
-| Rod radial layout | 57 cells within radius sqrt(17) on a 9x9 grid | assumed | A-052; not the plant map |
-| Rod relative worth | J0(2.405 r/R)^2 radial weighting, cosine-integral axial S-curve | assumed | A-052 |
+| Active fuel length | 3.81 m | assumed | typical GNF2; A-001 |
+| Rod position convention | 0 = full in, 48 = full out, 2 positions per notch | assumed | legacy BWR convention; A-001 |
+| Rod radial layout | 57 cells within radius sqrt(17) on a 9x9 grid | assumed | A-001; not the plant map |
+| Rod relative worth | J0(2.405 r/R)^2 radial weighting, cosine-integral axial S-curve | assumed | A-003 |
 
 ## 2. Rod motion mechanisms
 
@@ -87,8 +91,8 @@ Rod motion is a per-rod `RodMotion` state (reactor.rs):
 
 | Mechanism | State | Speed | Initiated by |
 |---|---|---|---|
-| Normal motor drive | `Motor { target }` | `ROD_SPEED` = 0.4 positions/s (assumed, A-053) | operator `RodSetTarget` |
-| Hydraulic scram | `Scram` | `ROD_FULL_OUT / SCRAM_TIME` = 48 / 3 s (assumed, A-053) | RPS scram (`Sim::scram`) |
+| Normal motor drive | `Motor { target }` | `ROD_SPEED` = 0.4 positions/s (assumed, A-001) | operator `RodSetTarget` |
+| Hydraulic scram | `Scram` | `ROD_FULL_OUT / SCRAM_TIME` = 48 / 3 s (assumed, A-001) | RPS scram (`Sim::scram`) |
 | Select Rod Insert | `Sri` | same hydraulic speed, SRI group only | turbine trip / load rejection at power |
 | Motor run-in (FMCRD electric backup) | `MotorRunIn` | `ROD_SPEED` toward 0 | every scram, in parallel with hydraulic |
 | Stuck rod | `stuck[i] = true` | none | `Fault::RodStuck { index }` only |
@@ -110,12 +114,33 @@ reuses the same two rod methods.
 FMCRD dual insertion (hydraulic plus electric run-in on the same drive) is a
 shared concept with ESBWR (DCD Rev. 10 Tier 2 Ch. 4.6, see
 esbwr-applicability.csv). BWRX-specific stroke times are not public; the
-values above are assumptions with the stated sensitivity (A-053).
+values above are assumptions with the stated sensitivity (A-001).
 
 Scram reset requires every `Scram` and `MotorRunIn` rod to be at position 0.
-A stuck rod is never commanded (it stays `Idle`), so it does not by itself
-block reset; it remains out, and the operator sees TGT = POS = its stuck
-position while the fault is active.
+
+**Stuck-rod policy** (`Fault::RodStuck`, mirrored into `rods.stuck` at step 2 of
+the plant step, after the rods have moved at step 1):
+
+| Fault arrives while | Result at the refresh | TGT shown |
+|---|---|---|
+| `Idle` | stays `Idle` | POS |
+| `Motor { target }` | parked `Idle`; the motor command is dropped | POS |
+| `Scram`, `Sri` or `MotorRunIn` | parked `Idle`; the insertion command is dropped for that rod, so `scramming()` and the reset rule ignore it | POS |
+
+A stuck rod is never commanded: `set_motor_target`, `scram_hydraulic`,
+`select_rod_insert` and `motor_run_in` skip rods whose `stuck` flag is set.
+A command issued at the same boundary as the fault (before the next step's
+refresh) is accepted and moves the rod once; the refresh then parks it.
+
+When the fault clears, the rod stays `Idle` at its position; nothing is
+replayed automatically. The one exception is the latched RPS demand: while
+`Sim.scrammed` is true, the plant step re-asserts `scram_hydraulic()` and
+`motor_run_in()` after the refresh, so a freed rod resumes hydraulic insertion
+from the next step. (Both methods command only rods with `pos > 0`, so rods
+already in stay `Idle` and `scramming()` clears when insertion completes.)
+An SRI demand is not latched and is not replayed. Scram reset is therefore
+never blocked by a stuck rod: it remains out, and the operator sees
+TGT = POS = its stuck position while the fault is active.
 
 ## 3. Reactivity
 
@@ -148,45 +173,85 @@ listed. Cold, xenon-free conditions mean fuel 20 degC, void 0, moderator
 20 degC, xenon 0, for which `rho_other = 0`.
 
 The plant SDM requirement is a sourced value from NEDO-33912-A Rev. 2
-(reactivity control). It is recorded in parameters.csv as `SDM_REQUIRED`
+(reactivity control, S-08). It is recorded in parameters.csv as `SDM_REQUIRED`
 with status `confirmed` only if the public document states the number;
-otherwise the row has status `unavailable` and the tests assert SDM > 0 only.
-Reported values (all-rods-in, strongest-rod-out, strongest-pair-out) are
-evidence of the calibrated model, not plant performance.
+otherwise the row has status `unavailable` (interval none/none: a margin
+requirement has no defensible interval) and the tests assert SDM > 0 only.
+
+**Applicability of the threshold.** A BWR shutdown-margin requirement governs
+the cold, xenon-free core with the highest-worth control rod fully withdrawn
+(the standard technical-specification definition). `SDM_REQUIRED`, when
+confirmed, is therefore applied by the tests to the strongest-rod-out case
+only. The all-rods-in value and any two-rod value are reported with a
+positivity check, not against the threshold.
+
+**Paired-rod case.** Which rods form a drive pair (shared hydraulic control
+unit or shared scram path) in the BWRX-300 FMCRD arrangement is not public, so
+the "applicable paired-rod unavailable" plant case is recorded as
+`unavailable` (findings.md, Task 9) and is **not** computed. What the tests do
+report is the generic worst-two-worth sensitivity: the two rods with the
+largest relative weights on the assumed grid, labelled "worst two rods
+(model sensitivity)". That number is evidence about the calibrated model's
+worth distribution, not the plant paired-drive case, and no threshold is
+applied to it.
+
+Reported values are evidence of the calibrated model, not plant performance.
+Every reported configuration is also rebuilt independently as explicit rod
+positions and its reactivity compared with `shutdown_margin` (Task 9).
 
 ## 5. Fuel thermal model and envelope
 
 Two lumped nodes: average fuel (`fuel_t`) and average cladding (`clad_t`).
 
-- Pellet-plus-gap resistance `GAP_RESISTANCE_K_PER_W` = 252 K / (870e6 W x 0.975), assumed (A-054): average fuel ~552 degC at rated.
-- Clad-to-coolant resistance `CLAD_COOLANT_RESISTANCE_K_PER_W` = 12 K / (870e6 W x 0.975), assumed (A-054): clad ~12 K above coolant at rated. Scaled by 1/htc_factor when the core uncovers.
-- `CLAD_HEAT_CAP_J_PER_K` = 3.1e6 J/K (about 9.5 t Zircaloy x 330 J/kg K), assumed (A-055).
+- Pellet-plus-gap resistance `GAP_RESISTANCE_K_PER_W` = 252 K / (870e6 W x 0.975), assumed (A-050): average fuel ~552 degC at rated.
+- Clad-to-coolant resistance `CLAD_COOLANT_RESISTANCE_K_PER_W` = 12 K / (870e6 W x 0.975), assumed (A-050): clad ~12 K above coolant at rated. Scaled by 1/htc_factor when the core uncovers.
+- `CLAD_HEAT_CAP_J_PER_K` = 3.1e6 J/K (about 9.5 t Zircaloy x 330 J/kg K), assumed (A-051).
 - Sum of the two resistances equals the former single-node `FUEL_RESISTANCE` (264 K at rated), so rated fuel temperature is unchanged.
 
 **Envelope.** The model is valid for covered, forced-free natural circulation
-cooling with cladding below `FUEL_MODEL_T_MAX_C` = 1000 degC. When
-`clad_t > FUEL_MODEL_T_MAX_C`, or the core is uncovered for more than
-`UNCOVERED_ENVELOPE_S` = 60 s, `DomainError::FuelModelEnvelope` is raised,
-`Snapshot.fuelEnvelopeExceeded` becomes true, and alarm `fuel_envelope`
-("FUEL THERMAL MODEL ENVELOPE EXCEEDED") is shown. This is **not** a damage
-limit. **Peak cladding temperature and critical power ratio are not
-computed**; the model has no hot-channel, no CPR correlation, and no
-post-dryout heat transfer. The former "CORE DAMAGE at 1200 degC" verdict is
-removed because it presented an unsupported conclusion.
+cooling with cladding below `FUEL_MODEL_T_MAX_C` = 1000 degC. When the
+cladding temperature exceeds `FUEL_MODEL_T_MAX_C`, or the core is uncovered
+for more than `UNCOVERED_ENVELOPE_S` = 60 s, `DomainError::FuelModelEnvelope`
+is raised once (first occurrence, P3 semantics), `Snapshot.fuelEnvelopeExceeded`
+becomes true, and alarm `fuel_envelope` ("FUEL THERMAL MODEL ENVELOPE
+EXCEEDED") is shown. This is **not** a damage limit. **Peak cladding
+temperature and critical power ratio are not computed**; the model has no
+hot-channel, no CPR correlation, and no post-dryout heat transfer. The former
+1200 degC average-fuel damage verdict is removed because it presented an
+unsupported conclusion.
+
+**Detection semantics.** The cladding check is evaluated on the plant-step
+endpoints: `Sim.clad_t_step_max = max(clad_t at step entry, clad_t at step
+exit)` is compared with the limit in `protection()`. An entry-state excursion
+therefore latches even if the fast cladding node cools below the limit within
+the same step; an excursion that begins and ends strictly inside one 0.05 s
+step is below the model's own resolution and is not claimed. The uncovered
+timer counts continuous plant time with `core_coverage() < CORE_COVERED_FRAC`
+(0.999) and resets to zero on any covered step; the limit is strict (`>`).
 
 ## 6. Decay heat
 
-Nine exponential groups fitted by `tools/fit_decay_heat.py` to
-`docs/model/decay-heat-reference.csv` (the `source` column names the public
-reference; see sources.csv). The fit is to a transcribed table, not a
-standards implementation. Maximum relative error of the fit is printed by the
-tool and must be below 5 %.
+Exponential groups fitted by `tools/fit_decay_heat.py`. Task 6 is a bounded
+evidence task first: it records in docs/validation/findings.md which public
+reference table (if any) could be retrieved and read, with the table's
+isotope/fission mix, irradiation history, normalisation, included
+contributions and stated uncertainty. Outcome `retrieved`: the groups are
+fitted to the transcribed `docs/model/decay-heat-reference.csv` (immutable
+after its transcription check; the `source_id`, `table` and `page` columns
+point into sources.csv). Outcome `unavailable`: the existing nine-group fit
+to the 0.066 t^-0.2 approximation (S-STD-04) is kept and the `DECAY_GROUPS`
+row says so. In neither case is the fit a standards implementation. The fit
+gate is 5 % maximum relative error at the reference points; the predeclared
+failure path (more groups, then `calibrated` status with the measured error
+and a findings entry) is in Task 6, and the source values are never edited to
+pass. This paragraph is completed by Task 6 with the outcome, the fitted
+error and the group count.
 
 Finite irradiation history: `DecayHeat::after_history(n, irr_s, cooled_s)`
 uses `d_i = f_i * n * (1 - exp(-lambda_i * irr_s)) * exp(-lambda_i * cooled_s)`.
 Scenarios use `IRRADIATION_HISTORY_S` = 6.31e7 s (2 years at rated, assumed,
-A-056). Uncertainty: a +/-10-20 % band is typical for total decay heat without
-actinide and exposure detail; this band is an assumption (A-057), not a
+A-052). Uncertainty: a +/-10-20 % band is typical for total decay heat without
+actinide and exposure detail; this band is an assumption (A-053), not a
 standards claim.
 
 ## 7. Xenon / iodine
@@ -195,78 +260,64 @@ Normalised two-nuclide model (reactor.rs `Xenon`). Verified behaviours
 (`core_transients.rs`): stationary equilibrium at 30/60/100 % power, post-
 shutdown peak between 6 h and 14 h, burnout on restart from the peak, and the
 transient dip after a 50 % to 100 % power rise. Cross-section-times-flux
-`SIGMA_PHI_XE` is assumed (A-058).
+`SIGMA_PHI_XE` is assumed (A-004).
 ```
 
-- [ ] **Step 2: Append parameter rows**
+- [ ] **Step 2: Append the documentation-owned parameter row**
 
-Append to `docs/model/parameters.csv`, in that file's header column order (the P1 header contains at least `name,value,unit,status`; fill the remaining P1 columns with the definition and source text shown here):
+Master register-row rule: a constant's row is added or updated in the task that adds or changes the constant. Task 1 therefore adds only the row that no code task owns, `SDM_REQUIRED` (a sourced requirement, not a `params.rs` constant). The code-owned rows are added in Task 4 (`Q_FUEL_RATED`, `GAP_RESISTANCE_K_PER_W`, `CLAD_COOLANT_RESISTANCE_K_PER_W`, `CLAD_HEAT_CAP_J_PER_K`; `FUEL_RESISTANCE` retired there), Task 5 (`FUEL_MODEL_T_MAX_C`, `UNCOVERED_ENVELOPE_S`, `CORE_COVERED_FRAC`) and Task 6 (`IRRADIATION_HISTORY_S`, `DECAY_GROUPS` update, `DECAY_FIT_MAX_REL_ERR`). P1's existing rows for `ROD_SPEED`, `SCRAM_TIME`, `ROD_WORTH_TOTAL`, `RHO_EXCESS_COLD`, `FUEL_RESISTANCE` and `DECAY_GROUPS` are left exactly as they are in this task (their constants do not change here; `FUEL_RESISTANCE` stays live and `derived` until Task 4 removes it).
+
+Append to `docs/model/parameters.csv` (locked header `id,value,unit,definition,reference_state,source_design,status,source_ids,interval_lo,interval_hi,assumption_id,location,notes`; 13 fields; no field contains a comma). `every_row_has_valid_shape_and_status` requires `unavailable` rows to carry either two numeric bounds or `none`/`none`; a margin requirement has no defensible interval, so:
 
 ```
-GAP_RESISTANCE_K_PER_W,2.9712e-7,K/W,assumed,Pellet plus gap thermal resistance: 252 K at 848.25 MW,A-054
-CLAD_COOLANT_RESISTANCE_K_PER_W,1.4148e-8,K/W,assumed,Clad to coolant resistance: 12 K at 848.25 MW,A-054
-CLAD_HEAT_CAP_J_PER_K,3.1e6,J/K,assumed,Cladding lumped heat capacity (9.5 t Zircaloy x 330 J/kgK),A-055
-FUEL_MODEL_T_MAX_C,1000,degC,assumed,Cladding temperature above which the thermal model is outside its envelope (not a damage limit),A-054
-UNCOVERED_ENVELOPE_S,60,s,assumed,Continuous core-uncovered duration beyond which the thermal model is outside its envelope,A-054
-IRRADIATION_HISTORY_S,6.31e7,s,assumed,Irradiation time at rated power assumed for scenario decay-heat initialisation (2 years),A-056
-SDM_REQUIRED,,dk/k,unavailable,Plant shutdown margin requirement; set from NEDO-33912-A Rev. 2 only if the public text states a number,core.md section 4
-ROD_SPEED,0.4,positions/s,assumed,FMCRD normal drive speed (~30 mm/s),A-053
-SCRAM_TIME,3.0,s,assumed,Hydraulic scram full-stroke time,A-053
-ROD_WORTH_TOTAL,0.200,dk/k,calibrated,Total rod worth; tuned with RHO_EXCESS_COLD for critical HFP with 5-25 % insertion,core.md section 3
-RHO_EXCESS_COLD,0.130,dk/k,calibrated,Cold clean all-rods-out excess reactivity,core.md section 3
-FUEL_RESISTANCE,,K/W,removed,Replaced by GAP_RESISTANCE_K_PER_W + CLAD_COOLANT_RESISTANCE_K_PER_W in Package 5,core.md section 5
+SDM_REQUIRED,,dk/k,Plant shutdown margin requirement (cold xenon-free; highest-worth rod fully withdrawn),cold xenon-free strongest rod out,BWRX-300,unavailable,,none,none,,docs/model/core.md section 4,no defensible interval for a requirement; set value and status confirmed with source_ids S-08 only if NEDO-33912-A Rev. 2 states the number; applies to the strongest-rod-out case only (core.md section 4)
 ```
 
-If a row for `ROD_SPEED`, `SCRAM_TIME`, `ROD_WORTH_TOTAL`, or `RHO_EXCESS_COLD` already exists from P1, update its status/note instead of adding a duplicate.
+If NEDO-33912-A Rev. 2 (S-08) is retrieved during this task and states the number, write the row with the value, status `confirmed`, `source_ids` `S-08`, and the P1 section rule satisfied (S-08's `section` field must not be `-`); record the page in `notes`. Never infer the value from another plant.
 
-- [ ] **Step 3: Append assumptions**
+Verify shape and uniqueness, then run the P1 register gate:
 
-Append to `docs/model/assumptions.md`:
+```bash
+cut -d, -f1 docs/model/parameters.csv | sort | uniq -d
+cargo test --release -p bwr-core --test register
+```
+Expected: no duplicate ids; every `register` test `ok` (in particular `every_row_has_valid_shape_and_status` and `every_assumption_id_exists_in_assumptions_md`).
+
+- [ ] **Step 3: Append assumption table rows**
+
+P1's `assumption_ids()` recognises only table rows of the form `| A-nnn | ... |` (six columns: `Id | Title | Statement | Sensitivity treatment | Interval basis | Resolved by`); headings are invisible to it. P1 already holds the rod geometry and kinematics (A-001), reactivity coefficients and rod worth (A-003), xenon data (A-004) and the fuel/decay lumped data (A-005), so this package does not restate them; `core.md` cites those ids. Append the following rows to the table in `docs/model/assumptions.md` (ids A-050..A-053 are unused by P1-P8; if a lower package has taken one by the time this runs, take the next free id and update every reference in this plan consistently). The P1 interval rule: a numeric `interval_lo`/`interval_hi` on a row is allowed only when the `Interval basis` cell names the parameter and its basis.
 
 ```markdown
-## A-050 Active fuel length
-3.81 m, typical GNF2. Sensitivity: +/-5 % changes void-weighted elevations and core volume proportionally; no BWRX public value.
-
-## A-051 Rod position convention
-0 = full in, 48 = full out, 2 positions per notch (legacy BWR convention). BWRX FMCRD position encoding is not public.
-
-## A-052 Rod layout and relative worth
-57 rods on a 9x9 grid inside radius sqrt(17); relative worth from J0^2 radial weighting and a cosine-integral axial S-curve. Not the plant control-rod map.
-
-## A-053 Rod speeds
-Normal drive 0.4 positions/s (~30 mm/s); hydraulic scram 3.0 s full stroke; motor run-in at normal drive speed. Sensitivity: scram time 2-4 s changes the first-second power drop only.
-
-## A-054 Fuel thermal resistances and envelope
-Pellet+gap 252 K and clad-coolant 12 K at rated (sum equals former single-node 264 K). Model envelope: clad < 1000 degC and core covered (or uncovered < 60 s). Outside: DomainError::FuelModelEnvelope. PCT and CPR are not computed.
-
-## A-055 Cladding heat capacity
-3.1e6 J/K (9.5 t Zircaloy x 330 J/kg K). Affects only sub-second clad response.
-
-## A-056 Irradiation history for scenarios
-2 years at rated power (6.31e7 s) before the stated cooling time. Affects long-lived decay-heat groups by < 10 % at 30 days.
-
-## A-057 Decay-heat uncertainty band
-+/-10-20 % on total decay heat (no actinide, exposure, or bundle-history detail). Not an ANS-5.1 uncertainty statement.
-
-## A-058 Xenon cross-section times flux
-SIGMA_PHI_XE = 2.65e-18 cm2 x 3.0e13 n/cm2/s. Affects equilibrium xenon fraction and peak time by the stated model only.
+| A-050 | Fuel thermal resistances and envelope | Two lumped nodes (average fuel, average cladding). Pellet+gap rise 252 K and clad-coolant rise 12 K at rated (sum equals the former single-node 264 K, A-005). Model envelope: cladding below 1000 degC and core covered (or uncovered for at most 60 s); outside it DomainError::FuelModelEnvelope is raised and no further claim is made. PCT and CPR are not computed. | Envelope flag and alarm instead of a damage verdict; envelope limits are indications only. | GAP_RESISTANCE_K_PER_W 2.4e-7..3.6e-7 K/W and CLAD_COOLANT_RESISTANCE_K_PER_W 0.7e-8..2.8e-8 K/W: the 252 K and 12 K rises scaled by the 0.8..1.2 and 0.6..2.0 ranges typical of gap conductance and single-phase versus boiling clad-coolant coefficients; FUEL_MODEL_T_MAX_C, UNCOVERED_ENVELOPE_S and CORE_COVERED_FRAC none (model-envelope choices) | Package 5 |
+| A-051 | Cladding heat capacity | 3.1e6 J/K (about 9.5 t Zircaloy x 330 J/kg K). Affects the sub-second cladding response only. | None; the energy identity and transient reference tests bound the numerical effect. | CLAD_HEAT_CAP_J_PER_K 2.5e6..4.0e6 J/K: Zircaloy mass 8..12 t at 300..340 J/kg K | Package 5 |
+| A-052 | Irradiation history for scenarios | Two years at rated power (6.31e7 s) before each scenario's stated cooling time; no exposure or bundle-history detail. | Long-lived decay-heat groups change by under 10 % at 30 days across the interval. | IRRADIATION_HISTORY_S 3.0e7..1.3e8 s: one to four years at power | Package 5 |
+| A-053 | Decay-heat uncertainty band | Total decay heat carries a +/-10..20 % band without actinide, exposure or bundle-history detail. Not an ANS-5.1 uncertainty statement. | Reported with every decay-heat figure; the fit error is reported separately (Task 6). | none (band, not a parameter) | Package 5 |
 ```
 
 - [ ] **Step 4: Append applicability rows**
 
-Append to `docs/model/esbwr-applicability.csv` (P1 header: ESBWR source/section, target subsystem, supporting BWRX evidence, relevant differences, required adaptation, applicability limits, associated test, classification):
+P1's `register.rs` accepts only the classification vocabulary `shared-concept`, `adapted-model`, `provisional-estimate`, `inapplicable`, `pending`, and P1 already carries `E-01` (Ch 4 core fuel and rods, classification `pending`, test `core_transients.rs (Package 5)`) whose closure is this package's job. Ids `E-07`..`E-09` are taken by other packages; use `E-10` and `E-11` (if a lower package has consumed them by the time this runs, take the next free ids and update the references in this plan). Cite retrieved source ids: `S-06` (005N9751), `S-08` (NEDO-33912-A), and the sources.csv id whose `section` covers DCD Tier 2 Ch 4 (`S-ESBWR-04` at the P1 baseline; confirm with `grep -n "^S-ESBWR" docs/model/sources.csv`). No ESBWR numeric value is borrowed by this package, so the `BORROWED` table in `tests/register.rs` is unchanged.
+
+In `docs/model/esbwr-applicability.csv`, edit the existing `E-01` row in place: keep every field, set `test` to `core_transients.rs (Package 5): full_power_rod_insertion_fraction; shutdown_margin_cold_xenon_free; scram_hydraulic_three_seconds` and `classification` to `adapted-model` (mechanisms and methodology borrowed; every number re-derived or calibrated for the 240-bundle core). Then append (locked header `id,esbwr_source,esbwr_section,target_subsystem,bwrx_evidence,differences,adaptation,applicability_limits,test,classification`; no field contains a comma):
 
 ```
-DCD Rev.10 Tier 2 Ch. 4.3 (nuclear design: feedback mechanisms),core reactivity,GE 005N9751 (natural circulation BWR; GNF2),smaller core and different exposure history,coefficients kept as calibrated ReactivityCoeffs with sensitivity study,qualitative sign and order only,core_transients::full_power_rod_insertion_fraction; examples/sensitivity.rs,shared concept
-DCD Rev.10 Tier 2 Ch. 4.6 (FMCRD: hydraulic scram plus electric run-in),rod mechanisms,GE 005N9751 (57 FMCRDs; NEDO-33912-A reactivity control),57 drives vs 269; stroke times not public,RodMotion::Scram / RodMotion::Sri (hydraulic) and RodMotion::MotorRunIn (electric) as distinct states with assumed speeds,timing values assumed (A-053),core_transients::scram_hydraulic_three_seconds; core_transients::motor_run_in_120_seconds,adapted model
-DCD Rev.10 Tier 2 Ch. 15 (transient mechanisms: turbine trip reactivity response),core transient verification,none numerical,bypass capacity and SRI group differ,used only to order the expected response (void collapse then Doppler); no numerical trace imported,qualitative,examples/sensitivity.rs,shared concept
+E-10,DCD Rev 10 Tier 2;NUREG-1966 V2,S-ESBWR-04 Section 4.6 (FMCRD: hydraulic scram plus electric motor run-in on the same drive),Rod mechanisms,S-06 (57 FMCRDs);S-08 (FMCRD arrangement and shutdown-margin methodology),57 drives vs 269; BWRX stroke times and pair topology not public,RodMotion::Scram and RodMotion::Sri (hydraulic) and RodMotion::MotorRunIn (electric) as distinct states with the assumed speeds of A-001,timing values assumed (A-001); no ESBWR stroke time is a BWRX value,core_transients.rs (Package 5): scram_hydraulic_three_seconds; motor_run_in_120_seconds; motor_run_in_never_replaces_a_hydraulic_scram,adapted-model
+E-11,DCD Rev 10 Tier 2;NUREG-1966 V2,Ch 15 (turbine trip transient mechanism: void collapse then Doppler),Core transient verification,none numerical,bypass capacity and SRI group differ,used only to order the expected qualitative response; no numerical trace imported,qualitative only,examples/sensitivity.rs (Package 5),shared-concept
 ```
 
-- [ ] **Step 5: Commit**
+Run the register gate again before committing:
 
 ```bash
+cargo test --release -p bwr-core --test register
+```
+Expected: all `ok` (no unknown classification, no unknown assumption id, no duplicate id).
+
+- [ ] **Step 5: Commit (register gate must be green)**
+
+```bash
+cargo test --release -p bwr-core --test register
 git add docs/model/core.md docs/model/parameters.csv docs/model/assumptions.md docs/model/esbwr-applicability.csv
-git commit -m "docs(core): Package 5 core model specification, parameters, assumptions
+git commit -m "docs(core): Package 5 core model specification, SDM requirement row, assumptions
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -278,11 +329,16 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Files:**
 - Modify: `crates/bwr-core/src/reactor.rs` (replace `Rods`)
 - Modify: `crates/bwr-core/src/sim.rs` (every `rods.target`, `rods.scramming`, `rods.fast_insert` use)
+- Modify: `crates/bwr-core/src/validation.rs` (populate `rods_min_pos`, `rods_max_pos`)
+- Modify: `docs/validation/method.md` (column provenance)
 - Create: `crates/bwr-core/tests/core_transients.rs`
 
 **Interfaces:**
-- Consumes: `Core::step_rods(dt)` (P3) which calls `self.rods.step(dt)`.
-- Produces (master contract): `RodMotion`, `Rods { layout, weights, pos, motion, stuck, selected }`, `Rods::{target, targets, set_motor_target, scram_hydraulic, motor_run_in, select_rod_insert, scramming, moving, stop, step, all_in, reactivity, sri_group}`.
+- Consumes: `Core::step_rods(dt)` (P3) which calls `self.rods.step(dt)`; `validation::{Case, ScriptedCommand, Operator, run_case}` and `Trace::column` (P2).
+- Produces (master r2): `RodMotion { Idle, Motor { target }, Scram, Sri, MotorRunIn }` deriving `Clone, Copy, Debug, PartialEq`; `Rods { layout, weights, pos, motion, stuck, selected, last_error }`; `Rods::{target, targets, set_motor_target, scram_hydraulic, motor_run_in, select_rod_insert, scramming, moving, stop, step, all_in, reactivity, sri_group, refresh_stuck}`.
+- Error channel (master dt rule): `Rods::step` is a public void-returning step, so it validates `dt` before touching state and sets `Rods.last_error` on failure. `Core::step_rods` (P3) validates `dt` first itself, then calls `rods.step(dt)` and forwards `rods.last_error.take()` into `Core.last_error`, which `Sim::step` already drains at step 17 (P3). `set_motor_target` rejects a non-finite or out-of-range target the same way (`what: "target"`).
+
+Behaviour locked by the master: `Scram` and `Sri` move at the hydraulic speed but are distinct states; `scramming()` is true only for `Scram`; `scram_hydraulic` converts `Sri` rods to `Scram`; `select_rod_insert` leaves `Scram` rods alone; `motor_run_in` sets every non-stuck rod not already `Scram` to `MotorRunIn` (callers always invoke `scram_hydraulic` first, so `Sri` rods are already `Scram` by then); `Sri`, `Scram` and `MotorRunIn` rods return to `Idle` at 0.0; `stop()` affects `Motor` only; `target(i)` is the commanded endpoint. Fixed by this plan (core.md section 2): `scram_hydraulic` and `motor_run_in` command only rods with `pos > 0.0`; `refresh_stuck(mask)` parks every stuck rod `Idle` whatever mechanism owned it; `set_motor_target` ignores stuck rods.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -292,6 +348,7 @@ Create `crates/bwr-core/tests/core_transients.rs`:
 //! Package 5: core physics, fuel response and rod mechanism tests.
 
 use bwr_core::api::{Command, ScenarioName};
+use bwr_core::domain::DomainError;
 use bwr_core::params::*;
 use bwr_core::reactor::{RodMotion, Rods};
 use bwr_core::sim::DT;
@@ -320,7 +377,7 @@ fn motor_motion_reaches_target_and_idles() {
     assert!((r.pos[3] - 4.0).abs() < 1e-9, "pos {}", r.pos[3]);
     assert_eq!(r.motion[3], RodMotion::Idle);
     assert!(!r.moving());
-    assert_eq!(r.targets()[3], 4.0);
+    assert_eq!(r.targets()[3], 4.0, "idle rod targets its own position");
 }
 
 #[test]
@@ -328,6 +385,8 @@ fn scram_hydraulic_three_seconds() {
     let mut r = Rods::new(ROD_FULL_OUT);
     r.scram_hydraulic();
     assert!(r.scramming());
+    assert!(r.motion.iter().all(|m| *m == RodMotion::Scram));
+    assert!(r.targets().iter().all(|&t| t == 0.0), "targets show the commanded endpoint");
     step_rods(&mut r, SCRAM_TIME - DT);
     assert!(!r.all_in());
     step_rods(&mut r, 2.0 * DT);
@@ -342,10 +401,57 @@ fn motor_run_in_120_seconds() {
     r.motor_run_in();
     assert!(r.motion.iter().all(|m| *m == RodMotion::MotorRunIn));
     assert!(!r.scramming(), "run-in is not a hydraulic scram");
+    assert!(r.targets().iter().all(|&t| t == 0.0));
     step_rods(&mut r, ROD_FULL_OUT / ROD_SPEED - 1.0);
     assert!(!r.all_in());
     step_rods(&mut r, 2.0);
     assert!(r.all_in());
+    assert!(r.motion.iter().all(|m| *m == RodMotion::Idle));
+}
+
+#[test]
+fn motor_run_in_never_replaces_a_hydraulic_scram() {
+    let mut r = Rods::new(ROD_FULL_OUT);
+    r.scram_hydraulic();
+    r.motor_run_in();
+    assert!(r.motion.iter().all(|m| *m == RodMotion::Scram));
+    let mut at_zero = Rods::new(0.0);
+    at_zero.motor_run_in();
+    assert!(at_zero.motion.iter().all(|m| *m == RodMotion::Idle), "rods already in are not commanded");
+}
+
+#[test]
+fn select_rod_insert_is_sri_on_the_group_only_and_is_not_a_scram() {
+    let mut r = Rods::new(ROD_FULL_OUT);
+    r.select_rod_insert();
+    let g = r.sri_group();
+    assert_eq!(g.len(), 4);
+    for i in 0..N_RODS {
+        let expect = if g.contains(&i) { RodMotion::Sri } else { RodMotion::Idle };
+        assert_eq!(r.motion[i], expect, "rod {i}");
+    }
+    assert!(!r.scramming(), "SRI must not count as a scram");
+    assert!(r.moving());
+    for &i in &g {
+        assert_eq!(r.target(i), 0.0);
+    }
+    step_rods(&mut r, SCRAM_TIME + DT);
+    for &i in &g {
+        assert_eq!(r.pos[i], 0.0);
+        assert_eq!(r.motion[i], RodMotion::Idle, "SRI rods return to Idle at 0");
+    }
+}
+
+#[test]
+fn scram_upgrades_sri_rods_and_sri_never_downgrades_scram() {
+    let mut r = Rods::new(ROD_FULL_OUT);
+    r.select_rod_insert();
+    r.scram_hydraulic();
+    assert!(r.motion.iter().all(|m| *m == RodMotion::Scram), "Sri rods become Scram");
+    let mut r2 = Rods::new(ROD_FULL_OUT);
+    r2.scram_hydraulic();
+    r2.select_rod_insert();
+    assert!(r2.motion.iter().all(|m| *m == RodMotion::Scram), "SRI leaves Scram rods alone");
 }
 
 #[test]
@@ -357,6 +463,8 @@ fn stuck_rod_ignores_every_mechanism() {
     assert_eq!(r.pos[7], ROD_FULL_OUT);
     r.scram_hydraulic();
     r.motor_run_in();
+    r.select_rod_insert();
+    assert_ne!(r.motion[7], RodMotion::Scram, "a stuck rod is never commanded by a scram");
     step_rods(&mut r, 5.0);
     assert_eq!(r.pos[7], ROD_FULL_OUT, "stuck rod moved under scram");
     assert!(r.pos.iter().enumerate().all(|(i, &p)| i == 7 || p == 0.0));
@@ -364,34 +472,109 @@ fn stuck_rod_ignores_every_mechanism() {
 }
 
 #[test]
-fn stop_parks_at_nearest_notch_in_direction_of_travel() {
+fn rods_step_rejects_invalid_dt_without_moving() {
+    // Master dt rule for the void-returning Rods::step: last_error set, nothing moves.
+    for dt in [f64::NAN, f64::INFINITY, 0.0, -0.05] {
+        let mut r = Rods::new(ROD_FULL_OUT);
+        r.scram_hydraulic();
+        let (pos, motion) = (r.pos.clone(), r.motion.clone());
+        r.step(dt);
+        assert_eq!(r.pos, pos, "dt {dt}: rods moved");
+        assert_eq!(r.motion, motion, "dt {dt}: motion changed");
+        assert!(matches!(r.last_error.take(), Some(DomainError::PropertyOutOfRange { what, .. }) if what == "dt"), "dt {dt}");
+    }
+}
+
+#[test]
+fn motor_target_rejects_non_finite_and_out_of_range_targets() {
+    let mut r = Rods::new(10.0);
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, ROD_FULL_OUT + 1.0] {
+        r.set_motor_target(2, bad);
+        assert_eq!(r.motion[2], RodMotion::Idle, "target {bad} was accepted");
+        assert!(matches!(r.last_error.take(), Some(DomainError::PropertyOutOfRange { what, .. }) if what == "target"), "target {bad}");
+        step_rods(&mut r, 1.0);
+        assert_eq!(r.pos[2], 10.0, "target {bad} moved the rod");
+    }
+    r.set_motor_target(2, ROD_FULL_OUT);
+    assert_eq!(r.motion[2], RodMotion::Motor { target: ROD_FULL_OUT });
+    assert!(r.last_error.is_none());
+}
+
+#[test]
+fn motor_command_to_a_stuck_rod_is_ignored() {
+    let mut r = Rods::new(10.0);
+    r.stuck[5] = true;
+    r.set_motor_target(5, 20.0);
+    assert_eq!(r.motion[5], RodMotion::Idle);
+    assert_eq!(r.target(5), 10.0, "TGT = POS for a stuck rod");
+    assert!(r.last_error.is_none(), "a stuck rod is a mechanism state, not an argument error");
+}
+
+#[test]
+fn refresh_stuck_parks_a_rod_in_every_motion_state_and_never_replays() {
+    // core.md section 2 policy table: whatever owned the rod, a fault parks it Idle
+    // with TGT = POS, and clearing the fault replays nothing at rod level.
+    let mechanisms: [(&str, fn(&mut Rods, usize)); 4] = [
+        ("motor", |r, i| r.set_motor_target(i, 0.0)),
+        ("scram", |r, _| r.scram_hydraulic()),
+        ("sri", |r, _| r.select_rod_insert()),
+        ("run-in", |r, _| r.motor_run_in()),
+    ];
+    for (name, start) in mechanisms {
+        let mut r = Rods::new(ROD_FULL_OUT);
+        let i = r.sri_group()[0]; // in the SRI group, so every mechanism commands it
+        start(&mut r, i);
+        assert_ne!(r.motion[i], RodMotion::Idle, "{name}: rod not commanded");
+        step_rods(&mut r, 1.0);
+        let moved_to = r.pos[i];
+        assert!(moved_to < ROD_FULL_OUT, "{name}: rod did not move before the fault");
+        let mut mask = vec![false; N_RODS];
+        mask[i] = true;
+        r.refresh_stuck(&mask);
+        assert!(r.stuck[i]);
+        assert_eq!(r.motion[i], RodMotion::Idle, "{name}: a stuck rod must be parked");
+        assert_eq!(r.target(i), moved_to, "{name}: TGT = POS for a stuck rod");
+        step_rods(&mut r, 10.0);
+        assert_eq!(r.pos[i], moved_to, "{name}: stuck rod moved");
+        assert!(!r.scramming(), "{name}: a parked rod must not hold the scram indication once the others are in");
+        r.refresh_stuck(&vec![false; N_RODS]);
+        assert!(!r.stuck[i]);
+        step_rods(&mut r, 1.0);
+        assert_eq!((r.motion[i], r.pos[i]), (RodMotion::Idle, moved_to), "{name}: Rods never replays a dropped command (Sim re-asserts a latched scram, Task 3)");
+    }
+}
+
+#[test]
+fn scram_hydraulic_and_run_in_leave_rods_already_in_idle() {
+    // Needed so Sim can re-assert a latched scram every step without scramming() sticking true.
+    let mut r = Rods::new(0.0);
+    r.scram_hydraulic();
+    r.motor_run_in();
+    assert!(r.motion.iter().all(|m| *m == RodMotion::Idle));
+    assert!(!r.scramming());
+}
+
+#[test]
+fn stop_parks_motor_motion_only() {
     let mut r = Rods::new(0.0);
     r.set_motor_target(0, 10.0);
-    step_rods(&mut r, 2.0 / ROD_SPEED + 0.5); // ~2.2 positions
+    step_rods(&mut r, 2.0 / ROD_SPEED + 0.5); // about 2.2 positions
     r.stop();
     assert_eq!(r.motion[0], RodMotion::Motor { target: 4.0 });
     step_rods(&mut r, 10.0);
     assert!((r.pos[0] - 4.0).abs() < 1e-9);
-    // Hydraulic motion is not stoppable.
-    r.scram_hydraulic();
-    r.stop();
-    assert!(r.scramming());
-}
-
-#[test]
-fn select_rod_insert_is_hydraulic_on_the_sri_group_only() {
-    let mut r = Rods::new(ROD_FULL_OUT);
-    r.select_rod_insert();
-    let g = r.sri_group();
-    assert_eq!(g.len(), 4);
-    for i in 0..N_RODS {
-        let expect = if g.contains(&i) { RodMotion::Hydraulic } else { RodMotion::Idle };
-        assert_eq!(r.motion[i], expect, "rod {i}");
-    }
-    step_rods(&mut r, SCRAM_TIME + DT);
-    for &i in &g {
-        assert_eq!(r.pos[i], 0.0);
-    }
+    // Insertion mechanisms are not stoppable.
+    let mut s = Rods::new(ROD_FULL_OUT);
+    s.select_rod_insert();
+    s.stop();
+    assert!(s.motion.iter().any(|m| *m == RodMotion::Sri));
+    s.scram_hydraulic();
+    s.stop();
+    assert!(s.scramming());
+    let mut m = Rods::new(ROD_FULL_OUT);
+    m.motor_run_in();
+    m.stop();
+    assert!(m.motion.iter().all(|x| *x == RodMotion::MotorRunIn));
 }
 
 #[test]
@@ -405,12 +588,26 @@ fn full_power_snapshot_targets_follow_motion() {
     assert!(s.rods.scram_in_progress);
     assert!(s.rods.targets.iter().all(|&t| t == 0.0));
 }
+
+#[test]
+fn sri_at_plant_level_does_not_light_scram_and_a_scram_takes_over() {
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 5.0);
+    sim.apply(Command::TripTurbine);
+    run(&mut sim, 1.0);
+    let g = sim.core.rods.sri_group();
+    assert!(g.iter().all(|&i| sim.core.rods.motion[i] == RodMotion::Sri), "SRI should fire on turbine trip at power");
+    assert!(!sim.scrammed && !sim.core.rods.scramming());
+    assert!(!sim.snapshot().rods.scram_in_progress);
+    sim.apply(Command::ManualScram);
+    assert!(sim.core.rods.motion.iter().zip(&sim.core.rods.pos).all(|(m, &p)| *m == RodMotion::Scram || p == 0.0));
+}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --release -p bwr-core --test core_transients 2>&1 | head -20`
-Expected: compile error `no variant or associated item named ... RodMotion` / `cannot find type RodMotion in module bwr_core::reactor`.
+Run: `cargo test --release -p bwr-core --test core_transients > /tmp/p5-t2-red.log 2>&1; echo exit=$?; grep -n "cannot find" /tmp/p5-t2-red.log`
+Expected: `exit=101`; the grep shows `cannot find type RodMotion in module bwr_core::reactor`.
 
 - [ ] **Step 3: Replace `Rods` in `reactor.rs`**
 
@@ -423,10 +620,22 @@ pub enum RodMotion {
     Idle,
     /// Normal fine-motion drive toward `target` at `ROD_SPEED`.
     Motor { target: f64 },
-    /// Hydraulic scram insertion at `ROD_FULL_OUT / SCRAM_TIME`.
-    Hydraulic,
-    /// Electric motor run-in toward 0 at `ROD_SPEED` (FMCRD backup / ARI path).
+    /// Hydraulic scram insertion at `ROD_FULL_OUT / SCRAM_TIME`, initiated by the RPS scram.
+    Scram,
+    /// Hydraulic insertion of the Select Rod Insert group (same speed as Scram,
+    /// but not a scram: it does not light the scram indication).
+    Sri,
+    /// Electric motor run-in toward 0 at `ROD_SPEED` (FMCRD backup path, every scram).
     MotorRunIn,
+}
+
+impl RodMotion {
+    fn is_hydraulic(self) -> bool {
+        matches!(self, RodMotion::Scram | RodMotion::Sri)
+    }
+    fn is_insertion(self) -> bool {
+        matches!(self, RodMotion::Scram | RodMotion::Sri | RodMotion::MotorRunIn)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -435,9 +644,13 @@ pub struct Rods {
     pub weights: Vec<f64>,
     pub pos: Vec<f64>,
     pub motion: Vec<RodMotion>,
-    /// Mirrored from `Fault::RodStuck` by `Sim` every step. A stuck rod never moves.
+    /// Mirrored from `Fault::RodStuck` by `Sim` every step through `refresh_stuck`.
+    /// A stuck rod is never commanded by any mechanism and never moves.
     pub stuck: Vec<bool>,
     pub selected: Option<usize>,
+    /// Error raised by the void-returning `step` or by `set_motor_target` (master dt
+    /// and non-finite rules); forwarded into `Core.last_error` by `Core::step_rods`.
+    pub last_error: Option<DomainError>,
 }
 
 impl Rods {
@@ -451,6 +664,21 @@ impl Rods {
             motion: vec![RodMotion::Idle; N_RODS],
             stuck: vec![false; N_RODS],
             selected: None,
+            last_error: None,
+        }
+    }
+
+    /// Mirror the fault mask (`Sim`, step 2 of the plant step). A stuck rod is parked
+    /// `Idle` whatever mechanism owned it, so its outstanding command is dropped and
+    /// TGT = POS (core.md section 2). Clearing a fault changes nothing else here;
+    /// `Sim` re-asserts a latched scram itself.
+    pub fn refresh_stuck(&mut self, mask: &[bool]) {
+        assert_eq!(mask.len(), self.pos.len(), "stuck mask length");
+        for i in 0..self.pos.len() {
+            if mask[i] {
+                self.motion[i] = RodMotion::Idle;
+            }
+            self.stuck[i] = mask[i];
         }
     }
 
@@ -468,11 +696,11 @@ impl Rods {
         self.pos.iter().all(|&p| p <= 0.01)
     }
 
-    /// Where rod `i` is heading: motor target, 0 for insertion mechanisms, own position when idle.
+    /// Commanded endpoint: motor target, 0 for any insertion mechanism, own position when idle.
     pub fn target(&self, i: usize) -> f64 {
         match self.motion[i] {
             RodMotion::Motor { target } => target,
-            RodMotion::Hydraulic | RodMotion::MotorRunIn => 0.0,
+            RodMotion::Scram | RodMotion::Sri | RodMotion::MotorRunIn => 0.0,
             RodMotion::Idle => self.pos[i],
         }
     }
@@ -481,9 +709,16 @@ impl Rods {
         (0..self.pos.len()).map(|i| self.target(i)).collect()
     }
 
-    /// Command normal motor motion. Ignored while an insertion mechanism owns the rod.
+    /// Command normal motor motion. A non-finite or out-of-range target is rejected
+    /// and sets `last_error` (`Sim` has already dropped non-finite command values,
+    /// so this is defence in depth). Ignored while an insertion mechanism owns the
+    /// rod or the rod is stuck.
     pub fn set_motor_target(&mut self, i: usize, target: f64) {
-        if matches!(self.motion[i], RodMotion::Hydraulic | RodMotion::MotorRunIn) {
+        if !(target.is_finite() && (0.0..=ROD_FULL_OUT).contains(&target)) {
+            self.last_error = Some(DomainError::PropertyOutOfRange { what: "target".into(), value: target });
+            return;
+        }
+        if self.stuck[i] || self.motion[i].is_insertion() {
             return;
         }
         self.motion[i] = if (target - self.pos[i]).abs() < 1e-6 {
@@ -493,45 +728,48 @@ impl Rods {
         };
     }
 
-    /// Hydraulic scram on every rod that is not stuck.
+    /// RPS scram: every non-stuck rod with `pos > 0` -> Scram (Sri rods become Scram).
+    /// Rods already at 0 stay Idle, so `Sim` can re-assert a latched scram each step.
     pub fn scram_hydraulic(&mut self) {
         for i in 0..self.pos.len() {
-            if !self.stuck[i] {
-                self.motion[i] = RodMotion::Hydraulic;
+            if !self.stuck[i] && self.pos[i] > 0.0 {
+                self.motion[i] = RodMotion::Scram;
             }
         }
     }
 
-    /// Electric run-in on every rod that is not stuck, not already hydraulic, and not at 0.
+    /// Electric run-in: every non-stuck rod not already in Scram and not at 0 -> MotorRunIn.
+    /// Callers invoke `scram_hydraulic` first, so this only matters for rods the
+    /// hydraulic path did not take (none today; the ARI path in Package 8 reuses it).
     pub fn motor_run_in(&mut self) {
         for i in 0..self.pos.len() {
-            if !self.stuck[i] && self.motion[i] != RodMotion::Hydraulic && self.pos[i] > 0.0 {
+            if !self.stuck[i] && self.motion[i] != RodMotion::Scram && self.pos[i] > 0.0 {
                 self.motion[i] = RodMotion::MotorRunIn;
             }
         }
     }
 
-    /// Hydraulically insert the Select Rod Insert group.
+    /// Select Rod Insert: SRI group -> Sri, unless a rod is already in Scram or stuck.
     pub fn select_rod_insert(&mut self) {
         for i in self.sri_group() {
-            if !self.stuck[i] {
-                self.motion[i] = RodMotion::Hydraulic;
+            if !self.stuck[i] && self.motion[i] != RodMotion::Scram {
+                self.motion[i] = RodMotion::Sri;
             }
         }
     }
 
-    /// True while any rod is under hydraulic insertion.
+    /// True while any rod is in Scram. Sri does not count.
     pub fn scramming(&self) -> bool {
-        self.motion.iter().any(|m| *m == RodMotion::Hydraulic)
+        self.motion.iter().any(|m| *m == RodMotion::Scram)
     }
 
-    /// True while any non-stuck rod is being driven.
+    /// True while any non-stuck rod is being driven by any mechanism.
     pub fn moving(&self) -> bool {
         (0..self.pos.len()).any(|i| self.motion[i] != RodMotion::Idle && !self.stuck[i])
     }
 
     /// Stop motor motion at the nearest notch in the direction of travel.
-    /// Hydraulic and run-in insertions cannot be stopped.
+    /// Scram, Sri and MotorRunIn cannot be stopped.
     pub fn stop(&mut self) {
         for i in 0..self.pos.len() {
             if let RodMotion::Motor { target } = self.motion[i] {
@@ -542,7 +780,13 @@ impl Rods {
         }
     }
 
+    /// Void-returning public step (master dt rule): an invalid `dt` sets `last_error`
+    /// and moves nothing.
     pub fn step(&mut self, dt: f64) {
+        if !(dt.is_finite() && dt > 0.0) {
+            self.last_error = Some(DomainError::PropertyOutOfRange { what: "dt".into(), value: dt });
+            return;
+        }
         let v_motor = ROD_SPEED * dt;
         let v_hyd = ROD_FULL_OUT / SCRAM_TIME * dt;
         for i in 0..self.pos.len() {
@@ -559,18 +803,19 @@ impl Rods {
                         self.motion[i] = RodMotion::Idle;
                     }
                 }
+                m if m.is_hydraulic() => {
+                    self.pos[i] = (self.pos[i] - v_hyd).max(0.0);
+                    if self.pos[i] <= 0.0 {
+                        self.motion[i] = RodMotion::Idle;
+                    }
+                }
                 RodMotion::MotorRunIn => {
                     self.pos[i] = (self.pos[i] - v_motor).max(0.0);
                     if self.pos[i] <= 0.0 {
                         self.motion[i] = RodMotion::Idle;
                     }
                 }
-                RodMotion::Hydraulic => {
-                    self.pos[i] = (self.pos[i] - v_hyd).max(0.0);
-                    if self.pos[i] <= 0.0 {
-                        self.motion[i] = RodMotion::Idle;
-                    }
-                }
+                _ => unreachable!("every RodMotion variant is handled above"),
             }
         }
     }
@@ -587,7 +832,17 @@ impl Rods {
 }
 ```
 
-- [ ] **Step 4: Migrate call sites in `sim.rs`**
+`reactor.rs` needs `use crate::domain::DomainError;` (P3 added it for `Core::step`; keep it). In P3's `Core::step_rods`, after the line `self.rods.step(dt);` add the forwarding so the rod-level channel reaches `Sim::step`'s step-17 drain:
+
+```rust
+        if let Some(e) = self.rods.last_error.take() {
+            self.last_error = Some(e);
+        }
+```
+
+(`Core::step_rods` keeps its own `dt` guard before calling `rods.step`, so P3's `step_rods_and_sim_step_reject_invalid_dt_without_moving` still sees `Core.last_error` set and no motion.)
+
+- [ ] **Step 4: Migrate call sites in `sim.rs` and the P3 tests**
 
 Add `RodMotion` to the reactor import:
 
@@ -595,7 +850,7 @@ Add `RodMotion` to the reactor import:
 use crate::reactor::{Core, DecayHeat, RodMotion, Xenon, ROD_GRID};
 ```
 
-In `full_power()`, the rod-insertion loop currently sets both `pos` and `target`; replace
+In `full_power()` (renamed `full_power_with` in Task 8), the rod-insertion loop currently sets both `pos` and `target`; replace
 
 ```rust
                 let p = (s.core.rods.pos[i] - 2.0).max(0.0);
@@ -608,7 +863,7 @@ with
                 s.core.rods.pos[i] = p;
 ```
 
-In `scram()`, replace `self.core.rods.scramming = true;` with
+In `scram()`, replace `self.core.rods.scramming = true;` with the layered RPS initiation:
 
 ```rust
         self.core.rods.scram_hydraulic();
@@ -618,16 +873,27 @@ In `scram()`, replace `self.core.rods.scramming = true;` with
 In `apply`, `Command::ResetScram` arm, replace the final `else { ... }` with
 
 ```rust
-                } else if !self.core.rods.all_in() {
-                    self.event("scram_reset", "Scram reset blocked: rods not fully inserted");
+                } else if self
+                    .core
+                    .rods
+                    .motion
+                    .iter()
+                    .zip(&self.core.rods.pos)
+                    .any(|(m, &p)| matches!(m, RodMotion::Scram | RodMotion::MotorRunIn) && p > 0.0)
+                {
+                    self.event("scram_reset", "Scram reset blocked: scram insertion not complete");
                 } else {
                     self.scrammed = false;
                     self.scram_reason = None;
                     for m in self.core.rods.motion.iter_mut() {
-                        *m = RodMotion::Idle;
+                        if matches!(m, RodMotion::Scram | RodMotion::MotorRunIn) {
+                            *m = RodMotion::Idle;
+                        }
                     }
                 }
 ```
+
+(`Sri` rods are not touched by a scram reset; they finish on their own.)
 
 In `Command::RodSetTarget`, replace the body of the per-index loop after the block check:
 
@@ -672,33 +938,85 @@ with
                 scram_in_progress: c.rods.scramming(),
 ```
 
-Search for any remaining uses: `grep -n "rods.target\b\|rods.scramming\b\|fast_insert\|\.target\[" crates/bwr-core/src crates/bwr-core/tests crates/bwr-core/examples`. Expected: no matches except `rods.target(` / `rods.targets(` calls.
+The SRI call in `protection()` (`self.core.rods.select_rod_insert();`) is unchanged.
 
-- [ ] **Step 5: Run the whole suite**
+**P3 tests that touch the removed fields** (`crates/bwr-core/tests/numerics.rs`; exact edits, preserving every original invalid-input assertion):
 
-Run: `cargo test --release -p bwr-core 2>&1 | grep -E "^test |test result"`
-Expected: every test `ok`, including the 7 new `core_transients` tests and all pre-existing `plant`, `numerics`, `conservation`, `vessel_transients` tests. `stuck_rod_ignores_every_mechanism` passes without `Sim` involvement because it sets `stuck` directly.
+- In `step_rods_and_sim_step_reject_invalid_dt_without_moving`, replace the line `core.rods.scramming = true;` with `core.rods.scram_hydraulic();` (the core is built at `ROD_FULL_OUT`, so every rod is `Scram` and would move on a valid `dt`). The assertions on `core.rods.pos`, `core.last_error` and the `Sim` state are unchanged.
+- In `non_finite_commands_are_ignored`, replace `let rods_before = sim.core.rods.target.clone();` with `let rods_before = sim.core.rods.targets();` and `assert_eq!(sim.core.rods.target, rods_before);` with `assert_eq!(sim.core.rods.targets(), rods_before);`. Add immediately after it `assert!(sim.core.rods.motion.iter().all(|m| *m == RodMotion::Idle), "a non-finite target must not start motor motion");` with `use bwr_core::reactor::RodMotion;` at the top of that file.
+- `kinetics_and_core_reject_invalid_step_arguments_unchanged` needs no edit in this task (Task 4 extends it with `clad_t`).
 
-- [ ] **Step 6: Commit**
+Search recursively for any remaining use of the removed fields (allowed: the `rods.target(i)`, `rods.targets()` and `rods.scramming()` method calls):
 
 ```bash
-git add crates/bwr-core/src/reactor.rs crates/bwr-core/src/sim.rs crates/bwr-core/tests/core_transients.rs
-git commit -m "feat(core): per-rod motion state machine with hydraulic, motor and run-in mechanisms
+rg -n "rods\.target\[|rods\.target\.|rods\.target,|rods\.target\)|rods\.target;|rods\.scramming[^(]|fast_insert|\.target\[" crates/bwr-core/src crates/bwr-core/tests crates/bwr-core/examples; echo "rg exit=$?"
+```
+Expected: no lines and `rg exit=1`. Fix every hit before continuing.
+
+- [ ] **Step 5: Populate the rod extrema trace columns**
+
+In `crates/bwr-core/src/validation.rs`, in the row-filling code of `run_case` (locate it with `grep -n '"rods_avg_pos"\|rods_avg_pos' crates/bwr-core/src/validation.rs`; P2 fills columns by name or by index into `TRACE_COLUMNS`), replace the `0.0` placeholders for `rods_min_pos` and `rods_max_pos` with
+
+```rust
+sim.core.rods.pos.iter().cloned().fold(f64::INFINITY, f64::min),
+sim.core.rods.pos.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+```
+
+In `docs/validation/method.md`, in the column provenance table, change `rods_min_pos` and `rods_max_pos` from "0.0 until Package 5" to "populated from Package 5 (per-rod positions)".
+
+Append to `crates/bwr-core/tests/core_transients.rs`:
+
+```rust
+use bwr_core::validation::{run_case, Case, Operator, ScriptedCommand};
+
+#[test]
+fn trace_rod_extrema_columns_are_populated() {
+    let case = Case {
+        id: "p5_rod_columns",
+        scenario: ScenarioName::FullPower,
+        duration_s: 10.0,
+        sample_dt_s: 1.0,
+        commands: vec![ScriptedCommand { at_s: 2.0, cmd: Command::ManualScram }],
+        faults: vec![],
+        dt_after_s: None,
+        operator: Operator::None,
+    };
+    let trace = run_case(&case, DT);
+    let min = trace.column("rods_min_pos");
+    let max = trace.column("rods_max_pos");
+    let avg = trace.column("rods_avg_pos");
+    assert!((max[0] - ROD_FULL_OUT).abs() < 1e-9, "some rods are fully out at full power: {}", max[0]);
+    assert!(min[0] <= avg[0] && avg[0] <= max[0]);
+    let last = trace.rows.len() - 1;
+    assert_eq!((min[last], max[last]), (0.0, 0.0), "all rods in after the scram");
+}
+```
+
+- [ ] **Step 6: Run the whole suite**
+
+Run: `set -o pipefail; cargo test --release -p bwr-core 2>&1 | tee /tmp/p5-t2.log | grep -E "^test |test result"`
+Expected: exit 0 and every test `ok`, including the 16 new `core_transients` tests and all pre-existing `plant`, `numerics` (with the two migrated tests), `conservation`, `vessel_transients`, `register` tests. `stuck_rod_ignores_every_mechanism` passes without `Sim` involvement because it sets `stuck` directly. On any failure stop here; the full log is in `/tmp/p5-t2.log`.
+
+- [ ] **Step 7: Commit (includes the migrated P3 test file)**
+
+```bash
+git add crates/bwr-core/src/reactor.rs crates/bwr-core/src/sim.rs crates/bwr-core/src/validation.rs docs/validation/method.md crates/bwr-core/tests/core_transients.rs crates/bwr-core/tests/numerics.rs
+git commit -m "feat(core): per-rod motion state machine with scram, SRI, motor and run-in mechanisms
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 3: Stuck-rod fault, dual-mechanism scram, and reset gating at plant level
+### Task 3: Stuck-rod fault honoured at plant level
 
 **Files:**
-- Modify: `crates/bwr-core/src/sim.rs` (`step`, scram path)
+- Modify: `crates/bwr-core/src/sim.rs` (`step`)
 - Modify: `crates/bwr-core/tests/core_transients.rs`
 
 **Interfaces:**
-- Consumes: `Fault::RodStuck { index }`, `Sim::set_fault`, `Sim::has_fault` (P2).
-- Produces: `rods.stuck` mirrored from faults each step; scram reset blocked while any rod is out.
+- Consumes: `Fault::RodStuck { index }`, `Sim::faults: Vec<Fault>`, `Sim::set_fault`, `Sim::has_fault` (P2); master step order position 2 (`rods.stuck <- faults`, right after `core.step_rods(dt)`).
+- Produces: `rods.stuck` mirrored from faults each step; a stuck rod survives scram and is never cleared by automatic logic.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -712,7 +1030,7 @@ fn first_rod_fully_out(sim: &Sim) -> usize {
 }
 
 #[test]
-fn stuck_rod_fault_survives_scram_and_blocks_reset() {
+fn stuck_rod_fault_survives_scram_and_is_visible_in_targets() {
     let mut sim = Sim::new(ScenarioName::FullPower);
     run(&mut sim, 1.0);
     let idx = first_rod_fully_out(&sim);
@@ -722,19 +1040,91 @@ fn stuck_rod_fault_survives_scram_and_blocks_reset() {
     sim.apply(Command::ManualScram);
     run(&mut sim, 20.0);
     assert_eq!(sim.core.rods.pos[idx], ROD_FULL_OUT, "stuck rod moved");
+    assert_eq!(sim.core.rods.motion[idx], RodMotion::Idle, "a stuck rod is never commanded");
     assert!(sim.core.rods.pos.iter().enumerate().all(|(i, &p)| i == idx || p == 0.0));
     assert!(sim.has_fault(&Fault::RodStuck { index: idx }), "automatic logic cleared the fault");
-    sim.apply(Command::ResetScram);
-    assert!(sim.scrammed, "reset must be blocked while a rod is out");
     let s = sim.snapshot();
-    assert!(s.alarms.iter().any(|a| a.text.contains("rods not fully inserted")), "{:?}", s.alarms);
-    // Clearing the fault lets the motor run-in finish and the reset succeed.
-    sim.set_fault(Fault::RodStuck { index: idx }, false);
-    sim.apply(Command::ManualScram); // re-issue so the freed rod receives a mechanism
-    run(&mut sim, 5.0);
-    assert!(sim.core.rods.all_in());
+    assert_eq!(s.rods.targets[idx], ROD_FULL_OUT, "TGT shows the stuck position, not 0");
+    assert!(!s.rods.scram_in_progress, "all commanded rods are in");
+    // Reset is permitted: every Scram/MotorRunIn rod is at 0 (the stuck rod was never commanded).
     sim.apply(Command::ResetScram);
     assert!(!sim.scrammed);
+    assert_eq!(sim.core.rods.pos[idx], ROD_FULL_OUT);
+    // After reset nothing is latched: clearing the fault leaves the rod Idle where it is,
+    // and the operator inserts it with a new scram.
+    sim.set_fault(Fault::RodStuck { index: idx }, false);
+    run(&mut sim, 1.0);
+    assert!(!sim.core.rods.stuck[idx]);
+    assert_eq!((sim.core.rods.motion[idx], sim.core.rods.pos[idx]), (RodMotion::Idle, ROD_FULL_OUT), "nothing is replayed after reset");
+    sim.apply(Command::ManualScram);
+    run(&mut sim, SCRAM_TIME + 1.0);
+    assert!(sim.core.rods.all_in());
+}
+
+#[test]
+fn freed_rod_resumes_insertion_while_the_scram_is_latched() {
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 1.0);
+    let idx = first_rod_fully_out(&sim);
+    sim.set_fault(Fault::RodStuck { index: idx }, true);
+    run(&mut sim, DT);
+    sim.apply(Command::ManualScram);
+    run(&mut sim, 20.0);
+    assert!(sim.scrammed && !sim.core.rods.scramming(), "latched but hydraulic insertion complete");
+    assert_eq!(sim.core.rods.pos[idx], ROD_FULL_OUT);
+    sim.set_fault(Fault::RodStuck { index: idx }, false);
+    run(&mut sim, 2.0 * DT);
+    assert_eq!(sim.core.rods.motion[idx], RodMotion::Scram, "the latched RPS demand is re-asserted on the freed rod");
+    assert!(sim.core.rods.scramming());
+    run(&mut sim, SCRAM_TIME + 1.0);
+    assert!(sim.core.rods.all_in());
+    assert!(!sim.core.rods.scramming(), "scramming() clears once the freed rod is in");
+}
+
+#[test]
+fn fault_during_scram_parks_the_rod_and_does_not_block_reset() {
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 1.0);
+    let idx = first_rod_fully_out(&sim);
+    sim.apply(Command::ManualScram);
+    run(&mut sim, 1.0); // mid-stroke: about 16 positions travelled
+    assert_eq!(sim.core.rods.motion[idx], RodMotion::Scram);
+    sim.set_fault(Fault::RodStuck { index: idx }, true);
+    sim.step(DT); // moves once more (step 1), then the refresh parks it (step 2)
+    let parked = sim.core.rods.pos[idx];
+    assert!(parked > 0.0 && parked < ROD_FULL_OUT - 10.0, "parked mid-stroke at {parked}");
+    assert_eq!(sim.core.rods.motion[idx], RodMotion::Idle, "a rod stuck mid-scram is parked, not left in Scram");
+    assert_eq!(sim.core.rods.target(idx), parked, "TGT = POS");
+    run(&mut sim, SCRAM_TIME + 1.0);
+    assert_eq!(sim.core.rods.pos[idx], parked, "parked rod moved");
+    assert!(!sim.core.rods.scramming(), "scramming() must not stick true because of the stuck rod");
+    assert!(sim.core.rods.pos.iter().enumerate().all(|(i, &p)| i == idx || p == 0.0));
+    sim.apply(Command::ResetScram);
+    assert!(!sim.scrammed, "reset must not be blocked by a parked stuck rod");
+    assert!(sim.core.rods.motion.iter().all(|m| *m == RodMotion::Idle));
+}
+
+#[test]
+fn stuck_rod_fault_is_applied_after_rods_step() {
+    // Master step order: rods move (step 1) before the fault mask is refreshed (step 2),
+    // so a fault and a command issued at the same boundary still move the rod once;
+    // the refresh then parks it with the motor command dropped.
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 1.0);
+    let idx = first_rod_fully_out(&sim);
+    sim.apply(Command::RodSetTarget { indices: vec![idx], target: ROD_FULL_OUT - 2.0 });
+    sim.set_fault(Fault::RodStuck { index: idx }, true);
+    sim.step(DT);
+    let after_one = sim.core.rods.pos[idx];
+    assert!(after_one < ROD_FULL_OUT, "the step in which the fault arrives still moves the rod once");
+    assert_eq!(sim.core.rods.motion[idx], RodMotion::Idle, "the motor command is dropped by the refresh");
+    run(&mut sim, 5.0);
+    assert_eq!(sim.core.rods.pos[idx], after_one, "stuck from the next step on");
+    // A motor command issued while the mask is current is ignored outright.
+    sim.apply(Command::RodSetTarget { indices: vec![idx], target: ROD_FULL_OUT - 4.0 });
+    run(&mut sim, 1.0);
+    assert_eq!(sim.core.rods.pos[idx], after_one);
+    assert_eq!(sim.core.rods.motion[idx], RodMotion::Idle);
 }
 
 #[test]
@@ -752,18 +1142,24 @@ fn scram_reset_clears_motion_when_all_in() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --release -p bwr-core --test core_transients stuck_rod_fault_survives_scram_and_blocks_reset 2>&1 | tail -5`
-Expected: FAIL at `assert!(sim.core.rods.stuck[idx])` ("fault must be mirrored into rods.stuck").
+Run: `cargo test --release -p bwr-core --test core_transients stuck_rod_fault > /tmp/p5-t3-red.log 2>&1; echo exit=$?; grep -n "panicked\|FAILED" /tmp/p5-t3-red.log`
+Expected: `exit=101`; FAIL at `assert!(sim.core.rods.stuck[idx])` ("fault must be mirrored into rods.stuck").
 
-- [ ] **Step 3: Mirror faults into the rods every step**
+- [ ] **Step 3: Mirror faults into the rods every step and re-assert a latched scram**
 
-In `Sim::step`, as the very first statements (before `self.core.step_rods(dt)` from P3):
+In `Sim::step`, immediately after `self.core.step_rods(dt);` (master step order position 2, after the rods have moved):
 
 ```rust
-        // Faults are the only source of stuck rods; copy them so the mechanism
-        // code never needs to know about the fault set.
-        for i in 0..N_RODS {
-            self.core.rods.stuck[i] = self.faults.contains(&Fault::RodStuck { index: i });
+        // Faults are the only source of stuck rods; the mask is mirrored here so the
+        // mechanism code never needs to know about the fault list. A rod that becomes
+        // stuck is parked Idle (its command dropped). While the RPS demand is latched
+        // a freed rod must resume insertion, so the scram is re-asserted every step;
+        // scram_hydraulic/motor_run_in skip rods at 0, so scramming() clears normally.
+        let stuck_mask: Vec<bool> = (0..N_RODS).map(|i| self.has_fault(&Fault::RodStuck { index: i })).collect();
+        self.core.rods.refresh_stuck(&stuck_mask);
+        if self.scrammed {
+            self.core.rods.scram_hydraulic();
+            self.core.rods.motor_run_in();
         }
 ```
 
@@ -771,14 +1167,14 @@ Add `use crate::faults::Fault;` to the `sim.rs` imports if P2 did not already.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --release -p bwr-core --test core_transients 2>&1 | grep -E "^test |test result"`
-Expected: all 9 tests `ok`.
+Run: `set -o pipefail; cargo test --release -p bwr-core --test core_transients 2>&1 | tee /tmp/p5-t3.log | grep -E "^test |test result"`
+Expected: exit 0; all 21 tests `ok`. Then the whole suite: `set -o pipefail; cargo test --release -p bwr-core 2>&1 | tee /tmp/p5-t3-all.log | grep -E "test result"` with exit 0 (the re-assert must not disturb `plant::manual_scram_shuts_down_without_isolation` or the P3 `numerics` tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/bwr-core/src/sim.rs crates/bwr-core/tests/core_transients.rs
-git commit -m "feat(core): honour Fault::RodStuck and gate scram reset on all-rods-in
+git commit -m "feat(core): honour Fault::RodStuck in the rod mechanisms
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -792,11 +1188,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Modify: `crates/bwr-core/src/reactor.rs` (`Core.clad_t`, `Core::step`)
 - Modify: `crates/bwr-core/src/sim.rs` (`full_power` initial temperatures)
 - Modify: `crates/bwr-core/src/api.rs`, `ui/src/sim/types.ts`, `ui/src/sim/mock.ts` (`cladTempC`)
+- Modify: `crates/bwr-core/src/validation.rs`, `docs/validation/method.md` (`clad_t_c` column)
 - Modify: `crates/bwr-core/tests/core_transients.rs`
 
 **Interfaces:**
 - Consumes: `Core::step(dt, coolant_t, htc_factor) -> Result<f64, DomainError>` as left by P3 (rods are no longer stepped inside).
-- Produces: `Core.clad_t: f64`, `Snapshot.neutronics.clad_temp_c`, constants `GAP_RESISTANCE_K_PER_W`, `CLAD_COOLANT_RESISTANCE_K_PER_W`, `CLAD_HEAT_CAP_J_PER_K`.
+- Produces: `Core.clad_t: f64` (public; P10's `Extrema.clad_t_c_max` reads it), `Snapshot.neutronics.clad_temp_c`, the `clad_t_c` trace column, constants `GAP_RESISTANCE_K_PER_W`, `CLAD_COOLANT_RESISTANCE_K_PER_W`, `CLAD_HEAT_CAP_J_PER_K`.
 
 Derivation (write this into the `params.rs` comments): at rated, 870e6 W x (1 - 0.025) = 848.25e6 W reaches the coolant through the fuel. Choosing average fuel ~552 degC and clad 12 K above the 287.7 degC coolant gives pellet+gap delta 252 K and clad-coolant delta 12 K, so `R_gap = 252 / 848.25e6 = 2.9712e-7 K/W` and `R_clad = 12 / 848.25e6 = 1.4148e-8 K/W`. Their sum, 264 K / 848.25e6 W, equals the former single-node `FUEL_RESISTANCE`, so rated fuel temperature is unchanged.
 
@@ -846,25 +1243,112 @@ fn clad_responds_faster_than_fuel_on_scram() {
     assert!(sim.core.clad_t >= sim.vessel.eos.t - 1e-6);
 }
 
+/// Component fixture for the thermal nodes: rated power held constant by setting the
+/// kinetics exactly critical (`rho_total = 0`; `update_reactivity` is NOT called, so the
+/// calibrated coefficients cannot push the fixture outside KIN_EXCESS_MAX), equilibrium
+/// precursors and decay heat, and the fixed source. Power drifts by under SOURCE * t
+/// (2e-4 over 20 s), which is below every tolerance used here.
+fn critical_core_at(fuel_t: f64, clad_t: f64) -> bwr_core::reactor::Core {
+    let mut c = bwr_core::reactor::Core::new(1.0, ROD_FULL_OUT, fuel_t);
+    c.clad_t = clad_t;
+    c.rho_total = 0.0;
+    c
+}
+
+/// Steady two-node temperatures for heat `q_fuel` through the fuel at coolant `t_cool`.
+fn steady_nodes(q_fuel: f64, t_cool: f64, htc: f64) -> (f64, f64) {
+    let clad = t_cool + CLAD_COOLANT_RESISTANCE_K_PER_W / htc * q_fuel;
+    (clad + GAP_RESISTANCE_K_PER_W * q_fuel, clad)
+}
+
 #[test]
-fn two_node_update_is_stable_for_large_steps() {
-    use bwr_core::reactor::Core;
-    let mut c = Core::new(1.0, ROD_FULL_OUT, 800.0);
-    c.update_reactivity(0.0, 287.0);
-    for _ in 0..10 {
-        c.step(5.0, 287.0, 1.0).unwrap();
-        assert!(c.fuel_t.is_finite() && c.clad_t.is_finite());
-        assert!(c.fuel_t >= c.clad_t - 1e-6 && c.clad_t >= 287.0 - 1e-6, "fuel {} clad {}", c.fuel_t, c.clad_t);
+fn two_node_update_is_stable_and_converges_for_every_step_size() {
+    for &dt in &[DT, 0.5, 5.0, 50.0] {
+        let mut c = critical_core_at(800.0, 800.0);
+        let q_fuel = c.thermal_power() * (1.0 - DIRECT_COOLANT_HEAT);
+        let (f_inf, c_inf) = steady_nodes(q_fuel, 287.0, 1.0);
+        let mut t = 0.0;
+        while t < 600.0 {
+            let q = c.step(dt, 287.0, 1.0).unwrap_or_else(|e| panic!("dt {dt}: thermal step rejected: {e:?}"));
+            t += dt;
+            assert!(q.is_finite() && c.fuel_t.is_finite() && c.clad_t.is_finite(), "dt {dt}");
+            assert!(c.fuel_t >= c.clad_t - 1e-6 && c.clad_t >= 287.0 - 1e-6, "dt {dt}: fuel {} clad {}", c.fuel_t, c.clad_t);
+            assert!(c.fuel_t <= 800.0 + 1e-6, "dt {dt}: no overshoot above the initial state");
+        }
+        assert!((c.kin.n - 1.0).abs() < 1e-3, "dt {dt}: fixture power drifted to {}", c.kin.n);
+        assert!((c.fuel_t - f_inf).abs() < 0.5 && (c.clad_t - c_inf).abs() < 0.5, "dt {dt}: ({}, {}) vs steady ({f_inf}, {c_inf})", c.fuel_t, c.clad_t);
     }
+}
+
+#[test]
+fn two_node_energy_identity_holds_each_step() {
+    // Generated thermal energy = fuel storage + clad storage + energy returned to the
+    // coolant, exactly, for backward Euler; includes DIRECT_COOLANT_HEAT and reduced coverage.
+    for &(htc, dt, fuel0, clad0) in &[(1.0, DT, 800.0, 600.0), (0.3, DT, 800.0, 600.0), (0.02, 0.5, 1400.0, 1400.0), (1.0, 5.0, 300.0, 290.0)] {
+        let mut c = critical_core_at(fuel0, clad0);
+        let q_out = c.step(dt, 287.0, htc).unwrap();
+        let p = c.thermal_power(); // the value used inside step: nothing advances after the thermal update
+        let stored = FUEL_HEAT_CAP * (c.fuel_t - fuel0) + CLAD_HEAT_CAP_J_PER_K * (c.clad_t - clad0);
+        let generated = p * dt;
+        let removed = q_out * dt;
+        assert!(
+            (generated - stored - removed).abs() < 1e-9 * generated.abs(),
+            "htc {htc} dt {dt}: generated {generated:.3e} = stored {stored:.3e} + removed {removed:.3e}"
+        );
+        assert!(q_out.is_finite());
+    }
+}
+
+#[test]
+fn two_node_transient_matches_an_independent_rk4_reference() {
+    // Constant-input relaxation from a hot fuel node (cladding started near its
+    // quasi-steady value so the stiff clad mode is small) compared with a classical RK4
+    // integration of the same two ODEs at h = 1e-4 s. Predeclared bound: 2 K on both
+    // nodes at every checkpoint; the final state must also sit within 1 K of the
+    // analytic steady state.
+    let (t_cool, htc) = (287.0, 1.0);
+    let mut c = critical_core_at(800.0, 320.0);
+    let q_fuel = c.thermal_power() * (1.0 - DIRECT_COOLANT_HEAT);
+    let r_g = GAP_RESISTANCE_K_PER_W;
+    let r_c = CLAD_COOLANT_RESISTANCE_K_PER_W / htc;
+    let deriv = |tf: f64, tc: f64| {
+        let gap = (tf - tc) / r_g;
+        ((q_fuel - gap) / FUEL_HEAT_CAP, (gap - (tc - t_cool) / r_c) / CLAD_HEAT_CAP_J_PER_K)
+    };
+    let (mut rf, mut rc) = (c.fuel_t, c.clad_t);
+    let h = 1e-4;
+    let mut t_ref = 0.0;
+    let mut t_core = 0.0;
+    for &tk in &[1.0, 5.0, 20.0] {
+        while t_ref < tk - 1e-9 {
+            let (k1f, k1c) = deriv(rf, rc);
+            let (k2f, k2c) = deriv(rf + 0.5 * h * k1f, rc + 0.5 * h * k1c);
+            let (k3f, k3c) = deriv(rf + 0.5 * h * k2f, rc + 0.5 * h * k2c);
+            let (k4f, k4c) = deriv(rf + h * k3f, rc + h * k3c);
+            rf += h / 6.0 * (k1f + 2.0 * k2f + 2.0 * k3f + k4f);
+            rc += h / 6.0 * (k1c + 2.0 * k2c + 2.0 * k3c + k4c);
+            t_ref += h;
+        }
+        while t_core < tk - 1e-9 {
+            c.step(DT, t_cool, htc).unwrap();
+            t_core += DT;
+        }
+        assert!((c.fuel_t - rf).abs() < 2.0, "t={tk}: fuel {} vs RK4 {rf}", c.fuel_t);
+        assert!((c.clad_t - rc).abs() < 2.0, "t={tk}: clad {} vs RK4 {rc}", c.clad_t);
+    }
+    let (f_inf, c_inf) = steady_nodes(q_fuel, t_cool, htc);
+    assert!((c.fuel_t - f_inf).abs() < 1.0 && (c.clad_t - c_inf).abs() < 1.0, "steady ({}, {}) vs ({f_inf}, {c_inf})", c.fuel_t, c.clad_t);
 }
 ```
 
+Also extend P3's argument-guard test so the new node is covered (`crates/bwr-core/tests/numerics.rs`, `kinetics_and_core_reject_invalid_step_arguments_unchanged`): after the line `assert_eq!(core.fuel_t, core0.fuel_t, "{what}");` add `assert_eq!(core.clad_t, core0.clad_t, "{what}");`. Every original assertion stays.
+
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --release -p bwr-core --test core_transients rated_fuel 2>&1 | head -10`
-Expected: compile error `no field clad_t on type Core` / `cannot find value CLAD_COOLANT_RESISTANCE_K_PER_W`.
+Run: `cargo test --release -p bwr-core --test core_transients rated_fuel > /tmp/p5-t4-red.log 2>&1; echo exit=$?; grep -n "no field\|cannot find" /tmp/p5-t4-red.log`
+Expected: `exit=101`; compile error `no field clad_t on type Core` / `cannot find value CLAD_COOLANT_RESISTANCE_K_PER_W`.
 
-- [ ] **Step 3: Parameters**
+- [ ] **Step 3: Parameters and their register rows (same task, master register-row rule)**
 
 In `params.rs`, delete the two lines
 
@@ -876,18 +1360,29 @@ pub const FUEL_RESISTANCE: f64 = 264.0 / (RATED_POWER_W * (1.0 - DIRECT_COOLANT_
 and insert in their place:
 
 ```rust
-/// Heat reaching the coolant through the fuel at rated power, W.
-const Q_FUEL_RATED: f64 = RATED_POWER_W * (1.0 - DIRECT_COOLANT_HEAT);
-/// Pellet + gap thermal resistance, K/W: 252 K at rated (avg fuel ~552 degC). ASSUMED (A-054).
+/// Heat reaching the coolant through the fuel at rated power, W. DERIVED.
+pub const Q_FUEL_RATED: f64 = RATED_POWER_W * (1.0 - DIRECT_COOLANT_HEAT);
+/// Pellet + gap thermal resistance, K/W: 252 K at rated (avg fuel ~552 degC). ASSUMED (A-050).
 pub const GAP_RESISTANCE_K_PER_W: f64 = 252.0 / Q_FUEL_RATED;
-/// Cladding-to-coolant resistance, K/W: 12 K at rated. ASSUMED (A-054).
+/// Cladding-to-coolant resistance, K/W: 12 K at rated. ASSUMED (A-050).
 /// GAP + CLAD = 264 K at rated, equal to the former single-node FUEL_RESISTANCE.
 pub const CLAD_COOLANT_RESISTANCE_K_PER_W: f64 = 12.0 / Q_FUEL_RATED;
-/// Cladding lumped heat capacity (~9.5 t Zircaloy x 330 J/kgK), J/K. ASSUMED (A-055).
+/// Cladding lumped heat capacity (~9.5 t Zircaloy x 330 J/kgK), J/K. ASSUMED (A-051).
 pub const CLAD_HEAT_CAP_J_PER_K: f64 = 3.1e6;
 ```
 
-- [ ] **Step 4: Cladding node in `Core`**
+In `docs/model/parameters.csv`: delete P1's `FUEL_RESISTANCE` row (the constant no longer exists; `every_params_const_is_registered` checks params.rs -> csv, and the history lives in the `GAP_RESISTANCE_K_PER_W` notes), and append (13 fields each, no commas inside fields):
+
+```
+Q_FUEL_RATED,8.4825e8,W,Heat reaching the coolant through the fuel at rated power: RATED_POWER_W x (1 - DIRECT_COOLANT_HEAT),hot full power,derived,derived,,,,A-005,crates/bwr-core/src/params.rs,denominator of the two thermal resistances
+GAP_RESISTANCE_K_PER_W,2.9712e-7,K/W,Pellet plus gap thermal resistance (252 K at Q_FUEL_RATED),hot full power,BWRX-300,assumed,,2.4e-7,3.6e-7,A-050,crates/bwr-core/src/params.rs,sum with CLAD_COOLANT_RESISTANCE_K_PER_W equals the former single-node FUEL_RESISTANCE (264 K at rated) removed in Package 5 so rated fuel temperature is unchanged
+CLAD_COOLANT_RESISTANCE_K_PER_W,1.4148e-8,K/W,Cladding to coolant thermal resistance (12 K at Q_FUEL_RATED),hot full power,BWRX-300,assumed,,0.7e-8,2.8e-8,A-050,crates/bwr-core/src/params.rs,scaled by 1/htc_factor (floor 0.02) when the core is uncovered
+CLAD_HEAT_CAP_J_PER_K,3.1e6,J/K,Cladding lumped heat capacity (9.5 t Zircaloy x 330 J/kgK),any,BWRX-300,assumed,,2.5e6,4.0e6,A-051,crates/bwr-core/src/params.rs,affects sub-second clad response only
+```
+
+Run the register gate now: `cargo test --release -p bwr-core --test register` (expected: all `ok`; the A-050/A-051 rows exist from Task 1).
+
+- [ ] **Step 4: Cladding node in `Core` (P3 argument guards preserved)**
 
 In `reactor.rs`, add the field after `fuel_t`:
 
@@ -900,7 +1395,7 @@ In `reactor.rs`, add the field after `fuel_t`:
 
 In `Core::new`, add `clad_t: fuel_t,` next to `fuel_t,`.
 
-Replace the thermal part of `Core::step` (everything after `self.decay.step(self.kin.n, dt);`) so the whole function reads:
+Replace the thermal part of `Core::step` (everything after `self.decay.step(self.kin.n, dt);`). P3's three argument guards stay exactly where they are, BEFORE `kin.advance`, so `kinetics_and_core_reject_invalid_step_arguments_unchanged` keeps passing (the kinetics validate `dt` but cannot validate `coolant_t` or `htc_factor`; without the guards a NaN coolant temperature would advance kinetics, xenon and decay heat before corrupting both nodes). The whole function reads:
 
 ```rust
     /// Advance neutronics, xenon, decay heat and the fuel/cladding nodes.
@@ -909,6 +1404,16 @@ Replace the thermal part of `Core::step` (everything after `self.decay.step(self
     /// heat transfer (1 = normal, lower when the core is uncovered).
     /// Returns heat delivered to the coolant, W.
     pub fn step(&mut self, dt: f64, coolant_t: f64, htc_factor: f64) -> Result<f64, DomainError> {
+        // Master dt rule and non-finite inputs rule (P3): every argument, before any mutation.
+        if !(dt.is_finite() && dt > 0.0) {
+            return Err(DomainError::PropertyOutOfRange { what: "dt".into(), value: dt });
+        }
+        if !coolant_t.is_finite() {
+            return Err(DomainError::PropertyOutOfRange { what: "coolant_t".into(), value: coolant_t });
+        }
+        if !htc_factor.is_finite() {
+            return Err(DomainError::PropertyOutOfRange { what: "htc_factor".into(), value: htc_factor });
+        }
         self.kin.advance(self.rho_total, SOURCE, dt)?;
         self.xenon.step(self.kin.n, dt);
         self.decay.step(self.kin.n, dt);
@@ -970,18 +1475,47 @@ with
 
 where `fuelTempC` and `coolantTempC` are the expressions already used for `fuelTempC:` and `vessel.coolantTempC:` in that literal (bind them to local `const`s above the literal if they are inline expressions).
 
-- [ ] **Step 7: Run tests and UI typecheck**
+- [ ] **Step 7: Populate the `clad_t_c` trace column**
 
-Run: `cargo test --release -p bwr-core 2>&1 | grep -E "^test |test result"`
-Expected: all `ok`, including the three new tests. `plant::full_power_is_steady` must still pass without retuning.
+In `crates/bwr-core/src/validation.rs`, in the row-filling code of `run_case` (locate it with `grep -n 'clad_t_c\|"fuel_t_c"' crates/bwr-core/src/validation.rs`), replace the `0.0` placeholder for `clad_t_c` with `sim.core.clad_t`. In `docs/validation/method.md`, change the `clad_t_c` provenance from "0.0 until Package 5" to "populated from Package 5 (`Core.clad_t`)".
+
+Append to `crates/bwr-core/tests/core_transients.rs`:
+
+```rust
+#[test]
+fn trace_clad_column_is_populated() {
+    let case = Case {
+        id: "p5_clad_column",
+        scenario: ScenarioName::FullPower,
+        duration_s: 5.0,
+        sample_dt_s: 1.0,
+        commands: vec![],
+        faults: vec![],
+        dt_after_s: None,
+        operator: Operator::None,
+    };
+    let trace = run_case(&case, DT);
+    let clad = trace.column("clad_t_c");
+    let fuel = trace.column("fuel_t_c");
+    let cool = trace.column("t_coolant_c");
+    for k in 0..trace.rows.len() {
+        assert!(cool[k] < clad[k] && clad[k] < fuel[k], "row {k}: coolant {} clad {} fuel {}", cool[k], clad[k], fuel[k]);
+    }
+}
+```
+
+- [ ] **Step 8: Run tests and UI typecheck**
+
+Run: `set -o pipefail; cargo test --release -p bwr-core 2>&1 | tee /tmp/p5-t4.log | grep -E "^test |test result"`
+Expected: exit 0; all `ok`, including the six new tests (`rated_fuel_and_clad_temperatures_match_resistance_derivation`, `clad_responds_faster_than_fuel_on_scram`, `two_node_update_is_stable_and_converges_for_every_step_size`, `two_node_energy_identity_holds_each_step`, `two_node_transient_matches_an_independent_rk4_reference`, `trace_clad_column_is_populated`), the extended `numerics::kinetics_and_core_reject_invalid_step_arguments_unchanged`, and `register`. `plant::full_power_is_steady` must still pass without retuning. The three component tests are this package's independent physical gates for the thermal model and are re-run before baseline regeneration (Task 11).
 
 Run: `npm --prefix ui run typecheck`
 Expected: exit 0, no output.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add crates/bwr-core/src/params.rs crates/bwr-core/src/reactor.rs crates/bwr-core/src/sim.rs crates/bwr-core/src/api.rs crates/bwr-core/tests/core_transients.rs ui/src/sim/types.ts ui/src/sim/mock.ts
+git add crates/bwr-core/src/params.rs crates/bwr-core/src/reactor.rs crates/bwr-core/src/sim.rs crates/bwr-core/src/api.rs crates/bwr-core/src/validation.rs docs/validation/method.md docs/model/parameters.csv crates/bwr-core/tests/core_transients.rs crates/bwr-core/tests/numerics.rs ui/src/sim/types.ts ui/src/sim/mock.ts
 git commit -m "feat(core): two-node fuel/cladding thermal model replacing the single fuel node
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -1054,10 +1588,10 @@ Append to `params.rs` core section:
 
 ```rust
 /// Cladding temperature above which the fuel thermal model is outside its
-/// envelope. An indication, not a damage limit (A-054). ASSUMED.
+/// envelope. An indication, not a damage limit (A-050). ASSUMED.
 pub const FUEL_MODEL_T_MAX_C: f64 = 1000.0;
 /// Continuous core-uncovered time after which the thermal model is outside
-/// its envelope (no post-dryout heat transfer modelled). ASSUMED (A-054).
+/// its envelope (no post-dryout heat transfer modelled). ASSUMED (A-050).
 pub const UNCOVERED_ENVELOPE_S: f64 = 60.0;
 ```
 
@@ -1072,18 +1606,9 @@ Remove the field `pub core_damage: bool,` from `Sim` and its initialiser `core_d
 
 initialised to `0.0` in `base()`.
 
-If P3 did not already provide a recording helper, add this method to `impl Sim` (if P3 provided one with a different name, use P3's and skip this):
+Add to `impl Sim` (P3's public `Sim::domain_error(e)` records the first occurrence of each variant and logs it; this package only adds the query and the test hook):
 
 ```rust
-    /// Record the first occurrence of each domain-error variant and log it.
-    pub fn record_domain_error(&mut self, e: DomainError) {
-        let dup = self.domain_errors.iter().any(|(_, x)| std::mem::discriminant(x) == std::mem::discriminant(&e));
-        if !dup {
-            self.log.push((self.time, format!("domain error: {e:?}")));
-            self.domain_errors.push((self.time, e));
-        }
-    }
-
     pub fn fuel_envelope_exceeded(&self) -> bool {
         self.domain_errors.iter().any(|(_, e)| matches!(e, DomainError::FuelModelEnvelope { .. }))
     }
@@ -1108,7 +1633,7 @@ with
 ```rust
         // Fuel thermal model envelope (not a damage verdict; see docs/model/core.md section 5).
         if self.core.clad_t > FUEL_MODEL_T_MAX_C || self.uncovered_s > UNCOVERED_ENVELOPE_S {
-            self.record_domain_error(DomainError::FuelModelEnvelope { fuel_t_c: self.core.fuel_t, clad_t_c: self.core.clad_t });
+            self.domain_error(DomainError::FuelModelEnvelope { fuel_t_c: self.core.fuel_t, clad_t_c: self.core.clad_t });
         }
 ```
 
@@ -1332,7 +1857,7 @@ Expected: compile error `no function or associated item named after_history`.
 `params.rs`: replace the existing `DECAY_GROUPS` doc comment and array with the contents of `/tmp/decay_groups.rs`. Append after it:
 
 ```rust
-/// Irradiation time at rated power assumed before each scenario's cooling period, s (2 years). ASSUMED (A-056).
+/// Irradiation time at rated power assumed before each scenario's cooling period, s (2 years). ASSUMED (A-052).
 pub const IRRADIATION_HISTORY_S: f64 = 6.31e7;
 ```
 
@@ -1505,7 +2030,8 @@ In `reactor.rs`, before `pub struct Core`, add:
 ```rust
 /// Feedback coefficients. Defaults are the calibrated `params.rs` values; a
 /// sensitivity study builds a plant with modified values via `Sim::full_power_with`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Derives per the master Derives rule: Clone, Copy, Debug (Default is manual).
+#[derive(Clone, Copy, Debug)]
 pub struct ReactivityCoeffs {
     /// dk/k per unit core-average void fraction.
     pub void: f64,
@@ -1599,18 +2125,19 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 Append to `crates/bwr-core/tests/core_transients.rs`:
 
 ```rust
-/// `SDM_REQUIRED` from parameters.csv if its status is `confirmed`; None otherwise.
+/// `SDM_REQUIRED` from parameters.csv (locked header; row found by `id`, columns by name) if its
+/// status is `confirmed`; None otherwise. Rows read here must not contain quoted commas.
 fn sdm_required() -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/model/parameters.csv");
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
     let header: Vec<&str> = lines.next()?.split(',').map(|s| s.trim()).collect();
-    let name_i = header.iter().position(|h| *h == "name")?;
+    let id_i = header.iter().position(|h| *h == "id")?;
     let value_i = header.iter().position(|h| *h == "value")?;
     let status_i = header.iter().position(|h| *h == "status")?;
     for line in lines {
         let cols: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-        if cols.get(name_i) == Some(&"SDM_REQUIRED") && cols.get(status_i) == Some(&"confirmed") {
+        if cols.get(id_i) == Some(&"SDM_REQUIRED") && cols.get(status_i) == Some(&"confirmed") {
             return cols.get(value_i)?.parse().ok();
         }
     }
@@ -1797,7 +2324,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Modify: `docs/validation/baseline/*.csv`, `docs/model/parameters.csv`, `docs/model/coverage.md`, `docs/model/core.md`
 
 **Interfaces:**
-- Consumes: P2's `examples/validation.rs` and its documented update mode (see `docs/validation/method.md`).
+- Consumes: P2's `examples/validation.rs` with its `--write` flag (see `docs/validation/method.md`).
 
 - [ ] **Step 1: Compare before and after**
 
@@ -1806,7 +2333,7 @@ Expected: comparison violations only in metrics explained by this package (fuel 
 
 - [ ] **Step 2: Regenerate baselines**
 
-Run the update mode documented in `docs/validation/method.md` (P2 defines it as `cargo run --release -p bwr-core --example validation -- --update`; use method.md's flag if it differs).
+Run: `cargo run --release -p bwr-core --example validation -- --write` (P2's baseline-writing flag, documented in `docs/validation/method.md`).
 Expected: baselines rewritten; a second plain run reports zero violations.
 
 - [ ] **Step 3: Close the register**
@@ -1815,9 +2342,10 @@ Verify every constant touched in this package has a `parameters.csv` row: run
 
 ```bash
 for n in GAP_RESISTANCE_K_PER_W CLAD_COOLANT_RESISTANCE_K_PER_W CLAD_HEAT_CAP_J_PER_K FUEL_MODEL_T_MAX_C UNCOVERED_ENVELOPE_S IRRADIATION_HISTORY_S SDM_REQUIRED DECAY_GROUPS; do grep -q "^$n," docs/model/parameters.csv && echo "ok $n" || echo "MISSING $n"; done
+cut -d, -f1 docs/model/parameters.csv | sort | uniq -d
 ```
 
-Expected: eight `ok` lines. Add a `DECAY_GROUPS` row (status `calibrated`, note "fit to decay-heat-reference.csv, max rel err <value from the tool>") if missing.
+Expected: eight `ok` lines and no duplicate ids. Update the `DECAY_GROUPS` row's `notes` with the maximum relative error printed by the fit tool.
 
 In `docs/model/coverage.md`, update the core/fuel/rods row: evidence = core.md; tests = `core_transients.rs` (list the test names) and the reactor unit tests; limitations = "no axial/channel model, no exposure dependence, no PCT/CPR, rod speeds assumed, SDM requirement unavailable unless sourced".
 
@@ -1860,9 +2388,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 | Verify iodine/xenon equilibrium, shutdown peak, restart, power-history dependence | 7 |
 | Reassess decay heat against an identified public reference, finite irradiation history, uncertainty; no "exact standards" claim | 6 |
 | Separate fuel and cladding; replace the 1200 C rule; no PCT/CPR claims | 4, 5 |
-| Hydraulic scram, alternate initiation, motor run-in as distinct mechanisms | 2, 3 |
+| Hydraulic scram, SRI, motor run-in as distinct mechanisms; ARI reuses them (P8, `ARI_ENABLED = false`) | 2, 3 |
 | All-rods-in, strongest-rod, paired-rod, cold xenon-free SDM; sourced margin targets | 9 |
 | Stuck-rod fault honoured (master `Fault::RodStuck`) | 3 |
+| Trace schema v2 columns `clad_t_c`, `rods_min_pos`, `rods_max_pos` populated | 2, 4 |
 | Register, assumptions, applicability, baselines | 1, 11 |
 
 **Acceptance gate (verbatim):** Supported reactivity and shutdown behavior has reproducible evidence. Uncertain rod worth, feedback, and fuel limits cannot silently appear as confirmed plant performance.
