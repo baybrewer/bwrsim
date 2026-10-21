@@ -323,7 +323,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Modify: `docs/model/sources.csv`, `docs/model/parameters.csv`
 
 **Interfaces:**
-- Produces: `pub const T_TABLE_MIN: f64 = 1.0`, `pub const T_TABLE_MAX: f64 = 350.0`, `Sat.kappa_f: f64` (1/Pa), `pub fn compressed_liquid_rho(t: f64, p: f64) -> f64`.
+- Produces: `pub const T_TABLE_MIN: f64 = 1.0`, `pub const T_TABLE_MAX: f64 = 350.0`, `pub const T_COMPRESSED_MAX: f64 = 300.0`, `Sat.kappa_f: f64` (1/Pa), `pub fn compressed_liquid_rho(t: f64, p: f64) -> f64`, `tools/gen_steam_table.py --grid | --kappa`.
+- Register rows in this task (Step 7): `KAPPA_F_TABLE`, `T_TABLE_MIN`, `T_TABLE_MAX`, `T_COMPRESSED_MAX`; sources `SRC-IAPWS-IF97`, `SRC-KELL-1975`, `SRC-COOLPROP`; assumptions `A-042`, `A-046`.
 
 - [ ] **Step 1: Write the failing tests in `crates/bwr-core/src/steam.rs`**
 
@@ -1157,7 +1158,7 @@ Replace `sat_for_core` and add `steam_available`:
 ```rust
     /// Saturation state the core boils against: the total vessel pressure. A cold
     /// air-filled vessel at 0.1 MPa therefore does not boil below 100 degC. The
-    /// downcomer hydrostatic head is neglected (A-P4-5).
+    /// downcomer hydrostatic head is neglected (A-044).
     fn sat_for_core(&self) -> Sat {
         sat_p(self.eos.p)
     }
