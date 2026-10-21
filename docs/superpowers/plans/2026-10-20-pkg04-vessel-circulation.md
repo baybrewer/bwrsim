@@ -629,13 +629,20 @@ T_TABLE_MAX,350.0,degC,last saturation-table temperature,-,physics,confirmed,SRC
 T_COMPRESSED_MAX,300.0,degC,upper temperature of the supported linear-compressibility domain,-,numerical,derived,SRC-IAPWS-IF97;SRC-COOLPROP,none,none,,crates/bwr-core/src/steam.rs,chosen so the linear law stays within 0.5 % of IF97 density up to 10 MPa above saturation; about 5 % at 349.5 degC
 ```
 
+Append to the table in `docs/model/assumptions.md` (P1 schema; the property approximations are introduced here and cited by `vessel.md` and the vessel code):
+
+```markdown
+| A-042 | Neglected energy and compression terms | The noncondensable gas internal energy, the pressure work on compressed liquid in the vessel energy balance, and the compression of the liquid by the gas partial pressure in the volume closure and level inversion are neglected. | Gas energy below 0.1 % of vessel energy; liquid compression by p_gas bounded by kappa_f(t) p_gas, below 0.1 % of liquid volume for p_gas <= 0.5 MPa and t <= 300 degC (`steam::tests::gas_compression_of_liquid_is_negligible`). | no intervals | Package 4 |
+| A-046 | Compressed-liquid properties | Compressed-liquid density is the linear law rho_f(t)(1 + kappa_f(t)(p - p_sat)), supported for t <= T_COMPRESSED_MAX and p - p_sat <= 10 MPa with density error below 0.5 % against IF97; compressed-liquid enthalpy is the saturated-liquid enthalpy at the same temperature, neglecting v_f (p - p_sat): about 8 % at 20 degC / 7 MPa, 0.9 % at 215 degC / 7 MPa (feedwater), below 0.2 % above 285 degC. | Measured errors recorded in KAPPA_F_TABLE notes; the feed enthalpy bias is an accuracy limit, not a conservation error (vessel and ledger use the same h). | T_COMPRESSED_MAX derived: largest temperature at which the 0.5 % density limit holds on the reference grid | Package 4 |
+```
+
 Run: `cargo test --release -p bwr-core --test register`
 Expected: exit 0 (every constant has a row; every source id exists; no `UNRETRIEVED` field).
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add tools/gen_steam_table.py crates/bwr-core/src/steam_table.rs crates/bwr-core/src/steam.rs docs/model/sources.csv docs/model/parameters.csv
+git add tools/gen_steam_table.py docs/model/assumptions.md crates/bwr-core/src/steam_table.rs crates/bwr-core/src/steam.rs docs/model/sources.csv docs/model/parameters.csv
 git commit -m "feat(steam): liquid compressibility column and IAPWS reference-point tests
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -1747,8 +1754,8 @@ fn water_solid_pressure_rises_steeply_and_leaves_envelope() {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cargo test --release -p bwr-core --test vessel_transients`
-Expected: `closed_vessel_heatup_transitions_gas_to_saturated` fails (pressure or regime assertions, because vent/gas dynamics are not yet in `step`), `vented_heatup_purges_air_and_closes_ledger` fails (gas never purged; ledger energy residual from the interim `step`), `regime_boundaries_are_continuous_and_cross_once` fails on (a) or (b), and/or `water_solid_pressure_rises_steeply_and_leaves_envelope` fails on the regime assertion. `cold_vented_vessel_is_atmospheric` may pass already. Record which fail.
+Run: `cargo test --release -p bwr-core --test vessel_transients > /tmp/p4t4a.log 2>&1; echo "exit=$?"; grep -n "^test \|test result" /tmp/p4t4a.log`
+Expected: nonzero exit. `step_rejects_invalid_arguments_unchanged` fails on the `dt` cases (the interim `step` has no dt guard), `closed_vessel_heatup_transitions_gas_to_saturated` fails (pressure or regime assertions, because vent/gas dynamics are not yet in `step`), `vented_heatup_purges_air_and_closes_ledger` fails (gas never purged; ledger energy residual from the interim `step`), `regime_boundaries_are_continuous_and_cross_once` fails on (a) or (b), `steam_space_cap_binds_and_reports_deficit` and `final_drain_commits_bounded_flows` fail (no steam-space or liquid cap yet), and/or `water_solid_pressure_rises_steeply_and_leaves_envelope` fails on the regime assertion. `cold_vented_vessel_is_atmospheric` may pass already. Record which fail in the commit body.
 
 - [ ] **Step 3: Replace `Vessel::step`**
 
@@ -1763,76 +1770,91 @@ pub const VENT_BOILOFF_KGS_PER_K: f64 = 0.02;
 Replace the body of `pub fn step(&mut self, dt: f64, inp: &VesselInputs) -> BoundaryFlows` up to the core-inlet enthalpy block with:
 
 ```rust
+        // Master dt and non-finite rules: validate before any state write. Nothing is
+        // applied, `last_error` names the offending argument, and every field keeps
+        // its entry value except `vent_flow` (the applied vent flow of this step: 0).
+        if !(dt.is_finite() && dt > 0.0) {
+            self.last_error = Some(DomainError::PropertyOutOfRange { what: "dt".into(), value: dt });
+            self.vent_flow = 0.0;
+            return BoundaryFlows::default();
+        }
+        let fields = [
+            ("q_core", inp.q_core), ("q_ic", inp.q_ic), ("w_feed", inp.w_feed),
+            ("h_feed", inp.h_feed), ("w_steam", inp.w_steam), ("w_liquid_out", inp.w_liquid_out),
+        ];
+        if let Some((what, value)) = fields.iter().find(|(_, v)| !v.is_finite()) {
+            self.last_error = Some(DomainError::PropertyOutOfRange { what: format!("vessel input {what}"), value: *value });
+            self.vent_flow = 0.0;
+            return BoundaryFlows::default();
+        }
+
         let t_before = self.eos.t;
         let eos = self.eos;
         let s_steam = sat_t(eos.t);
         let h_liq = steam::h_liquid(eos.t);
         let heat_loss = HEAT_LOSS_HOT * ((eos.t - 20.0) / 268.0).max(0.0);
 
-        // Steam-space composition. Steam and noncondensable gas leave through the
-        // steam lines and the head vent in proportion to their masses, and no more
-        // steam can leave in a step than the steam space holds, so every outflow is
-        // continuous across regime boundaries (no label-dependent switch; see
-        // docs/model/vessel.md section 4).
+        // Inventories available this step (docs/model/vessel.md section 4). Only the
+        // free gas is swept; the dissolved capacity stays. No label is read here.
         let m_steam_space = (self.mass * eos.x).max(0.0);
-        let m_gas = self.gas_mass.max(0.0);
-        let y_steam = if m_steam_space + m_gas > 0.0 { m_steam_space / (m_steam_space + m_gas) } else { 0.0 };
+        let m_liquid = (self.mass - m_steam_space).max(0.0);
+        let m_free_gas = (self.gas_mass - DISSOLVED_GAS_CAPACITY_KG).max(0.0);
+        let y_steam = if m_steam_space + m_free_gas > 0.0 { m_steam_space / (m_steam_space + m_free_gas) } else { 0.0 };
 
-        // Main steam lines: the requested draw, split by composition.
-        let w_line_steam_raw = inp.w_steam.max(0.0) * y_steam;
-        let w_line_gas_raw = inp.w_steam.max(0.0) * (1.0 - y_steam);
-
-        // Head vent: relief above atmospheric, air ingress below (gas only, no energy).
-        // A water-solid vessel has no steam space and the vent passes nothing (A-P4-2).
-        let mut w_vent_steam_raw = 0.0;
-        let mut w_vent_gas_raw = 0.0;
-        let mut w_air_in = 0.0;
-        if self.head_vent_open && eos.regime != Regime::WaterSolid {
+        // Requests. The steam-line request is for steam (water) mass; free gas is swept
+        // along with the applied line steam in the dome mass ratio, outside the water
+        // ledger and never counted against the request (A-043). The head vent passes
+        // dome fluid by composition when there is a steam space (x > 0; a water-solid
+        // vessel has none and the vent passes nothing, A-041) and admits air (no
+        // energy) below atmospheric. No liquid leaves through either path.
+        let w_line_steam_req = inp.w_steam.max(0.0);
+        let gas_per_steam = if m_steam_space > 0.0 { m_free_gas / m_steam_space } else { 0.0 };
+        let (mut w_vent_steam_req, mut w_vent_gas_req, mut w_air_in) = (0.0, 0.0, 0.0);
+        if self.head_vent_open && eos.x > 0.0 {
             let dp = eos.p - P_ATM;
             if dp > 0.0 {
                 let w = C_HEAD_VENT * dp + VENT_BOILOFF_KGS_PER_K * (eos.t - 100.0).max(0.0);
-                w_vent_steam_raw = w * y_steam;
-                w_vent_gas_raw = w * (1.0 - y_steam);
+                w_vent_steam_req = w * y_steam;
+                w_vent_gas_req = w * (1.0 - y_steam);
             } else {
                 w_air_in = C_HEAD_VENT * (-dp);
             }
         }
-
-        // Steam-space and gas caps: proportional scaling keeps the line/vent split.
-        let steam_cap = m_steam_space / dt;
-        let steam_raw = w_line_steam_raw + w_vent_steam_raw;
-        let f_steam = if steam_raw > steam_cap && steam_raw > 0.0 { steam_cap / steam_raw } else { 1.0 };
-        let gas_cap = m_gas / dt;
-        let gas_raw = w_line_gas_raw + w_vent_gas_raw;
-        let f_gas = if gas_raw > gas_cap && gas_raw > 0.0 { gas_cap / gas_raw } else { 1.0 };
-        let w_steam_req = w_line_steam_raw * f_steam;
-        let w_vent_steam_raw = w_vent_steam_raw * f_steam;
-        let w_gas_out = gas_raw * f_gas;
-        let h_steam_out = s_steam.h_g;
         let w_liquid_req = inp.w_liquid_out.max(0.0);
 
-        // Transfer-allocation point (master step 8): bound ALL water outflows to the
-        // inventory available this step, BEFORE solving the state. Before Package 7 the
-        // IC removes energy only (inp.q_ic); Package 7 adds inp.w_ic_steam to `out_req`
-        // and reports w_ic_steam / w_ic_return.
+        // Transfer-allocation point (master step 8): bound every water outflow to the
+        // inventory it draws from, BEFORE solving the state, and report any shortfall
+        // in this step. Steam (lines + vent) against the steam space, with proportional
+        // scaling so the line/vent split is kept; RWCU against the liquid plus this
+        // step's feed. Before Package 7 the IC removes energy only (inp.q_ic); Package 7
+        // adds w_ic_steam to the steam request and reports w_ic_steam / w_ic_return.
         self.exhausted = None;
-        let out_req = (w_steam_req + w_vent_steam_raw + w_liquid_req) * dt;
-        let avail = self.mass + inp.w_feed * dt;
-        let scale = if out_req > avail && out_req > 0.0 { avail / out_req } else { 1.0 };
-        if scale < 1.0 {
-            let deficit = out_req - avail;
+        let steam_req = w_line_steam_req + w_vent_steam_req;
+        let f_steam = if steam_req * dt > m_steam_space { m_steam_space / (steam_req * dt) } else { 1.0 };
+        let w_steam = w_line_steam_req * f_steam;
+        let w_vent_steam = w_vent_steam_req * f_steam;
+        let liquid_avail = m_liquid / dt + inp.w_feed.max(0.0);
+        let f_liquid = if w_liquid_req > liquid_avail { liquid_avail / w_liquid_req } else { 1.0 };
+        let w_liquid_out = w_liquid_req * f_liquid;
+        let deficit = (steam_req - w_steam - w_vent_steam + w_liquid_req - w_liquid_out) * dt;
+        if deficit > 0.0 {
+            // `exhausted` feeds the Sim's step-17 drain (P3); `last_error` carries the
+            // same error so standalone vessel tests see it. Sim::domain_error keeps the
+            // first occurrence per variant, so nothing is double-counted.
             self.exhausted = Some(deficit);
             self.last_error = Some(DomainError::InventoryExhausted { deficit_kg: deficit });
         }
-        let w_steam = w_steam_req * scale;
-        let w_vent_steam = w_vent_steam_raw * scale;
-        let w_liquid_out = w_liquid_req * scale;
+        // Gas: swept with the applied line steam and vented by composition, bounded by
+        // the free gas inventory; outside the water ledger.
+        let gas_req = w_steam * gas_per_steam + w_vent_gas_req;
+        let w_gas_out = if gas_req * dt > m_free_gas { m_free_gas / dt } else { gas_req };
         self.vent_flow = w_vent_steam;
+        let h_steam_out = s_steam.h_g;
 
         // Energy uses exactly the products Ledger::record (P2) integrates from `flows`:
         //   out = (w_steam + w_vent) * h_steam + w_liquid_out * h_liquid_out + q_ic + q_loss
         //   in  = w_feed * h_feed + q_core
-        // Gas carries no energy (A-P4-3), so air ingress and gas egress do not appear.
+        // Gas carries no energy (A-042), so air ingress and gas egress do not appear.
         // If Package 2's record() turns out to integrate different products, make this
         // expression term-identical to record(), never the reverse.
         let dm = inp.w_feed - w_steam - w_vent_steam - w_liquid_out;
@@ -1892,7 +1914,7 @@ Replace the body of `pub fn step(&mut self, dt: f64, inp: &VesselInputs) -> Boun
         let s = self.sat_for_core();
 ```
 
-Keep the rest of `step` (core inlet enthalpy, voids, momentum, `update_level`, heatup rate) unchanged except that the function ends with `flows` as its return value. `Sim::step` step 9 (Package 3) continues to scale `steam.w_tcv`, `steam.w_bypass` and `fw.rwcu_reject` by `flows.w_steam / requested` so downstream consumers see applied transfers; nothing in this task changes that code. The vented gas is outside the water `Ledger` by design (gas is not part of `mass`); `docs/model/vessel.md` section 2 states this.
+Keep the rest of `step` (core inlet enthalpy, voids, momentum, `update_level`, heatup rate) unchanged except that the function ends with `flows` as its return value; at the zero-water endpoint `sat_for_core()` (= `sat_p(0)`) returns the table floor, the loop head is zero and the flow decays to `W_MIN`, all finite (`final_drain_commits_bounded_flows`). `Sim::step` step 9 (Package 3 Task 4) is untouched by this task and already conforms to the master: it scales the steam consumers `steam.w_tcv` and `steam.w_bypass` by `flows.w_steam / requested_steam`, hands the condenser `flows.w_liquid_out` at `flows.h_liquid_out` and `flows.w_feed` directly, commits the IC trains with the ratio-scaled request, and never mutates `fw.rwcu_reject` or `fw.flow` (operator setpoints). Because `flows.w_steam` counts steam only (gas is swept outside the ledger and never counted against the request), the ratio is 1.0 unless a cap binds, and a binding cap is reported as `InventoryExhausted` in the same step, as the master requires; `rwcu_cap_keeps_setpoint_and_feeds_condenser_applied_flow` pins the setpoint and the condenser's applied liquid transfer end to end. The vented gas is outside the water `Ledger` by design (gas is not part of `mass`); `docs/model/vessel.md` section 2 states this.
 
 - [ ] **Step 4: Run the tests**
 
