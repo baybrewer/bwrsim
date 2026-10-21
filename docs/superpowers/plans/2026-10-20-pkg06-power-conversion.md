@@ -542,16 +542,29 @@ Add `pub line: SteamLine,` to `SteamSystem` and `line: SteamLine::at_pressure(P_
         self.line = SteamLine::at_pressure(0.5 * (lo + hi));
     }
 
-    /// Advance the line node and set all steam flows for dome pressure `p`.
+    /// REQUESTED steam flows for this step (master step 5): an implicit predictor
+    /// solves the new line pressure from mass(p) = mass + dt*(w_in(p) - w_out(p))
+    /// (monotone in p), then evaluates every flow at that pressure. Nothing is
+    /// committed here; `step_line` commits the APPLIED flows after vessel allocation.
     pub fn compute_flows(&mut self, dt: f64, p: f64, tsv_open: bool) {
         let a_tcv = if tsv_open { C_TCV * self.tcv_pos } else { 0.0 };
         let a_byp = C_BYPASS * self.bypass_pos;
         let a = a_tcv + a_byp;
         let msiv = self.msiv_pos;
-        let w_in = move |ph: f64| -> f64 { msiv.iter().map(|&m| line_flow(p - ph, m)).sum() };
-        let w_out = move |ph: f64| -> f64 { a * (ph - P_ATM).max(0.0) };
-        self.line.step(dt, w_in, w_out);
-        let ph = self.line.p;
+        let g = |ph: f64| -> f64 {
+            let w_in: f64 = msiv.iter().map(|&m| line_flow(p - ph, m)).sum();
+            SteamLine::mass_at(ph) - self.line.mass - dt * (w_in - a * (ph - P_ATM).max(0.0))
+        };
+        let (mut lo, mut hi) = (1.0e3, 16.5e6);
+        for _ in 0..60 {
+            let mid = 0.5 * (lo + hi);
+            if g(mid) < 0.0 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let ph = 0.5 * (lo + hi);
         for i in 0..N_STEAM_LINES {
             self.w_line[i] = line_flow(p - ph, msiv[i]);
         }
@@ -560,9 +573,22 @@ Add `pub line: SteamLine,` to `SteamSystem` and `line: SteamLine::at_pressure(P_
         self.w_tcv = a_tcv * dp_out;
         self.w_bypass = a_byp * dp_out;
     }
+
+    /// Commit the APPLIED flows into the line node (master step 10). Call after the
+    /// vessel allocation has scaled `w_line`, `w_tcv` and `w_bypass`; pass the applied
+    /// inflow (`vessel_steam_flow()` after scaling). Outflows are the already-scaled
+    /// `w_tcv + w_bypass`. Draining is self-limiting (outflow conductance vanishes as
+    /// p -> P_ATM), so no clamp is needed; `refresh` keeps p and energy mass-consistent.
+    pub fn step_line(&mut self, dt: f64, w_in_applied: f64) {
+        self.line.mass += (w_in_applied - (self.w_tcv + self.w_bypass)) * dt;
+        self.line.refresh();
+        self.p_chest = self.line.p;
+    }
 ```
 
-Update the Task 2 test `msiv_flow_is_per_line_not_averaged` to call `a.init_line_steady(P_RATED, true); a.compute_flows(DT, P_RATED, true);` (same for `b`), since the quasi-steady state is now the initialiser followed by one dynamic step.
+When the allocation ratio is 1.0 (every normal step), the committed mass equals the predictor's implicit solution exactly, so the node never drifts from its own solve.
+
+Update the Task 2 test `msiv_flow_is_per_line_not_averaged` to call `a.init_line_steady(P_RATED, true); a.compute_flows(DT, P_RATED, true);` (same for `b`), since the quasi-steady state is now the initialiser followed by one request computation.
 
 - [ ] **Step 6: Wire into `sim.rs`**
 
@@ -572,19 +598,53 @@ In `Sim::base`, after `s.prev_gen_online = ...;` add:
         s.steam.init_line_steady(s.vessel.eos.p, !s.turbine.tripped);
 ```
 
-In `Sim::step` replace
+In `Sim::step`, restructure the steam/vessel section to the master step order 5 and 8–11. Replace
 
 ```rust
         self.steam.compute_flows(if self.vessel.eos.subcooled { P_ATM } else { p }, !self.turbine.tripped);
 ```
 
-with (Package 4 replaced `subcooled` with `regime`; keep whatever expression P4 left for the vessel-side pressure and only add `dt`):
+and the turbine call that follows it, and move the `VesselInputs`/`vessel.step` block up between them, so the section reads (Package 4 replaced `subcooled` with `regime`; keep whatever expression P4 left for the vessel-side pressure as `p_steam_side`):
 
 ```rust
+        // 5. requested steam flows
         self.steam.compute_flows(dt, p_steam_side, !self.turbine.tripped);
+
+        // ... (IC step 6 and feedwater step 7 stay where P3 left them, before the vessel) ...
+
+        // 8. vessel: the transfer-allocation point
+        let inputs = VesselInputs {
+            q_core: self.q_core,
+            q_ic,
+            w_feed: self.fw.flow,
+            h_feed: self.fw.h_feed(),
+            w_steam: self.steam.vessel_steam_flow(),
+            w_liquid_out: self.fw.rwcu_reject,
+        };
+        let flows = self.vessel.step(dt, &inputs);
+
+        // 9. scale every steam consumer to the APPLIED transfer
+        let requested = self.steam.vessel_steam_flow();
+        if requested > 0.0 && flows.w_steam < requested {
+            let r = flows.w_steam / requested;
+            for w in self.steam.w_line.iter_mut() {
+                *w *= r;
+            }
+            self.steam.w_tcv *= r;
+            self.steam.w_bypass *= r;
+        }
+        // RWCU consumers use flows.w_liquid_out (applied), never fw.rwcu_reject (request).
+
+        // 10. line storage commits the applied flows
+        let w_in_line = self.steam.vessel_steam_flow();
+        self.steam.step_line(dt, w_in_line);
+
+        // 11. turbine consumes applied w_tcv
+        let p_cond = self.cond.pressure();
+        self.turbine.step(dt, self.steam.w_tcv, self.steam.p_chest, p_cond);
 ```
 
-where `p_steam_side` is the existing expression. Change the feedwater call's `steam_flow` argument from `self.steam.total_flow()` to `self.steam.vessel_steam_flow()` (the three-element controller measures line flow). Change `VesselInputs { ... w_steam: self.steam.total_flow(), ... }` to `w_steam: self.steam.vessel_steam_flow(),`. In `isolation_signals`, change `self.steam.total_flow() > 1.4 * STEAM_FLOW_RATED` to `self.steam.vessel_steam_flow() > 1.4 * STEAM_FLOW_RATED`. In `snapshot()`, change `steam_flow_kgs: self.steam.total_flow() + v.vent_flow` to `steam_flow_kgs: self.steam.vessel_steam_flow() + v.vent_flow`.
+(The baseline computed `p_cond` and stepped the turbine before the vessel; both move after the allocation. Task 6 extends the turbine call with `extraction_heat`.) Change the feedwater call's `steam_flow` argument from `self.steam.total_flow()` to `self.steam.vessel_steam_flow()` (the three-element controller measures line flow; at step 7 this still holds the request, which is the measured flow a real sensor would see within one step). In `isolation_signals`, change `self.steam.total_flow() > 1.4 * STEAM_FLOW_RATED` to `self.steam.vessel_steam_flow() > 1.4 * STEAM_FLOW_RATED`. In `snapshot()`, change `steam_flow_kgs: self.steam.total_flow() + v.vent_flow` to `steam_flow_kgs: self.steam.vessel_steam_flow() + v.vent_flow` (post-step these are applied values).
 
 Add to `Sim::full_power()` just before `s.settle(600.0);`: `s.steam.init_line_steady(s.vessel.eos.p, true);` (the TCV position was set after `base`).
 
@@ -595,7 +655,7 @@ Expected: all pass. `turbine_trip_rides_through_on_bypass` and `raising_pressure
 
 - [ ] **Step 8: Regenerate baselines and record the change**
 
-Run: `cargo run --release -p bwr-core --example validation -- --update` (Package 2 runner; use the flag Package 2 defined for regeneration). Append to `docs/model/power-conversion.md` "Results" a table of `turbine_trip_bypass` and `msiv_closure` peak pressure and time before/after this task (from the runner's compare output).
+Run: `cargo run --release -p bwr-core --example validation -- --update` (Package 2 runner; use the flag Package 2 defined for regeneration). Append to `docs/model/power-conversion.md` "Results" a table of `fp_turbine_trip` and the P2 MSIV-closure case's peak pressure and time before/after this task (from the runner's compare output; use the exact ids `standard_cases()` defines).
 
 - [ ] **Step 9: Commit**
 
@@ -798,10 +858,12 @@ Add to `impl Sim`:
         f.tsv_stuck = self.has_fault(&Fault::TsvStuck);
         f.tcv_stuck = self.has_fault(&Fault::TcvStuck);
         f.bypass_unavailable = self.has_fault(&Fault::BypassUnavailable);
-        f.regulator_frozen = self.faults.iter().find_map(|x| match x {
-            Fault::PressureRegulatorFailed { demand_pct } => Some(*demand_pct as f64 / 100.0),
+        // Payload lookup goes through find_fault (master r2): exactly one
+        // PressureRegulatorFailed entry can exist per the (kind, equipment) rule.
+        f.regulator_frozen = match self.find_fault("PressureRegulatorFailed", None) {
+            Some(Fault::PressureRegulatorFailed { demand_pct }) => Some(*demand_pct as f64 / 100.0),
             _ => None,
-        });
+        };
         f
     }
 
@@ -919,7 +981,7 @@ In `params.rs`, in the protection setpoints section:
 pub const SRI_TRIGGER_POWER_FRAC: f64 = 0.4;
 ```
 
-In `sim.rs` `protection()` replace `self.core.kin.n > 0.4` with `self.core.kin.n > SRI_TRIGGER_POWER_FRAC`. Update the `BYPASS_CAPACITY` doc comment to: `/// Turbine bypass capacity as fraction of rated steam flow. ASSUMED, status "to verify" per spec; sensitivity 0.5..1.0 exercised by case turbine_trip_bypass_50.`
+In `sim.rs` `protection()` replace `self.core.kin.n > 0.4` with `self.core.kin.n > SRI_TRIGGER_POWER_FRAC`. Update the `BYPASS_CAPACITY` doc comment to: `/// Turbine bypass capacity as fraction of rated steam flow. ASSUMED, status "to verify" per spec; the turbine_trip_no_bypass case bounds the zero-capacity end.`
 
 - [ ] **Step 4: Register the cases**
 
@@ -969,7 +1031,7 @@ regulator_fail_closed,fullPower,Pressure regulator output frozen at zero demand;
 excess_steam_demand,fullPower,Regulator frozen at 130 % demand; verifies RUN-mode low steam line pressure isolation then scram,plausibility,physical
 ```
 
-In `tests/plant.rs` `turbine_trip_rides_through_on_bypass`, change the three assertion messages to reference the case, e.g. `"case turbine_trip_bypass: select rod insert should cut power, got {}"`; keep the thresholds (0.9, 200 kg/s, 7.4 MPa) and add the matching tolerance row for `turbine_trip_bypass` in `cases.csv` if Package 2 did not already register it: `turbine_trip_bypass,fullPower,Turbine trip with bypass; SRI ride-through; peak power < 0.9 and bypass > 200 kg/s and pressure < 7.4 MPa,plausibility,physical`.
+In `tests/plant.rs` `turbine_trip_rides_through_on_bypass`, change the three assertion messages to reference the P2 case, e.g. `"case fp_turbine_trip: select rod insert should cut power, got {}"`; keep the thresholds (0.9, 200 kg/s, 7.4 MPa). `fp_turbine_trip` is registered in `cases.csv` by Package 2; update its `purpose` cell to name the thresholds: `Turbine trip with bypass; SRI ride-through; peak power < 0.9 and bypass > 200 kg/s and pressure < 7.4 MPa`.
 
 - [ ] **Step 5: Run everything and regenerate baselines**
 

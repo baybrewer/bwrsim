@@ -815,29 +815,34 @@ Append to `docs/model/parameters.csv`, using its header's column order (Package 
 
 ```bash
 git add crates/bwr-core/src/kinetics.rs crates/bwr-core/src/reactor.rs crates/bwr-core/src/sim.rs crates/bwr-core/tests/numerics.rs docs/model/parameters.csv
-git commit -m "fix(kinetics): adaptive substeps and explicit prompt-supercritical rejection
+git commit -m "fix(kinetics): adaptive substeps, finite period meter, prompt-supercritical rejection
 
 Baseline clamped n to 1e-14 once rho exceeded ~0.046 dk/k at the fixed 1 ms
-substep: <paste printed line from Step 1>. The solver now shortens the
-substep so h*(rho-beta)/Lambda <= 0.25 and rejects rho - beta > 0.2 dk/k
-as DomainError::PromptSupercritical without mutating state.
+substep, and the period meter went non-finite from zero power (defect 12):
+<paste both printed lines from Step 1>. The solver now shortens the substep
+so h*(rho-beta)/Lambda <= 0.25 (no work cap), rejects rho - beta > 0.2 dk/k
+as DomainError::PromptSupercritical without mutating state, and floors the
+period estimator at KIN_N_FLOOR.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 4: One-step rod reactivity lag
+### Task 4: One-step rod reactivity lag and the transfer-allocation step order
 
 **Files:**
 - Modify: `crates/bwr-core/src/reactor.rs` (`Core::step_rods`, `Core::step`)
-- Modify: `crates/bwr-core/src/sim.rs` (`Sim::step` ordering)
+- Modify: `crates/bwr-core/src/sim.rs` (`Sim::step` restructured to the master order)
 - Modify: `crates/bwr-core/tests/numerics.rs`
 
 **Interfaces:**
-- Produces: `pub fn Core::step_rods(&mut self, dt: f64)`. `Core::step` no longer moves rods. `Sim::step` order: `core.step_rods` → `core.update_reactivity` → `core.step` → steam/turbine → IC → feedwater → vessel → condenser → `time += dt` → `protection()` → ledger record.
+- Consumes: `Sim::last_flows()` storage and `ledger.record` placement from Package 2.
+- Produces: `pub fn Core::step_rods(&mut self, dt: f64)`. `Core::step` no longer moves rods. `Sim::step` implements the P3 subset of the master's shared step order: `core.step_rods` → `core.update_reactivity` → `core.step` → steam valves and REQUESTED flows → IC → feedwater → `vessel.step` (the transfer-allocation point) → scale consumers to APPLIED flows → `turbine.step` → `cond.step` → `time += dt` → `protection()` → `ledger.record` → drain vessel errors (Task 6).
 
-**Baseline defect (verified in code):** `Sim::step` calls `self.core.update_reactivity(...)` first, then `self.core.step(...)`, which moves the rods and then advances kinetics with the `rho_total` computed from the *previous* positions. Every rod motion, including scram, acts on power one step (0.05 s) late.
+**Baseline defects (verified in code; master defects 3 and 13):**
+- Defect 3: `Sim::step` calls `self.core.update_reactivity(...)` first, then `self.core.step(...)`, which moves the rods and then advances kinetics with the `rho_total` computed from the *previous* positions. Every rod motion, including scram, acts on power one step (0.05 s) late.
+- Defect 13: the turbine and condenser consume the REQUESTED steam and reject flows (`self.steam.w_tcv`, `self.fw.rwcu_reject`) computed before the vessel step; when the vessel cannot supply the request (subcooled gating today, inventory bounding after Task 6), mass appears downstream from nowhere.
 
 - [ ] **Step 1: Write the failing test and the lag measurement**
 
