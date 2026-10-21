@@ -114,9 +114,23 @@ inventory, `Vessel.exhausted` carries the deficit and the bounded flows are appl
 | `GasBlanketed` | vent closed, steam space present, `p_gas > p_sat(t)` | `p = p_sat(t) + p_gas`, with `p_gas = gas_mass * R_AIR * T_K / V_gas` |
 | `WaterSolid` | `mass * v_f(t) >= V_VESSEL_FLUID` | `p = p_sat(t) + (mass * v_f(t) - V) / (V * kappa_f(t))` (liquid compressibility) |
 
-Regime is a label for display, alarms and tests; the physics uses `p`, `p_steam`, `x`
-uniformly. A vessel below 100 degC with the vent closed and no gas sits at `p_sat(t)`
-below atmospheric (a sealed vessel draws vacuum); air in-leakage is not modelled.
+Regime is a label for display, alarms and tests only; no physical quantity or outflow
+depends on it (outflows are split by the steam-space composition, section 4, and
+`steam_available` depends on `p_steam` and the water-solid condition alone). `solve_eos`
+is a pure function; `Vessel::step` applies a hysteresis band of `REGIME_HYSTERESIS`
+(1.05) to the Saturated/GasBlanketed label so it cannot chatter when `p_gas ~ p_sat`.
+Pressure is continuous across every boundary: Vented/Saturated differ only by the vent
+flag; Saturated/GasBlanketed share `p = p_sat + p_gas`; at the water-solid boundary the
+compressibility term is zero. Only the pressure derivative is discontinuous at the
+water-solid boundary (tested by `regime_boundaries_are_continuous_and_cross_once`).
+
+A gas-blanketed vessel cannot be driven water-solid in the model: as the gas space
+vanishes `p_gas` rises without bound and `PropertyOutOfRange { what: "gas space volume"
+| "gas partial pressure" }` is raised before the water-solid branch is reached. Gas
+dissolution is not modelled (A-P4-1); only gas below `WATER_SOLID_GAS_TOLERANCE_KG`
+(1 kg) is treated as dissolved. A vessel below 100 degC with the vent closed and no gas
+sits at `p_sat(t)` below atmospheric (a sealed vessel draws vacuum); air in-leakage is
+not modelled (A-P4-8).
 
 ## 4. Equations
 
@@ -129,19 +143,27 @@ below atmospheric (a sealed vessel draws vacuum); air in-leakage is not modelled
 - Boiling in the core is evaluated at the total vessel pressure `p` (`sat_for_core`),
   so a cold, air-filled vessel at 0.1 MPa does not boil until 100 degC. The downcomer
   hydrostatic head on the core inlet pressure is neglected (A-P4-5).
-- Outflow enthalpies: steam lines carry `h_g(p_steam)` in `Saturated`/`Vented`; zero
-  flow in `GasBlanketed` (gas transport through steam lines is not modelled, A-P4-4);
-  liquid at `h_f(t)` in `WaterSolid`. Head vent carries steam and gas in proportion to
-  their masses in the steam space, or liquid when water-solid.
+- Outflows from the steam space (steam lines and head vent) leave as steam and gas in
+  proportion to their masses in the steam space, `y_steam = m_steam / (m_steam + m_gas)`
+  with `m_steam = mass * x`; steam leaves at `h_g(p_steam)` and gas carries no energy
+  (A-P4-3). No more steam can leave in a step than the steam space holds
+  (`mass * x / dt`), so steam outflow goes to zero continuously as the vessel approaches
+  water-solid; the shortfall is an unmet request that the Sim allocation step scales
+  downstream (master step 9). Gas swept out through the steam lines is removed from
+  `gas_mass` (this is how trapped air is purged during heatup, A-P4-4). No liquid ever
+  leaves through the steam lines or the vent.
 - Natural circulation head (section 6).
 
 ## 5. Head vent
 
 `w_vent = C_HEAD_VENT * (p - P_ATM) + VENT_BOILOFF_KGS_PER_K * max(t - 100, 0)` kg/s
-out when `p > P_ATM`; air ingress `C_HEAD_VENT * (P_ATM - p)` kg/s when `p < P_ATM`.
-Both coefficients are ASSUMED (parameters.csv). The vent cannot hold a heating
-water-solid vessel at atmospheric pressure; this is a declared limitation, not a plant
-claim.
+of steam-space fluid (steam + gas by composition) out when `p > P_ATM`; air ingress
+`C_HEAD_VENT * (P_ATM - p)` kg/s of gas (no energy) when `p < P_ATM`. Both coefficients
+are ASSUMED (parameters.csv). A water-solid vessel has no steam space and the vent
+passes nothing: water-solid pressure is bounded only by the envelope check (2 x design
+pressure, `PropertyOutOfRange`). This is a declared limitation (A-P4-2), not a plant
+claim. Vented gas is outside the water ledger; vented steam is recorded in
+`BoundaryFlows.w_vent` at `h_steam`.
 
 ## 6. Natural circulation
 
@@ -183,6 +205,9 @@ baseline use of the bulk saturation temperature for `MOD_TEMP_COEF`.
 |---|---|
 | Property reference points | `steam::tests::reference_points_iapws`, `compressibility_in_published_range` |
 | EOS round-trip in every regime | `vessel::tests::eos_roundtrip_all_regimes` |
+| EOS bisection monotonicity across the water-solid branch | `vessel::tests::state_energy_is_monotonic_in_temperature` |
+| Regime boundaries continuous, label changes once | `vessel_transients::regime_boundaries_are_continuous_and_cross_once` |
+| Vented heatup purges air, ledger closes | `vessel_transients::vented_heatup_purges_air_and_closes_ledger` |
 | Cold vented vessel at atmospheric pressure | `vessel_transients::cold_vented_vessel_is_atmospheric` |
 | Heatup with trapped air | `vessel_transients::closed_vessel_heatup_transitions_gas_to_saturated` |
 | Cooldown | `vessel_transients::sealed_cooldown_draws_vacuum` |
@@ -470,6 +495,23 @@ Replace the existing `eos_roundtrip` test with:
     }
 
     #[test]
+    fn state_energy_is_monotonic_in_temperature() {
+        // The bisection in solve_eos assumes total energy increases with temperature at
+        // fixed mass, across the two-phase / water-solid branch of state_at. Masses:
+        // two-phase throughout; water-solid below ~45 degC then two-phase; always solid.
+        for &m in &[150_000.0, 200_000.0, V_VESSEL_FLUID * 990.0, V_VESSEL_FLUID * 1000.5] {
+            let mut prev = f64::MIN;
+            let mut t = T_EOS_MIN;
+            while t <= T_EOS_MAX {
+                let e = state_at(t, m).0;
+                assert!(e > prev, "energy not increasing at t={t} mass={m}: {e} <= {prev}");
+                prev = e;
+                t += 0.25;
+            }
+        }
+    }
+
+    #[test]
     fn new_cold_vessel_is_vented_at_atmospheric() {
         let v = Vessel::new(40.0, Z_NWL, 0.3e6, 0.0, 40.0, true);
         assert_eq!(v.eos.regime, Regime::Vented);
@@ -505,6 +547,9 @@ use serde::{Deserialize, Serialize};
 pub const R_AIR: f64 = 287.0;
 /// Gas below this mass is treated as dissolved when the vessel goes water-solid, kg.
 pub const WATER_SOLID_GAS_TOLERANCE_KG: f64 = 1.0;
+/// Hysteresis ratio on p_gas / p_steam for the Saturated <-> GasBlanketed label
+/// (applied in Vessel::step; solve_eos itself is pure). ASSUMED, display only.
+pub const REGIME_HYSTERESIS: f64 = 1.05;
 
 /// Derives per master r2 Derives rule (nested in Sim via Vessel.eos and placed in api.rs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -673,11 +718,13 @@ Replace `sat_for_core` and add `steam_available`:
         sat_p(self.eos.p)
     }
 
-    /// True when the dome holds steam above atmospheric pressure that the steam
-    /// lines and isolation condensers can draw. Not credited while gas-blanketed
-    /// (gas transport is not modelled, A-P4-4) or water-solid.
+    /// True when the dome holds steam above atmospheric pressure that the isolation
+    /// condensers can draw. Deliberately independent of the Saturated/GasBlanketed
+    /// label (which may flip near p_gas ~ p_sat): it depends on the steam partial
+    /// pressure and on there being a steam space at all. Gas-rich steam degrades IC
+    /// condensation; that is Package 7's noncondensable sensitivity, not a cutoff here.
     pub fn steam_available(&self) -> bool {
-        matches!(self.eos.regime, Regime::Saturated | Regime::Vented) && self.eos.p_steam > P_ATM
+        self.eos.regime != Regime::WaterSolid && self.eos.p_steam > P_ATM
     }
 ```
 
@@ -822,6 +869,108 @@ fn closed_vessel_heatup_transitions_gas_to_saturated() {
     assert!(v.last_error.is_none());
 }
 
+/// Steps `v` with heat `q` until `done`, returning every regime change (from, to).
+fn regime_changes(v: &mut Vessel, q: f64, done: impl Fn(&Vessel) -> bool) -> Vec<(Regime, Regime, f64, f64)> {
+    let mut out = Vec::new();
+    let mut time = 0.0;
+    while !done(v) && time < 4.0 * 3600.0 {
+        let before = v.eos;
+        v.step(DT, &inputs(q, 0.0, 0.0));
+        time += DT;
+        if v.eos.regime != before.regime {
+            out.push((before.regime, v.eos.regime, before.p, v.eos.p));
+        }
+    }
+    out
+}
+
+#[test]
+fn regime_boundaries_are_continuous_and_cross_once() {
+    // (a) Closed vessel with trapped air: GasBlanketed -> Saturated exactly once, with
+    //     no pressure jump at the relabel (same formula on both sides).
+    let mut v = Vessel::new(40.0, Z_NWL, 0.0, 0.0, 40.0, false);
+    let ch = regime_changes(&mut v, 50.0e6, |v| v.eos.t >= 140.0);
+    assert_eq!(ch.len(), 1, "regime changes: {ch:?}");
+    assert_eq!((ch[0].0, ch[0].1), (Regime::GasBlanketed, Regime::Saturated));
+    assert!((ch[0].3 - ch[0].2).abs() < 500.0, "pressure jump at relabel: {ch:?}");
+    assert!(v.last_error.is_none());
+
+    // (b) Vented cold vessel: closing the vent relabels once, pressure unchanged.
+    let mut v = Vessel::new(40.0, Z_NWL, 0.0, 0.0, 40.0, true);
+    for _ in 0..100 {
+        v.step(DT, &inputs(0.0, 0.0, 0.0));
+    }
+    let p_before = v.eos.p;
+    v.head_vent_open = false;
+    v.step(DT, &inputs(0.0, 0.0, 0.0));
+    assert_eq!(v.eos.regime, Regime::GasBlanketed);
+    assert!((v.eos.p - p_before).abs() < 500.0, "closing the vent moved pressure by {}", v.eos.p - p_before);
+
+    // (c) Nearly full saturated vessel (no gas): Saturated -> WaterSolid exactly once;
+    //     pressure continuous (the jump at the crossing step is no larger than the
+    //     steps that follow it, where compressibility sets the slope).
+    let mut v = Vessel::new(150.0, VESSEL_HEIGHT - 0.02, 0.0, 0.0, 150.0, false);
+    assert_eq!(v.gas_mass, 0.0);
+    assert_eq!(v.eos.regime, Regime::Saturated);
+    let mut p_hist = vec![v.eos.p];
+    let mut cross_idx = None;
+    let mut time = 0.0;
+    while v.last_error.is_none() && v.eos.t < 160.0 && time < 3600.0 {
+        let before = v.eos.regime;
+        v.step(DT, &inputs(50.0e6, 0.0, 0.0));
+        time += DT;
+        p_hist.push(v.eos.p);
+        if before != v.eos.regime {
+            assert!(cross_idx.is_none(), "regime changed twice");
+            assert_eq!((before, v.eos.regime), (Regime::Saturated, Regime::WaterSolid));
+            cross_idx = Some(p_hist.len() - 1);
+        }
+    }
+    let i = cross_idx.expect("never went water-solid");
+    assert!(i + 21 < p_hist.len(), "too few steps after crossing");
+    let jump = (p_hist[i] - p_hist[i - 1]).abs();
+    let after = (i + 1..=i + 20).map(|k| (p_hist[k] - p_hist[k - 1]).abs()).fold(0.0, f64::max);
+    assert!(jump <= 2.0 * after + 100.0, "pressure jump {jump} Pa at the water-solid crossing vs {after} Pa/step after");
+    assert!(v.last_error.is_none(), "{:?}", v.last_error);
+
+    // (d) Gas-blanketed vessel driven toward water-solid leaves the envelope through
+    //     the gas-space check, never by a silent branch switch.
+    let mut v = Vessel::new(40.0, VESSEL_HEIGHT - 0.5, 0.0, 0.0, 40.0, false);
+    assert!(v.gas_mass > WATER_SOLID_GAS_TOLERANCE_KG);
+    let ch = regime_changes(&mut v, 50.0e6, |v| v.last_error.is_some() || v.eos.t > 120.0);
+    assert!(ch.is_empty(), "unexpected relabel {ch:?}");
+    assert!(matches!(v.last_error, Some(DomainError::PropertyOutOfRange { .. })), "{:?}", v.last_error);
+}
+
+#[test]
+fn vented_heatup_purges_air_and_closes_ledger() {
+    use bwr_core::ledger::Ledger;
+    let mut v = Vessel::new(40.0, Z_NWL, 0.0, 0.0, 40.0, true);
+    let gas0 = v.gas_mass;
+    let mut ledger = Ledger::new(v.mass, v.energy);
+    let mut gas_prev = gas0;
+    let mut time = 0.0;
+    while v.eos.t < 120.0 && time < 4.0 * 3600.0 {
+        let flows = v.step(DT, &inputs(20.0e6, 0.0, 0.0));
+        ledger.record(DT, &flows);
+        time += DT;
+        assert_eq!(v.eos.regime, Regime::Vented);
+        assert!(v.last_error.is_none(), "{:?}", v.last_error);
+        assert!(v.gas_mass >= 0.0, "gas mass negative at t={time}");
+        assert!(flows.w_vent >= 0.0 && flows.w_steam == 0.0 && flows.w_liquid_out == 0.0);
+        if v.eos.p > P_ATM {
+            assert!(v.gas_mass <= gas_prev + 1e-9, "air entered a vessel above atmospheric at t={time}");
+        }
+        gas_prev = v.gas_mass;
+    }
+    assert!(v.eos.t >= 120.0, "did not reach 120 degC: {}", v.eos.t);
+    assert!(v.gas_mass < gas0, "no air purged: {} of {gas0} kg", v.gas_mass);
+    let rm = ledger.mass_residual(v.mass);
+    let re = ledger.energy_residual(v.energy);
+    assert!(rm.abs() < 1e-6 * v.mass, "mass residual {rm} kg");
+    assert!(re.abs() < 1e-6 * v.energy.abs(), "energy residual {re} J");
+}
+
 #[test]
 fn sealed_cooldown_draws_vacuum() {
     let t0 = sat_p(P_RATED).t;
@@ -883,7 +1032,7 @@ fn water_solid_pressure_rises_steeply_and_leaves_envelope() {
 - [ ] **Step 2: Run to verify failure**
 
 Run: `cargo test --release -p bwr-core --test vessel_transients`
-Expected: `closed_vessel_heatup_transitions_gas_to_saturated` fails (pressure or regime assertions, because vent/gas dynamics are not yet in `step`) and/or `water_solid_pressure_rises_steeply_and_leaves_envelope` fails on the regime assertion. `cold_vented_vessel_is_atmospheric` may pass already. Record which fail.
+Expected: `closed_vessel_heatup_transitions_gas_to_saturated` fails (pressure or regime assertions, because vent/gas dynamics are not yet in `step`), `vented_heatup_purges_air_and_closes_ledger` fails (gas never purged; ledger energy residual from the interim `step`), `regime_boundaries_are_continuous_and_cross_once` fails on (a) or (b), and/or `water_solid_pressure_rises_steeply_and_leaves_envelope` fails on the regime assertion. `cold_vented_vessel_is_atmospheric` may pass already. Record which fail.
 
 - [ ] **Step 3: Replace `Vessel::step`**
 
@@ -904,42 +1053,54 @@ Replace the body of `pub fn step(&mut self, dt: f64, inp: &VesselInputs) -> Boun
         let h_liq = steam::h_liquid(eos.t);
         let heat_loss = HEAT_LOSS_HOT * ((eos.t - 20.0) / 268.0).max(0.0);
 
-        // Head vent: steam and gas leave in proportion to their masses in the steam
-        // space; air enters when the vessel is below atmospheric; a water-solid vessel
-        // relieves liquid.
-        let mut w_vent_steam = 0.0;
-        let mut w_vent_liquid = 0.0;
-        let mut dgas = 0.0;
-        if self.head_vent_open {
+        // Steam-space composition. Steam and noncondensable gas leave through the
+        // steam lines and the head vent in proportion to their masses, and no more
+        // steam can leave in a step than the steam space holds, so every outflow is
+        // continuous across regime boundaries (no label-dependent switch; see
+        // docs/model/vessel.md section 4).
+        let m_steam_space = (self.mass * eos.x).max(0.0);
+        let m_gas = self.gas_mass.max(0.0);
+        let y_steam = if m_steam_space + m_gas > 0.0 { m_steam_space / (m_steam_space + m_gas) } else { 0.0 };
+
+        // Main steam lines: the requested draw, split by composition.
+        let w_line_steam_raw = inp.w_steam.max(0.0) * y_steam;
+        let w_line_gas_raw = inp.w_steam.max(0.0) * (1.0 - y_steam);
+
+        // Head vent: relief above atmospheric, air ingress below (gas only, no energy).
+        // A water-solid vessel has no steam space and the vent passes nothing (A-P4-2).
+        let mut w_vent_steam_raw = 0.0;
+        let mut w_vent_gas_raw = 0.0;
+        let mut w_air_in = 0.0;
+        if self.head_vent_open && eos.regime != Regime::WaterSolid {
             let dp = eos.p - P_ATM;
-            if eos.regime == Regime::WaterSolid {
-                w_vent_liquid = (C_HEAD_VENT * dp).max(0.0);
-            } else if dp > 0.0 {
+            if dp > 0.0 {
                 let w = C_HEAD_VENT * dp + VENT_BOILOFF_KGS_PER_K * (eos.t - 100.0).max(0.0);
-                let m_steam_space = self.mass * eos.x;
-                let y_gas = self.gas_mass / (self.gas_mass + m_steam_space).max(1e-9);
-                w_vent_steam = w * (1.0 - y_gas);
-                dgas = -(w * y_gas).min(self.gas_mass / dt);
+                w_vent_steam_raw = w * y_steam;
+                w_vent_gas_raw = w * (1.0 - y_steam);
             } else {
-                dgas = C_HEAD_VENT * (-dp);
+                w_air_in = C_HEAD_VENT * (-dp);
             }
         }
-        self.vent_flow = w_vent_steam;
 
-        // Main steam lines draw steam only from a steam-filled dome; water-solid
-        // lines pass liquid (declared approximation, docs/model/vessel.md section 4).
-        let (w_steam_req, h_steam_out) = match eos.regime {
-            Regime::GasBlanketed => (0.0, 0.0),
-            Regime::WaterSolid => (inp.w_steam, h_liq),
-            _ => (inp.w_steam, s_steam.h_g),
-        };
-        let w_liquid_req = inp.w_liquid_out + w_vent_liquid;
+        // Steam-space and gas caps: proportional scaling keeps the line/vent split.
+        let steam_cap = m_steam_space / dt;
+        let steam_raw = w_line_steam_raw + w_vent_steam_raw;
+        let f_steam = if steam_raw > steam_cap && steam_raw > 0.0 { steam_cap / steam_raw } else { 1.0 };
+        let gas_cap = m_gas / dt;
+        let gas_raw = w_line_gas_raw + w_vent_gas_raw;
+        let f_gas = if gas_raw > gas_cap && gas_raw > 0.0 { gas_cap / gas_raw } else { 1.0 };
+        let w_steam_req = w_line_steam_raw * f_steam;
+        let w_vent_steam_raw = w_vent_steam_raw * f_steam;
+        let w_gas_out = gas_raw * f_gas;
+        let h_steam_out = s_steam.h_g;
+        let w_liquid_req = inp.w_liquid_out.max(0.0);
 
-        // Transfer-allocation point (master step 8): bound ALL outflows to the inventory
-        // available this step. Before Package 7 the IC removes energy only (inp.q_ic);
-        // Package 7 adds inp.w_ic_steam to `out_req` and reports w_ic_steam/w_ic_return.
+        // Transfer-allocation point (master step 8): bound ALL water outflows to the
+        // inventory available this step, BEFORE solving the state. Before Package 7 the
+        // IC removes energy only (inp.q_ic); Package 7 adds inp.w_ic_steam to `out_req`
+        // and reports w_ic_steam / w_ic_return.
         self.exhausted = None;
-        let out_req = (w_steam_req + w_vent_steam + w_liquid_req) * dt;
+        let out_req = (w_steam_req + w_vent_steam_raw + w_liquid_req) * dt;
         let avail = self.mass + inp.w_feed * dt;
         let scale = if out_req > avail && out_req > 0.0 { avail / out_req } else { 1.0 };
         if scale < 1.0 {
@@ -948,13 +1109,19 @@ Replace the body of `pub fn step(&mut self, dt: f64, inp: &VesselInputs) -> Boun
             self.last_error = Some(DomainError::InventoryExhausted { deficit_kg: deficit });
         }
         let w_steam = w_steam_req * scale;
-        let w_vent_steam = w_vent_steam * scale;
+        let w_vent_steam = w_vent_steam_raw * scale;
         let w_liquid_out = w_liquid_req * scale;
+        self.vent_flow = w_vent_steam;
 
+        // Energy uses exactly the products Ledger::record (P2) integrates from `flows`:
+        //   out = (w_steam + w_vent) * h_steam + w_liquid_out * h_liquid_out + q_ic + q_loss
+        //   in  = w_feed * h_feed + q_core
+        // Gas carries no energy (A-P4-3), so air ingress and gas egress do not appear.
+        // If Package 2's record() turns out to integrate different products, make this
+        // expression term-identical to record(), never the reverse.
         let dm = inp.w_feed - w_steam - w_vent_steam - w_liquid_out;
         let de = inp.q_core - inp.q_ic - heat_loss + inp.w_feed * inp.h_feed
-            - w_steam * h_steam_out
-            - w_vent_steam * s_steam.h_g
+            - (w_steam + w_vent_steam) * h_steam_out
             - w_liquid_out * h_liq;
         let flows = BoundaryFlows {
             w_feed: inp.w_feed,
@@ -978,9 +1145,19 @@ Replace the body of `pub fn step(&mut self, dt: f64, inp: &VesselInputs) -> Boun
         // semantics): on Err roll mass, energy and gas_mass back to their entry values,
         // report nothing applied, and record the error.
         let (mass0, energy0, gas0) = (self.mass, self.energy, self.gas_mass);
-        let gas_new = (gas0 + dgas * dt).max(0.0);
+        let gas_new = (gas0 + (w_air_in - w_gas_out) * dt).max(0.0);
         match solve_eos(mass0 + dm * dt, energy0 + de * dt, gas_new, self.head_vent_open) {
-            Ok(e) => {
+            Ok(mut e) => {
+                // Label hysteresis (display only; nothing physical reads the label):
+                // Saturated <-> GasBlanketed flips only once p_gas crosses p_steam by
+                // REGIME_HYSTERESIS. Vented and WaterSolid are unaffected.
+                if !self.head_vent_open {
+                    e.regime = match (self.eos.regime, e.regime) {
+                        (Regime::Saturated, Regime::GasBlanketed) if e.p_gas < REGIME_HYSTERESIS * e.p_steam => Regime::Saturated,
+                        (Regime::GasBlanketed, Regime::Saturated) if e.p_gas * REGIME_HYSTERESIS > e.p_steam => Regime::GasBlanketed,
+                        (_, r) => r,
+                    };
+                }
                 self.mass = mass0 + dm * dt;
                 self.energy = energy0 + de * dt;
                 self.gas_mass = gas_new;
@@ -1004,7 +1181,15 @@ Keep the rest of `step` (core inlet enthalpy, voids, momentum, `update_level`, h
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --release -p bwr-core --test vessel_transients`
-Expected: all five tests pass. Then `cargo test --release -p bwr-core` — all pass, including Package 3 `conservation.rs` (residual columns remain ~0 because `flows` reports exactly what was applied).
+Expected: all seven tests pass (`cold_vented_vessel_is_atmospheric`, `closed_vessel_heatup_transitions_gas_to_saturated`, `regime_boundaries_are_continuous_and_cross_once`, `vented_heatup_purges_air_and_closes_ledger`, `sealed_cooldown_draws_vacuum`, `adding_energy_raises_pressure`, `water_solid_pressure_rises_steeply_and_leaves_envelope`). Then `cargo test --release -p bwr-core` — all pass, including Package 3 `conservation.rs` (residual columns remain ~0 because `flows` reports exactly what was applied).
+
+Package 3 rejection semantics are preserved by the body above: (a) `exhausted` is reset at the allocation point every step; (b) all water outflows (steam-line steam, vent steam, RWCU; IC steam from P7) are bounded to `mass + w_feed*dt` before `solve_eos` is called; (c) on `Err` mass, energy and gas_mass are restored to entry values, `vent_flow` and `exhausted` are cleared, `last_error` is set, and `BoundaryFlows::default()` is returned; (d) no field is written between the allocation and the `match`, so no partial update can escape. One documented consequence: if the same step both exhausts inventory and fails `solve_eos`, `last_error` holds the EOS error (the exhaustion is moot because nothing was applied).
+
+Package 3 tests that can be affected, and the adjustment to make in the same commit:
+- `tests/numerics.rs` / `tests/conservation.rs` calls of `solve_eos(m, e)` → `solve_eos(m, e, 0.0, false)` (Task 3 Step 7).
+- Any construction of an `Eos { .. }` literal or read of `eos.subcooled` / `eos.solid` → use `p_steam: sat_t(t).p, p_gas: 0.0, regime: Regime::Saturated` and `eos.regime` (run `grep -n "subcooled\|\.solid\|Eos {" crates/bwr-core/tests`).
+- A P3 assertion that `flows.h_steam == sat_p(vessel.eos.p).h_g` still holds whenever `gas_mass == 0` (then `p == p_steam`); with gas present `h_steam` is `sat_t(eos.t).h_g`, so such an assertion must read `sat_t(sim.vessel.eos.t).h_g`.
+- The P3 coupled low-inventory regression (hotwell gains what the vessel released) is unaffected: `flows.w_steam` is the applied value and `Sim::step` step 9 scales consumers by `flows.w_steam / requested` as before; the new steam-space cap only lowers the applied value further when the steam space is nearly empty, which is a legitimate shortfall handled by the same ratio.
 
 If `closed_vessel_heatup_transitions_gas_to_saturated` reports the switch outside 95..115 degC, print `v.gas_mass` and the gas-space volume at 40 degC and check the `gas_mass` initialisation in `Vessel::new` before touching the test bounds.
 
@@ -1177,6 +1362,7 @@ LOOP_FADE_M,0.5,m,height above TAF over which the natural-circulation loop head 
 VENT_BOILOFF_KGS_PER_K,0.02,kg/s/K,extra head-vent steam flow per degC above 100 with the vent open,vented hot vessel,none,assumed,,0.0,0.05,A-P4-2,crates/bwr-core/src/vessel.rs,was an inline literal in the baseline step(); if Package 1 registered it under another id rename that row
 R_AIR,287.0,J/kg/K,specific gas constant of air (head noncondensable),,physical constant,confirmed,,,,A-P4-1,crates/bwr-core/src/vessel.rs,
 WATER_SOLID_GAS_TOLERANCE_KG,1.0,kg,gas mass treated as dissolved when the vessel goes water-solid,water-solid,none,assumed,,0.1,10.0,A-P4-1,crates/bwr-core/src/vessel.rs,
+REGIME_HYSTERESIS,1.05,-,p_gas/p_steam ratio band for the Saturated/GasBlanketed display label,vent closed,none,assumed,,1.01,1.2,A-P4-1,crates/bwr-core/src/vessel.rs,display and alarm only; no physics reads the label
 ```
 
 Update the existing `C_HEAD_VENT` row (Package 1 inventoried the private constant): set `notes` to "also the air-ingress coefficient below atmospheric and the liquid-relief coefficient when water-solid (A-P4-2)" and `interval_lo,interval_hi` to `1e-7,1e-5`. Delete the row Package 1 created for the `tau_dc` literal `750.0` (downcomer density): the literal is replaced by `compressed_liquid_rho`, a computed property, not a constant. Note the deletion in the commit body.
@@ -1427,7 +1613,7 @@ ESBWR-P4-3,SRC-ESBWR-DCD-R10,Tier 2 Sec. 4.4 drift-flux void correlation,core an
 
 - [ ] **Step 4: Coverage and README**
 
-In `docs/model/coverage.md` vessel row, list the thirteen tests from `vessel.md` section 8 and mark "natural circulation below chimney top" and "gas-blanketed heatup" as plausibility-verified, not validated. In `README.md` "Vessel" row replace "Mass and energy balance with real IAPWS-IF97 steam tables, so pressure, flashing, swell and shrink are physical" with "Mass, energy and noncondensable-gas balance with IAPWS-IF97 properties including liquid compressibility; vented, gas-blanketed, saturated and water-solid regimes" and add "flow stops if level falls below the chimney top" → "loop head falls with level and is lost near the top of the fuel".
+In `docs/model/coverage.md` vessel row, list the sixteen tests from `vessel.md` section 8 and mark "natural circulation below chimney top" and "gas-blanketed heatup" as plausibility-verified, not validated. In `README.md` "Vessel" row replace "Mass and energy balance with real IAPWS-IF97 steam tables, so pressure, flashing, swell and shrink are physical" with "Mass, energy and noncondensable-gas balance with IAPWS-IF97 properties including liquid compressibility; vented, gas-blanketed, saturated and water-solid regimes" and add "flow stops if level falls below the chimney top" → "loop head falls with level and is lost near the top of the fuel".
 
 - [ ] **Step 5: Final verification and commit**
 
@@ -1447,7 +1633,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 "Pressure and level respond consistently to mass/energy changes and boundary conditions. Natural circulation works across tested conditions, not solely the calibration point. Density-wave or regional stability claims remain limited to evidence actually demonstrated."
 
-Evidence: `tests/vessel_transients.rs` (13 tests), `steam::tests::reference_points_iapws`, `vessel::tests::eos_roundtrip_all_regimes`, `docs/model/vessel.md` sections 1–8, regenerated baselines with change log.
+Evidence: `tests/vessel_transients.rs` (15 tests), `steam::tests::reference_points_iapws`, `vessel::tests::eos_roundtrip_all_regimes`, `vessel::tests::state_energy_is_monotonic_in_temperature`, `docs/model/vessel.md` sections 1–8, regenerated baselines with change log.
 
 ## Self-review (master r2 checklist)
 
@@ -1459,5 +1645,6 @@ Evidence: `tests/vessel_transients.rs` (13 tests), `steam::tests::reference_poin
 - [x] **Snapshot change:** `vessel.regime` has `api.rs`, `types.ts`, `mock.ts` steps and a typecheck run (Task 3 Step 6–7).
 - [x] **Failing test first:** Tasks 2–6 each start with a failing test; Task 7 adds whole-plant tests on top of the implemented behaviour and compares baselines before regenerating.
 - [x] **Applied transfers:** `Vessel::step` returns applied flows after bounding all outflows (steam, vent, RWCU; IC steam added by P7 at the marked line) and rolls back on `solve_eos` Err; `Sim::step` step 9 scaling is untouched.
-- Names introduced beyond the master contract: `Eos.p_steam`, `Eos.p_gas`, `Vessel::friction_dp`, `Vessel::steam_available`, `VENT_BOILOFF_KGS_PER_K`, `LOOP_FADE_M`, `WATER_SOLID_GAS_TOLERANCE_KG`, `vessel::state_at` (private), alarm id `gas_blanket`, register ids `KAPPA_F_TABLE`, `ESBWR-P4-1..3`.
+- [x] **Codex cycle-2 audit (regime transitions, vent accounting, P3 semantics):** no physics reads the regime label (outflows split by steam-space composition with a steam-space cap; `steam_available` reads `p_steam` and the water-solid condition only); label hysteresis `REGIME_HYSTERESIS` applied in `Vessel::step`, `solve_eos` stays pure; `state_at` monotonicity tested across the water-solid branch; gas-blanketed vessels cannot reach water-solid and leave the envelope explicitly (documented, tested); no liquid ever leaves through vent or steam lines (so `BoundaryFlows.w_liquid_out` remains RWCU-only and the Sim RWCU allocation ratio stays valid); `de` is term-identical to the ledger products and vent steam is in `w_vent` at `h_steam`; gas egress through lines and vent is capped at `gas_mass/dt`, air ingress carries no energy; ledger closure asserted in `vented_heatup_purges_air_and_closes_ledger`.
+- Names introduced beyond the master contract: `Eos.p_steam`, `Eos.p_gas`, `Vessel::friction_dp`, `Vessel::steam_available`, `VENT_BOILOFF_KGS_PER_K`, `LOOP_FADE_M`, `WATER_SOLID_GAS_TOLERANCE_KG`, `REGIME_HYSTERESIS`, `vessel::state_at` (private), alarm id `gas_blanket`, register ids `KAPPA_F_TABLE`, `ESBWR-P4-1..3`.
 - Accepted deviations (coordinator, r2): `sat_for_core` uses total pressure (the core boils against total local pressure; using steam partial pressure would make a cold air-filled vessel boil at 40 degC); `moderator_t` uses the exit liquid temperature, not saturation, as the top of the rise when the core is non-boiling (otherwise a cold core would report ~70 degC).

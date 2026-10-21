@@ -886,7 +886,7 @@ fn scram_motion_per_step_is_quantified() {
 Run: `cargo test --release -p bwr-core --test numerics rod_reactivity_has_no_one_step_lag -- --nocapture`
 Expected: FAIL with `rho_rods used by kinetics <x> but rods are at <y>` where `|x - y|` is on the order of 1e-3 dk/k (the worth of 0.8 positions on every rod). Paste the message into the commit body.
 
-- [ ] **Step 3: Implement the reorder**
+- [ ] **Step 3: Implement the reorder and the allocation step**
 
 In `crates/bwr-core/src/reactor.rs`, add before `pub fn step(`:
 
@@ -900,37 +900,143 @@ In `crates/bwr-core/src/reactor.rs`, add before `pub fn step(`:
 
 and delete the line `self.rods.step(dt);` from `Core::step`.
 
-In `crates/bwr-core/src/sim.rs`, `Sim::step`, replace
+In `crates/bwr-core/src/sim.rs`, replace the body of `Sim::step` with the master's P3-subset order. The turbine and condenser move BELOW the vessel step and consume applied flows:
 
 ```rust
-        // --- reactor core
-        self.core.update_reactivity(self.vessel.alpha_core, t_cool);
-        let cov = self.vessel.core_coverage();
-```
+    /// One physics step (master shared step order, P3 subset).
+    pub fn step(&mut self, dt: f64) {
+        let p = self.vessel.eos.p;
+        let t_cool = self.vessel.eos.t;
 
-with
-
-```rust
-        // --- reactor core: move rods first so reactivity matches this step's positions.
+        // 1,3,4: rods move first so reactivity matches this step's positions.
         self.core.step_rods(dt);
         self.core.update_reactivity(self.vessel.alpha_core, t_cool);
         let cov = self.vessel.core_coverage();
+        self.q_core = match self.core.step(dt, t_cool, cov) {
+            Ok(q) => q,
+            Err(e) => {
+                self.domain_error(e);
+                self.q_core
+            }
+        };
+
+        // 5: steam valve motion and REQUESTED steam flows.
+        let demand = self.steam.pressure_demand(p);
+        let tcv_demand = self.turbine.tcv_demand(dt, demand);
+        let byp_ok = self.cond.available_for_bypass();
+        self.steam.step(dt, p, tcv_demand, byp_ok, self.turbine.tripped);
+        self.steam.compute_flows(if self.vessel.eos.subcooled { P_ATM } else { p }, !self.turbine.tripped);
+
+        // 6: isolation condensers. (Task 5 changes this call to the IcStep form:
+        // `t.step(dt, t_cool, h_fg, steam_avail).q_removed`.)
+        let steam_avail = !self.vessel.eos.subcooled;
+        let q_ic: f64 = self.ic.iter_mut().map(|t| t.step(dt, t_cool, steam_avail)).sum();
+
+        // 7: feedwater (level setpoint setdown after a scram).
+        self.fw.setdown_cm = if self.scrammed { -100.0 } else { 0.0 };
+        let hotwell_ok = self.cond.hotwell_mass > 0.05 * HOTWELL_CAPACITY;
+        let msg = self.fw.step(
+            dt,
+            p,
+            self.level_cm(),
+            self.steam.total_flow(),
+            self.steam.w_tcv,
+            hotwell_ok,
+            self.cond.hotwell_t(),
+        );
+        if let Some(m) = msg {
+            self.event("fw_trip", m);
+        }
+
+        // 8: vessel — the transfer-allocation point; all outflows are bounded here.
+        let requested_steam = self.steam.total_flow();
+        let inputs = VesselInputs {
+            q_core: self.q_core,
+            q_ic,
+            w_feed: self.fw.flow,
+            h_feed: self.fw.h_feed(),
+            w_steam: requested_steam,
+            w_liquid_out: self.fw.rwcu_reject,
+        };
+        let flows = self.vessel.step(dt, &inputs);
+
+        // 9: allocation — every downstream consumer sees APPLIED transfers.
+        // The ratio is 1.0 whenever inventory is adequate (it differs only in a
+        // step that raises InventoryExhausted, or under subcooled steam gating).
+        let steam_ratio = if requested_steam > 1e-12 { flows.w_steam / requested_steam } else { 0.0 };
+        self.steam.w_tcv *= steam_ratio;
+        self.steam.w_bypass *= steam_ratio;
+        // fw.rwcu_reject is an operator SETPOINT and is never mutated here; the
+        // applied reject flow is flows.w_liquid_out, used below and by the ledger.
+
+        // 11: turbine shaft dynamics with the applied TCV flow.
+        let p_cond = self.cond.pressure();
+        self.turbine.step(dt, self.steam.w_tcv, self.steam.p_chest, p_cond);
+
+        // 12: condenser with applied flows only.
+        let h_steam = sat_p(self.steam.p_chest.max(P_ATM)).h_g;
+        let h_hw = steam::h_liquid(self.cond.hotwell_t());
+        let w_in = self.steam.w_tcv + self.steam.w_bypass + flows.w_liquid_out;
+        let fw_heating = self.fw.flow * (self.fw.h_feed() - h_hw).max(0.0);
+        let q_cond = self.steam.w_tcv * h_steam - self.turbine.p_mech + self.steam.w_bypass * h_steam
+            + flows.w_liquid_out * flows.h_liquid_out
+            - w_in * h_hw
+            - fw_heating;
+        self.cond.step(dt, q_cond, w_in, self.fw.flow);
+
+        // 14-17: clock, protection, bookkeeping.
+        self.time += dt;
+        self.protection();
+        self.ledger.record(dt, &flows);
+        self.last_flows = flows; // Package 2 field behind Sim::last_flows()
+    }
 ```
 
-- [ ] **Step 4: Run the tests**
+This is the Package 2 body with three changes: the core block at the top (rods first, `Result` handling), `turbine.step`/`cond.step` moved below `vessel.step`, and the allocation of applied flows between them. If Package 2 named its `last_flows` storage differently, keep its name; `Sim::last_flows()` is the accessor.
+
+`flows.h_liquid_out` replaces the baseline's `self.fw.rwcu_reject * self.vessel.sat().h_f` term so the condenser receives exactly the enthalpy the vessel released.
+
+- [ ] **Step 4: Add the applied-flows invariant test**
+
+Append to `tests/numerics.rs`. This invariant holds trivially at steady full power (ratio 1.0); it bites, and its failing-first demonstration lives, in Task 6's coupled low-inventory regression. It is still asserted here so any later reorder breaks loudly:
+
+```rust
+#[test]
+fn downstream_consumers_see_applied_flows() {
+    for scenario in [ScenarioName::FullPower, ScenarioName::HotStandby] {
+        let mut sim = Sim::new(scenario);
+        for _ in 0..(10.0 / DT) as usize {
+            sim.step(DT);
+            let f = sim.last_flows();
+            assert!(
+                (sim.steam.w_tcv + sim.steam.w_bypass - f.w_steam).abs() < 1e-9,
+                "{scenario:?}: turbine+bypass {} but vessel applied {}",
+                sim.steam.w_tcv + sim.steam.w_bypass,
+                f.w_steam
+            );
+        }
+    }
+}
+```
+
+- [ ] **Step 5: Run the tests**
 
 Run: `cargo test --release -p bwr-core`
-Expected: all pass. `turbine_trip_rides_through_on_bypass` and `manual_scram_shuts_down_without_isolation` still pass (the fix makes insertion act 0.05 s earlier, inside their tolerances).
+Expected: all pass. `turbine_trip_rides_through_on_bypass` and `manual_scram_shuts_down_without_isolation` still pass (insertion acts 0.05 s earlier, inside their tolerances). `full_power_is_steady` still passes: at steady state the allocation ratio is 1.0 and the turbine sees the same flow one phase later in the step, which only re-times `p_mech` by one step. If net MWe drifts outside the existing 285-315 band, that is a wiring mistake in the reorder, not a tolerance problem.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add crates/bwr-core/src/reactor.rs crates/bwr-core/src/sim.rs crates/bwr-core/tests/numerics.rs
-git commit -m "fix(core): rod motion precedes reactivity evaluation within a step
+git commit -m "fix(core): rods move before reactivity; consumers get applied transfers
 
 update_reactivity ran before rods moved, so kinetics used positions from
 the previous step (0.8 positions per step during scram). Baseline:
 <paste failure message from Step 2>
+
+Sim::step now follows the master shared order: vessel.step is the
+transfer-allocation point and turbine/condenser consume the applied
+flows (defect 13), so a vessel-side bound can never create mass downstream.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -1144,7 +1250,7 @@ impl IcTrain {
 }
 ```
 
-In `crates/bwr-core/src/sim.rs`, `Sim::step`, replace
+In `crates/bwr-core/src/sim.rs`, `Sim::step` (the body written in Task 4), replace
 
 ```rust
         let steam_avail = !self.vessel.eos.subcooled;
@@ -1199,8 +1305,9 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Create: `crates/bwr-core/tests/conservation.rs`
 
 **Interfaces:**
-- Consumes: `BoundaryFlows`, `Ledger` (Package 2), `DomainError`.
+- Consumes: `BoundaryFlows` (r2 shape, incl. `w_ic_steam`/`w_ic_return`/`h_ic_return`, zero until Package 7), `Ledger.integrated`, `Sim::last_flows()` (Package 2), `DomainError`, the Task 4 allocation step.
 - Produces: `pub fn solve_eos(mass: f64, energy: f64) -> Result<Eos, DomainError>`; `T_EOS_MIN = 1.0`, `T_EOS_MAX = 349.5`; `Vessel.exhausted: Option<f64>`; `Vessel.last_error: Option<DomainError>`; `Vessel::step` keeps the master signature `-> BoundaryFlows` and reports what it actually applied; `BoundaryFlows.mass_clipped` and `energy_clipped` are always `0.0` from now on (kept for the Package 2 ledger).
+- Rejection semantics (master r2): on `solve_eos` Err inside `step`, `mass` and `energy` roll back to their values at entry, `last_error = Some(..)`, and the returned flows are `BoundaryFlows::default()`, so downstream consumers and the ledger see zero applied transfers for that step. On exhaustion, outflows are scaled so `mass + dm*dt >= 0`, the deficit is recorded in `exhausted`, and the state advances with the bounded flows.
 
 **Baseline defects (verified in code):** `self.mass = (self.mass + dm * dt).max(1000.0)` creates mass; `solve_eos` bisects over 1..349.5 degC and silently returns the nearest bound outside that range.
 
@@ -1224,15 +1331,13 @@ use bwr_core::Sim;
 #[test]
 fn baseline_vessel_floor_creates_mass() {
     let mut v = Vessel::new(sat_p(P_RATED).t, Z_NWL, RATED_POWER_W, STEAM_FLOW_RATED, T_FW_RATED, false);
-    let inp = VesselInputs { q_core: 0.0, q_ic: 0.0, w_feed: 0.0, h_feed: 0.0, w_steam: 0.0, w_liquid_out: 1.0e7, h_feed: 0.0 };
+    let inp = VesselInputs { q_core: 0.0, q_ic: 0.0, w_feed: 0.0, h_feed: 0.0, w_steam: 0.0, w_liquid_out: 1.0e7 };
     let flows = v.step(DT, &inp);
     println!("baseline mass after draining step: {} kg, mass_clipped {} kg", v.mass, flows.mass_clipped);
     assert_eq!(v.mass, 1000.0, "baseline floors the inventory");
     assert!(flows.mass_clipped > 0.0, "Package 2 ledger must see the created mass");
 }
 ```
-
-(Remove the duplicated `h_feed` field; `VesselInputs` is `{ q_core, q_ic, w_feed, h_feed, w_steam, w_liquid_out }`.)
 
 Run: `cargo test --release -p bwr-core --test conservation baseline_vessel_floor_creates_mass -- --nocapture`
 Expected: PASS with the printed line showing `1000 kg` and a positive `mass_clipped`. Paste it into the commit body, then delete this test.
@@ -1292,9 +1397,60 @@ fn drained_vessel_is_flagged_not_refilled() {
     assert!(sim.snapshot().unsupported.is_some());
     common::assert_finite(&sim.snapshot());
 }
+
+#[test]
+fn eos_error_rolls_back_vessel_state() {
+    // Rejection semantics (master r2): on an EOS error nothing commits and the
+    // returned flows are zero, so the ledger and consumers see no transfer.
+    let mut v = Vessel::new(sat_p(P_RATED).t, Z_NWL, RATED_POWER_W, STEAM_FLOW_RATED, T_FW_RATED, false);
+    let (m0, e0, t0) = (v.mass, v.energy, v.eos.t);
+    // 1e15 W of removal for one step drives the energy far below the table range.
+    let inp = VesselInputs { q_core: 0.0, q_ic: 1.0e15, w_feed: 0.0, h_feed: 0.0, w_steam: 0.0, w_liquid_out: 0.0 };
+    let flows = v.step(DT, &inp);
+    assert!(matches!(v.last_error, Some(DomainError::EosOutOfRange { .. })));
+    assert_eq!(v.mass, m0, "mass must roll back on EOS rejection");
+    assert_eq!(v.energy, e0, "energy must roll back on EOS rejection");
+    assert_eq!(v.eos.t, t0);
+    assert_eq!(flows, bwr_core::ledger::BoundaryFlows::default(), "no transfers applied");
+}
+
+#[test]
+fn coupled_low_inventory_run_conserves_mass_end_to_end() {
+    // Defect 13 regression: with feed off and RWCU reject on until exhaustion,
+    // what the condenser side receives equals what the vessel released, read
+    // from Sim::last_flows() and the ledger. Raw hotwell_mass equality is NOT
+    // asserted here: the hotwell's automatic +/-30 kg/s makeup/reject is an
+    // unaccounted boundary flow until Package 6 (master defect 6).
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    for i in 0..N_FEED_PUMPS {
+        sim.apply(Command::SetFeedPump { index: i, on: false });
+    }
+    sim.apply(Command::SetRwcuReject { kgs: 15.0 });
+    let mut received_kg = 0.0;
+    let mut saw_bounded_step = false;
+    let mut t = 0.0;
+    while t < 6.0 * 3600.0 && !saw_bounded_step {
+        sim.step(DT);
+        t += DT;
+        let f = sim.last_flows();
+        // The condenser was handed exactly the applied transfers (Task 4 allocation).
+        assert!((sim.steam.w_tcv + sim.steam.w_bypass - f.w_steam).abs() < 1e-9);
+        received_kg += (f.w_steam + f.w_liquid_out) * DT;
+        if sim.vessel.exhausted.is_some() {
+            saw_bounded_step = true;
+            assert!(f.w_liquid_out < 15.0 - 1e-9, "the bounded step must scale the reject flow");
+        }
+    }
+    assert!(saw_bounded_step, "run never reached the inventory bound (mass {} kg)", sim.vessel.mass);
+    let ledger_out = sim.ledger.integrated["steam_kg"] + sim.ledger.integrated["rwcu_kg"];
+    assert!(
+        (received_kg - ledger_out).abs() <= 1e-6 * ledger_out.max(1.0),
+        "condenser-side receipts {received_kg} kg vs vessel-side releases {ledger_out} kg"
+    );
+}
 ```
 
-- [ ] **Step 3: Run tests to verify they fail**
+With Task 4 reverted (consumers reading requested flows), `coupled_low_inventory_run_conserves_mass_end_to_end` fails at the bounded step: that is the defect-13 demonstration. Run it once with the Task 4 allocation lines commented out, record the failure message for the commit body, then restore them.
 
 Run: `cargo test --release -p bwr-core --test conservation`
 Expected: compile errors (`no field exhausted`, `solve_eos` returns `Eos` not `Result`).
@@ -1412,6 +1568,9 @@ Replace the first half of `Vessel::step`, from `pub fn step(` down to and includ
             w_vent: self.vent_flow,
             w_liquid_out,
             h_liquid_out: h_liq,
+            w_ic_steam: 0.0,   // IC mass ports open in Package 7
+            w_ic_return: 0.0,
+            h_ic_return: 0.0,
             q_core: inp.q_core,
             q_ic: inp.q_ic,
             q_loss: heat_loss,
@@ -1450,7 +1609,7 @@ In `crates/bwr-core/src/sim.rs`, `Sim::step`, directly after the `self.vessel.st
         }
 ```
 
-Note for the executor: when the vessel scales steam outflow down, `self.steam.total_flow()` (used by the condenser) still carries the unscaled demand. That mismatch exists only in an already-flagged exhausted state and is accepted here; Package 6 reconciles the steam path.
+The downstream mismatch this bounding would otherwise create (turbine and condenser consuming the unscaled request) does not exist: Task 4's allocation step already scales `steam.w_tcv` and `steam.w_bypass` by `flows.w_steam / requested` and hands the condenser `flows.w_liquid_out`. The coupled regression in Step 2 pins this end to end.
 
 Update the existing unit test in `vessel.rs`:
 
@@ -1469,7 +1628,7 @@ Update the existing unit test in `vessel.rs`:
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test --release -p bwr-core --test conservation -- --nocapture`
-Expected: three tests pass; `drained_vessel_is_flagged_not_refilled` prints `inventory exhausted at t = <about 9000-12000> s` and runs in well under a minute in release.
+Expected: all five tests pass; `drained_vessel_is_flagged_not_refilled` prints `inventory exhausted at t = <about 9000-12000> s` and runs in well under a minute in release. Then perform the defect-13 demonstration: comment out the two allocation lines from Task 4 (`self.steam.w_tcv *= steam_ratio;` and the bypass line), rerun `coupled_low_inventory_run_conserves_mass_end_to_end`, record its failure message for the commit body, and restore the lines.
 
 Run: `cargo test --release -p bwr-core`
 Expected: all pass.
@@ -1482,7 +1641,9 @@ git commit -m "fix(vessel): bounded outflows and EOS range rejection replace sil
 
 Baseline: <paste printed line from Step 1>. Outflows are now scaled to the
 available inventory and the deficit raised as DomainError::InventoryExhausted;
-solve_eos returns EosOutOfRange instead of the nearest table bound.
+solve_eos returns EosOutOfRange instead of the nearest table bound; on EOS
+rejection nothing commits and zero flows are returned. Coupled regression
+without the Task 4 allocation: <paste defect-13 failure from Step 5>.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -1634,14 +1795,16 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 8: Time-step convergence
+### Task 8: Time-step convergence and measured numerical tolerances
 
 **Files:**
 - Modify: `crates/bwr-core/tests/numerics.rs`
-- Modify: `docs/validation/method.md` (add the convergence subsection)
+- Modify: `crates/bwr-core/src/validation.rs` (`Tolerance::numerical()` values)
+- Modify: `docs/validation/method.md` (convergence subsection and tolerance table)
 
 **Interfaces:**
-- Consumes: `validation::{run_case, standard_cases}`, `Trace::metrics()`, `Metrics.first_event_time`, `Metrics.peak` (Package 2), case ids `fp_turbine_trip` and `fp_manual_scram` from `standard_cases()`.
+- Consumes: `validation::{run_case, standard_cases}`, `Trace::metrics()`, `Metrics.first_event_time`, `Metrics.peak`, `Metrics.final_values` (Package 2), case ids `fp_turbine_trip` and `fp_manual_scram` from `standard_cases()`.
+- Produces: the final values of `Tolerance::numerical()` (master r2: "P3 REPLACES these with 2x the measured dt-halving differences from the convergence study").
 
 **dt audit (done while planning; no hidden `DT` assumptions found):** every time-dependent update in `sim.rs`, `bop.rs`, `vessel.rs`, `ic.rs`, `reactor.rs` is either exact (`DecayHeat::step`, implicit fuel node), rate-limited by `dt` (valve strokes, rod speed, `SPEED_RAMP`), a first-order explicit lag of the form `x += (target - x) * (dt / tau).min(1.0)` (`h_in`, `alpha_core`, `alpha_ch`, `heatup_rate`, IC `heat`, condenser `p_steam`, `t_feed`, `inv_period`), an explicit Euler integral (`Xenon::step`, governor and level-controller integrals, air mass), or an absolute-time comparison (`scram_time`, event expiry, `reverse_power_timer`, `low_suction_timer`). All converge at first order in `dt`; the semi-implicit momentum step and `solve_eos` are stable for any `dt`. The only `DT`-specific code is `Sim::advance` and `Sim::settle`, which the runner does not use. Protection is evaluated once per step, so trip times are quantised to `dt`; the 0.1 s event tolerance below covers that.
 
@@ -1673,6 +1836,13 @@ fn event_timing_and_peaks_converge_with_time_step() {
         assert!((p_mid - p_fine).abs() / p_fine < 0.005, "{id}: peak pressure {p_mid} (0.025) vs {p_fine} (0.0125)");
         println!("{id} peak pressure: dt0.05 {:.0} Pa, dt0.0125 {:.0} Pa, diff {:+.2} %", m50.peak["pressure_pa"].0, p_fine, (m50.peak["pressure_pa"].0 / p_fine - 1.0) * 100.0);
         println!("{id} min level: dt0.05 {:.2} cm, dt0.0125 {:.2} cm", m50.min["level_nr_cm"].0, m125.min["level_nr_cm"].0);
+
+        // Machine-pastable dt-halving differences for Tolerance::numerical() (Step 3).
+        for col in ["pressure_pa", "level_nr_cm", "power_frac", "fuel_t_c", "core_flow_kgs", "mass_kg", "energy_j"] {
+            let d_peak = (m25.peak[col].0 - m125.peak[col].0).abs();
+            let d_final = (m25.final_values[col] - m125.final_values[col]).abs();
+            println!("TOL {id} {col} {:.6e}", d_peak.max(d_final));
+        }
     }
 }
 ```
@@ -1682,28 +1852,72 @@ fn event_timing_and_peaks_converge_with_time_step() {
 Run: `cargo test --release -p bwr-core --test numerics event_timing_and_peaks_converge -- --nocapture`
 Expected: PASS and printed differences. If an event time differs by more than 0.1 s between 0.025 and 0.0125, or peak pressure by more than 0.5 %, that is a non-converged model element: find the explicit update responsible (use the audit list above), make it semi-implicit or shorten its internal substep, and rerun. Do not widen the tolerance. Record the printed table in the commit body.
 
-- [ ] **Step 3: Document**
+- [ ] **Step 3: Set `Tolerance::numerical()` from the measurements**
+
+Master r2 rule: the initial Package 2 values of `Tolerance::numerical()` are provisional; this step REPLACES them with 2x the measured dt-halving differences. For each `TOL <case> <col> <value>` line printed in Step 2, take the maximum over the two cases, multiply by 2, and write it as that column's abs floor. Edit `Tolerance::numerical()` in `crates/bwr-core/src/validation.rs` to this shape. `M_<col>` below is not code: it stands for the measured `TOL` maximum for that column, and the executor writes `2.0 * M` as one plain `f64` literal with the measured value in a trailing comment (e.g. `abs.insert("pressure_pa".to_string(), 2.4e3); // measured 1.2e3 Pa`):
+
+```rust
+    /// Numerical class. Every value is 2x the measured dt-halving difference
+    /// (0.025 s vs 0.0125 s) from the Package 3 convergence study over
+    /// fp_turbine_trip and fp_manual_scram; see docs/validation/method.md.
+    pub fn numerical() -> Self {
+        let mut abs = std::collections::BTreeMap::new();
+        abs.insert("pressure_pa".to_string(), 2.0 * M_pressure_pa);
+        abs.insert("level_nr_cm".to_string(), 2.0 * M_level_nr_cm);
+        abs.insert("power_frac".to_string(), 2.0 * M_power_frac);
+        abs.insert("fuel_t_c".to_string(), 2.0 * M_fuel_t_c);
+        abs.insert("core_flow_kgs".to_string(), 2.0 * M_core_flow_kgs);
+        abs.insert("mass_kg".to_string(), 2.0 * M_mass_kg);
+        abs.insert("energy_j".to_string(), 2.0 * M_energy_j);
+        Self {
+            rel: 1e-3,                 // keep unless 2x the measured relative peak difference exceeds it
+            abs,
+            event_time_s: 0.1,         // >= one 0.05 s step; raise to 2x measured only if larger
+            extremum_time_s: 1.0,
+            residual_mass_kg: 1e-3,
+            residual_energy_j: 1e3,
+        }
+    }
+```
+
+A measured difference of exactly 0 for a column gets a floor of one ULP-scale epsilon instead (`1e-9` absolute) so the comparison never demands bit equality of physics. If any 2x value is LOOSER than the Package 2 provisional value, the looser measured value wins and the change is called out in method.md; that is measurement, not tolerance-widening. Then run `cargo run --release -p bwr-core --example validation`: the baselines must still compare clean under the new tolerances.
+
+- [ ] **Step 4: Document**
 
 Append to `docs/validation/method.md`:
 
 ```markdown
-## Time-step convergence
+## Time-step convergence and the numerical tolerance class
 
 Supported cases are run at plant steps of 0.05, 0.025 and 0.0125 s with the
 kinetics substep chosen adaptively (`kinetics.rs`). The numerical tolerance
 class requires first-event times to agree within 0.1 s and pressure peaks
 within 0.5 % between the two finer steps. The 0.05 s production step is
 accepted when its difference from 0.0125 s is reported and inside the
-physical tolerance class. Enforced by `tests/numerics.rs::event_timing_and_peaks_converge_with_time_step`.
+physical tolerance class. Enforced by
+`tests/numerics.rs::event_timing_and_peaks_converge_with_time_step`.
+
+`Tolerance::numerical()` abs floors are 2x the measured 0.025 s vs 0.0125 s
+differences from this study (measured <date>, commit <hash>):
+
+| column | measured diff | floor (2x) |
+|---|---|---|
+<one row per column from the TOL lines>
+
+`collapsed_level_m` and `unsupported` trace columns are populated from
+Package 3 (Tasks 2 and 1).
 ```
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add crates/bwr-core/tests/numerics.rs docs/validation/method.md
-git commit -m "test(core): time-step convergence of event timing and extrema
+git add crates/bwr-core/tests/numerics.rs crates/bwr-core/src/validation.rs docs/validation/method.md
+git commit -m "test(core): time-step convergence; numerical tolerances set from measurement
 
 <paste printed table from Step 2>
+
+Tolerance::numerical() abs floors are 2x the measured dt-halving differences
+per the master plan; provisional Package 2 values replaced.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```

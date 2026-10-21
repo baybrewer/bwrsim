@@ -956,21 +956,29 @@ fn turbine_trip_without_bypass_scrams_on_pressure_and_starts_ics() {
 }
 
 #[test]
-fn excessive_steam_demand_in_run_isolates_on_low_line_pressure() {
+fn excessive_steam_demand_in_run_isolates() {
+    // Pressure-controller fault expressed as a setpoint runaway to the minimum:
+    // the regulator demands far more than rated flow and depressurises the plant.
+    // (Fault::is_valid caps PressureRegulatorFailed at 100 %, which at full power
+    // is the normal operating point, so the runaway is injected via the setpoint.)
     let mut sim = Sim::new(ScenarioName::FullPower);
     run(&mut sim, 5.0);
-    sim.set_fault(Fault::PressureRegulatorFailed { demand_pct: 130 }, true);
-    run(&mut sim, 120.0);
-    assert!(sim.scrammed, "excess demand should depressurise to the RUN-mode isolation");
+    sim.apply(Command::SetPressureSetpoint { mpa: 0.2 });
+    run(&mut sim, 300.0);
     assert!(!sim.msivs_open(), "MSIVs should have isolated");
-    assert!(sim.log.iter().any(|(_, t)| t.contains("Low steam line pressure in RUN")), "log: {:?}", sim.log);
+    assert!(sim.scrammed, "MSIV closure in RUN must scram");
+    assert!(
+        sim.log.iter().any(|(_, t)| t.starts_with("msiv isolation:")),
+        "log must carry the isolation with its locked key: {:?}",
+        sim.log
+    );
 }
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
 Run: `cargo test --release -p bwr-core --test power_conversion load_rejection excessive turbine_trip_without`
-Expected: `load_rejection_with_bypass_does_not_scram` and `turbine_trip_without_bypass...` compile and may already pass (verification tests); `excessive_steam_demand...` passes only if the `PressureRegulatorFailed` path from Task 4 drives the TCV open. Record which passed at this point in the commit message.
+Expected: `load_rejection_with_bypass_does_not_scram` and `turbine_trip_without_bypass...` compile and may already pass (verification tests); `excessive_steam_demand_in_run_isolates` passes only if the P2 log line for MSIV isolation carries the locked `msiv isolation:` key. Record which passed at this point in the commit message.
 
 - [ ] **Step 3: Make the SRI trigger a registered parameter**
 
@@ -995,6 +1003,8 @@ Append to `standard_cases()` in `crates/bwr-core/src/validation.rs`:
             sample_dt_s: 0.5,
             commands: vec![ScriptedCommand { at_s: 5.0, cmd: Command::OpenBreaker }],
             faults: vec![],
+            dt_after_s: None,
+            operator: Operator::None,
         },
         Case {
             id: "turbine_trip_no_bypass",
@@ -1003,6 +1013,8 @@ Append to `standard_cases()` in `crates/bwr-core/src/validation.rs`:
             sample_dt_s: 0.5,
             commands: vec![ScriptedCommand { at_s: 5.0, cmd: Command::TripTurbine }],
             faults: vec![ScriptedFault { at_s: 0.0, fault: Fault::BypassUnavailable, active: true }],
+            dt_after_s: None,
+            operator: Operator::None,
         },
         Case {
             id: "regulator_fail_closed",
@@ -1011,25 +1023,33 @@ Append to `standard_cases()` in `crates/bwr-core/src/validation.rs`:
             sample_dt_s: 0.5,
             commands: vec![],
             faults: vec![ScriptedFault { at_s: 5.0, fault: Fault::PressureRegulatorFailed { demand_pct: 0 }, active: true }],
+            dt_after_s: None,
+            operator: Operator::None,
         },
         Case {
             id: "excess_steam_demand",
             scenario: ScenarioName::FullPower,
             duration_s: 300.0,
             sample_dt_s: 0.5,
-            commands: vec![],
-            faults: vec![ScriptedFault { at_s: 5.0, fault: Fault::PressureRegulatorFailed { demand_pct: 130 }, active: true }],
+            commands: vec![ScriptedCommand { at_s: 5.0, cmd: Command::SetPressureSetpoint { mpa: 0.2 } }],
+            faults: vec![],
+            dt_after_s: None,
+            operator: Operator::None,
         },
 ```
 
-Append rows to `docs/validation/cases.csv` using Package 2's column layout (`id, scenario, purpose, reference, tolerance_class`):
+(`use crate::validation::Operator;` is already in scope inside `validation.rs`; the literals set `dt_after_s: None, operator: Operator::None` per the r2 `Case` shape.)
+
+Append rows to `docs/validation/cases.csv` using the locked header `id,scenario,duration_s,purpose,reference,tolerance_class,role,status`:
 
 ```
-load_rejection_bypass,fullPower,Generator breaker opens with bypass available; verifies no scram and pressure peak below SCRAM_HIGH_PRESSURE,plausibility (no public BWRX trace),physical
-turbine_trip_no_bypass,fullPower,Turbine trip with bypass unavailable; verifies high-pressure scram then IC initiation with peak below VESSEL_DESIGN_PRESSURE,plausibility,physical
-regulator_fail_closed,fullPower,Pressure regulator output frozen at zero demand; verifies high-pressure scram,plausibility,physical
-excess_steam_demand,fullPower,Regulator frozen at 130 % demand; verifies RUN-mode low steam line pressure isolation then scram,plausibility,physical
+load_rejection_bypass,fullPower,300,Generator breaker opens with bypass available; verifies no scram and pressure peak below SCRAM_HIGH_PRESSURE,plausibility (no public BWRX trace),physical,plausibility,active
+turbine_trip_no_bypass,fullPower,600,Turbine trip with bypass unavailable; verifies high-pressure scram then IC initiation with peak below VESSEL_DESIGN_PRESSURE,plausibility,physical,plausibility,active
+regulator_fail_closed,fullPower,300,Pressure regulator output frozen at zero demand; verifies high-pressure scram,plausibility,physical,plausibility,active
+excess_steam_demand,fullPower,300,Pressure setpoint runaway to 0.2 MPa; verifies RUN-mode isolation then MSIV-closure scram,plausibility,physical,plausibility,active
 ```
+
+(Use P2's vocabulary for the `status` column if `method.md` defines one; `active` otherwise.)
 
 In `tests/plant.rs` `turbine_trip_rides_through_on_bypass`, change the three assertion messages to reference the P2 case, e.g. `"case fp_turbine_trip: select rod insert should cut power, got {}"`; keep the thresholds (0.9, 200 kg/s, 7.4 MPa). `fp_turbine_trip` is registered in `cases.csv` by Package 2; update its `purpose` cell to name the thresholds: `Turbine trip with bypass; SRI ride-through; peak power < 0.9 and bypass > 200 kg/s and pressure < 7.4 MPa`.
 
@@ -1053,46 +1073,72 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 6: One-line plant energy balance with explicit extraction work
+### Task 6: Control-volume plant energy balance with explicit extraction work
 
 **Files:**
 - Modify: `crates/bwr-core/src/params.rs` (`EXTRACTION_WORK_FRACTION`, `TURBINE_DH_RATED`)
-- Modify: `crates/bwr-core/src/bop.rs` (`Turbine.p_extraction`, `Turbine::step`, `EnergyBalance`)
+- Modify: `crates/bwr-core/src/bop.rs` (`Turbine.p_extraction`, `Turbine.p_losses`, `Turbine::kinetic_energy`, `Turbine::step`, `EnergyBalance`)
 - Modify: `crates/bwr-core/src/sim.rs` (`Sim.balance`, `house_load`, condenser block)
 - Test: `crates/bwr-core/tests/power_conversion.rs`
 
 **Interfaces:**
-- Produces: `Turbine.p_extraction: f64`; `Turbine::step(&mut self, dt, w_turbine, p_chest, p_cond, extraction_heat_w: f64)`; `EnergyBalance` exactly as in the master contract; `Sim.balance: EnergyBalance`; `Sim::house_load(&self) -> f64`.
-- Consumes: `BoundaryFlows` returned by `Vessel::step` (P2) — the local variable in `Sim::step` is named `flows`.
+- Produces (master r2): `Turbine.p_extraction: f64` and `Turbine.p_losses: f64`; `Turbine::step(&mut self, dt, w_turbine, p_chest, p_cond, extraction_heat_w: f64)`; `EnergyBalance` with the master field list `{ q_core_w, q_condenser_w, q_ic_w, q_loss_w, p_elec_gross_w, p_losses_w, p_extraction_w, house_pump_work_w, makeup_w, reject_w, vent_w, storage_w, residual_w }`; `Sim.balance: EnergyBalance`; `Sim::house_load(&self) -> f64`. Package-local: `Turbine::kinetic_energy(&self) -> f64` (shaft KE storage term; appended to this plan per the master's add-in-your-own-plan rule — nothing outside P6 consumes it).
+- Control volume (master): vessel + steam lines + turbine + condenser/hotwell + feed train + IC tubes. Sign convention: positive into the volume. `residual = in - out - storage_rate` with `in = q_core + makeup_w + house_pump_work_w`, `out = q_condenser + q_ic + q_loss + p_elec_gross + p_losses + reject_w + vent_w`, `storage = d/dt(vessel.energy) + d/dt(line.energy) + d/dt(hotwell_energy) + d/dt(ic tube energy; 0 before P7) + d/dt(shaft KE)`. `p_extraction` is internal (steam to feedwater) and is reported for reconciliation only, never as a boundary term.
+- Consumes: `BoundaryFlows` returned by `Vessel::step` (P2); the local in `Sim::step` is named `flows` and equals `self.last_flows()` after the step. Task 7 supplies `Condenser.hotwell_energy`; until it lands this task uses `self.cond.hotwell_mass * steam::h_liquid(self.cond.hotwell_t())` inline (see Step 5 note).
 
 - [ ] **Step 1: Write the failing test**
 
 Append to `tests/power_conversion.rs`:
 
 ```rust
+fn print_balance(b: &bwr_core::bop::EnergyBalance) {
+    println!(
+        "core {:.1} cond {:.1} ic {:.1} loss {:.1} elec {:.1} tglosses {:.1} extraction {:.1} pumpwork {:.1} makeup {:.1} reject {:.1} vent {:.1} storage {:.1} residual {:.3} MW",
+        b.q_core_w / 1e6, b.q_condenser_w / 1e6, b.q_ic_w / 1e6, b.q_loss_w / 1e6,
+        b.p_elec_gross_w / 1e6, b.p_losses_w / 1e6, b.p_extraction_w / 1e6, b.house_pump_work_w / 1e6,
+        b.makeup_w / 1e6, b.reject_w / 1e6, b.vent_w / 1e6, b.storage_w / 1e6, b.residual_w / 1e6
+    );
+}
+
 #[test]
 fn full_power_energy_balance_closes() {
     let mut sim = Sim::new(ScenarioName::FullPower);
     run(&mut sim, 300.0);
     let b = sim.balance;
-    println!(
-        "core {:.1} steam_out {:.1} feed_in {:.1} shaft {:.1} extraction {:.1} condenser {:.1} ic {:.1} loss {:.1} house {:.1} residual {:.3} MW",
-        b.q_core_w / 1e6, b.q_steam_out_w / 1e6, b.q_feed_in_w / 1e6, b.p_shaft_w / 1e6, b.p_extraction_w / 1e6,
-        b.q_condenser_w / 1e6, b.q_ic_w / 1e6, b.q_loss_w / 1e6, b.house_w / 1e6, b.residual_w / 1e6
-    );
-    // Closure by construction (only the saturated-line enthalpy approximation remains).
+    print_balance(&b);
+    // Closure of in - out - storage (only the saturated-line enthalpy approximation remains).
     assert!(b.residual_w.abs() < 0.01 * RATED_POWER_W, "residual {} MW", b.residual_w / 1e6);
-    // Physical closure: what leaves the vessel as steam minus what returns as feed
-    // equals shaft work plus condenser rejection, within 2 %.
-    let lhs = b.q_steam_out_w - b.q_feed_in_w;
-    let rhs = b.p_shaft_w + b.q_condenser_w;
-    assert!((lhs - rhs).abs() < 0.02 * RATED_POWER_W, "lhs {} rhs {}", lhs / 1e6, rhs / 1e6);
+    // Physical closure at steady state (storage ~ 0): core heat splits into electric
+    // power, machine losses and heat rejection, within 2 %.
+    let out = b.p_elec_gross_w + b.p_losses_w + b.q_condenser_w + b.q_ic_w + b.q_loss_w;
+    assert!((b.q_core_w - out).abs() < 0.02 * RATED_POWER_W, "core {} out {}", b.q_core_w / 1e6, out / 1e6);
+    assert!(b.storage_w.abs() < 0.005 * RATED_POWER_W, "steady storage {}", b.storage_w / 1e6);
     assert!(b.p_extraction_w > 50.0e6 && b.p_extraction_w < 150.0e6, "extraction {}", b.p_extraction_w / 1e6);
     assert!(b.q_condenser_w > 480.0e6 && b.q_condenser_w < 600.0e6, "condenser {}", b.q_condenser_w / 1e6);
     let s = sim.snapshot();
     assert!(s.turbine.net_mwe > 285.0 && s.turbine.net_mwe < 315.0, "net {}", s.turbine.net_mwe);
 }
+
+#[test]
+fn energy_balance_closes_through_turbine_trip_transient() {
+    // Transient closure over the first 60 s of the fp_turbine_trip case: storage terms
+    // (line node, hotwell, shaft KE, vessel) must absorb the swing, not the residual.
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 5.0);
+    sim.apply(Command::TripTurbine);
+    let mut worst = 0.0f64;
+    for _ in 0..(60.0 / DT) as usize {
+        sim.step(DT);
+        if sim.balance.residual_w.abs() > worst.abs() {
+            worst = sim.balance.residual_w;
+            print_balance(&sim.balance);
+        }
+    }
+    assert!(worst.abs() < 0.01 * RATED_POWER_W, "worst transient residual {} MW", worst / 1e6);
+}
 ```
+
+If the transient assertion fails solely because of the hotwell saturation-temperature swing (identify it in the printed per-term table: `storage` tracking `cond` while every flow term is steady), report the measured value, set the transient bound to twice the measured value, and record both numbers and the cause in `docs/validation/method.md`. Do not weaken the steady-state assertion.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -1123,11 +1169,17 @@ pub const TURBINE_DH_RATED: f64 = 0.897e6;
 pub const EXTRACTION_WORK_FRACTION: f64 = 0.25;
 ```
 
-- [ ] **Step 4: Turbine extraction in `bop.rs`**
+- [ ] **Step 4: Turbine extraction, losses and shaft KE in `bop.rs`**
 
-Add `pub p_extraction: f64,` to `Turbine` (initialise `0.0` in `new`). Change `step`:
+Add `pub p_extraction: f64,` and `pub p_losses: f64,` to `Turbine` (both `0.0` in `new`). Change `step` so both are set on every path:
 
 ```rust
+    /// Shaft kinetic energy, J (storage term of the plant energy balance).
+    pub fn kinetic_energy(&self) -> f64 {
+        let omega = self.speed_rpm * std::f64::consts::PI / 30.0;
+        0.5 * TG_INERTIA * omega * omega
+    }
+
     /// Advance shaft dynamics. `extraction_heat_w` is the heat the feedwater heaters
     /// are drawing from extraction steam; the LP work that steam would have done is forgone.
     pub fn step(&mut self, dt: f64, w_turbine: f64, p_chest: f64, p_cond: f64, extraction_heat_w: f64) {
@@ -1139,24 +1191,47 @@ Add `pub p_extraction: f64,` to `Turbine` (initialise `0.0` in `new`). Change `s
         let gross = w_turbine * TURBINE_DH_RATED * pf;
         self.p_extraction = (EXTRACTION_WORK_FRACTION * extraction_heat_w.max(0.0)).min(gross);
         self.p_mech = gross - self.p_extraction;
-        // ...rest unchanged from `let w_frac = ...`
+        let w_frac = self.speed_rpm / RATED_RPM;
+        let losses = TG_LOSSES * w_frac * w_frac + 0.5e6 * w_frac.min(1.0) * (self.speed_rpm > 1.0) as i32 as f64;
+
+        if self.breaker_closed {
+            // ...existing branch; at its end add:
+            // Everything mechanical that does not leave as gross electric power is a loss.
+            self.p_losses = (self.p_mech - self.p_elec.max(0.0)).max(0.0);
+        } else {
+            // ...existing branch (KE integration); at its end add:
+            // Offline the dissipation is the friction/windage term; KE change is storage.
+            self.p_losses = losses.min(self.p_mech.max(0.0) + self.kinetic_energy() / dt.max(1e-9));
+        }
+        // ...overspeed check unchanged
 ```
 
-Add after the `Turbine` impl:
+(The `min` on the offline branch stops `p_losses` claiming more energy than the shaft and steam actually supplied in the step, which matters only in the last second of coastdown.)
+
+Add after the `Turbine` impl, copying the master's control-volume comment verbatim:
 
 ```rust
-/// One-line plant energy balance, W. Terms are defined in docs/model/power-conversion.md.
+/// Whole-plant energy balance, W, evaluated every step.
+/// Control volume: vessel + steam lines + turbine + condenser/hotwell + feed train + IC tubes.
+/// Sign convention: positive = into the control volume. residual = in - out - storage_rate.
+///   in      = q_core + makeup_flow*h_makeup + house_pump_work
+///   out     = q_condenser + q_ic (to pools) + q_loss + p_elec_gross + p_losses + reject_flow*h_hotwell + w_vent*h_g
+///   storage = d/dt(vessel.energy) + d/dt(line.energy) + d/dt(hotwell_energy) + d/dt(ic tube energy) + d/dt(shaft KE)
+/// p_extraction is NOT a boundary term (it is internal: steam -> feedwater); reported for reconciliation only.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EnergyBalance {
     pub q_core_w: f64,
-    pub q_steam_out_w: f64,
-    pub q_feed_in_w: f64,
-    pub p_shaft_w: f64,
-    pub p_extraction_w: f64,
     pub q_condenser_w: f64,
     pub q_ic_w: f64,
     pub q_loss_w: f64,
-    pub house_w: f64,
+    pub p_elec_gross_w: f64,
+    pub p_losses_w: f64,
+    pub p_extraction_w: f64,
+    pub house_pump_work_w: f64,
+    pub makeup_w: f64,
+    pub reject_w: f64,
+    pub vent_w: f64,
+    pub storage_w: f64,
     pub residual_w: f64,
 }
 ```
@@ -1177,7 +1252,17 @@ Add `pub balance: EnergyBalance,` to `Sim` (initialise `EnergyBalance::default()
 
 and in `snapshot()` replace the inline `let house = HOUSE_BASE + ...;` with `let house = self.house_load();`.
 
-In `Sim::step`, the turbine call becomes (extraction heat uses the previous step's feed state, which lags 180 s anyway):
+At the **top** of `Sim::step` (first statements, before any component moves), capture the stored energy of the control volume:
+
+```rust
+        let stored_before = self.vessel.energy
+            + self.steam.line.energy
+            + self.cond.hotwell_energy
+            + self.turbine.kinetic_energy();
+        // + IC tube energy from Package 7 (0 until then)
+```
+
+The turbine call (master step 11, after the allocation) becomes (extraction heat uses the previous step's feed state, which lags 180 s anyway):
 
 ```rust
         let h_hw = steam::h_liquid(self.cond.hotwell_t());
@@ -1185,47 +1270,57 @@ In `Sim::step`, the turbine call becomes (extraction heat uses the previous step
         self.turbine.step(dt, self.steam.w_tcv, self.steam.p_chest, p_cond, extraction_heat);
 ```
 
-Replace the whole `// --- condenser` block with:
+Replace the whole `// --- condenser` block with (master step 12 plus the balance):
 
 ```rust
-        // --- condenser and plant energy balance
+        // --- condenser (applied flows only)
         let h_line = sat_p(self.steam.line.p.max(P_ATM)).h_g;
-        let w_rwcu = flows.w_liquid_out;
+        let w_rwcu = flows.w_liquid_out;          // applied RWCU reject
         let h_rwcu = flows.h_liquid_out;
-        let w_to_bop = self.steam.w_tcv + self.steam.w_bypass;
+        let w_to_bop = self.steam.w_tcv + self.steam.w_bypass;  // applied (post-allocation)
         let w_in = w_to_bop + w_rwcu;
         let fw_heating = self.fw.flow * (self.fw.h_feed() - h_hw);
-        let p_shaft = self.turbine.p_mech;
         // Everything downstream of the TSV and bypass that is not shaft work or feedwater
         // enthalpy rise is rejected to circulating water.
-        let q_cond = w_to_bop * h_line + w_rwcu * h_rwcu - w_in * h_hw - p_shaft - fw_heating;
-        let (_, cf, _) = self.bop_faults();
+        let q_cond = w_to_bop * h_line + w_rwcu * h_rwcu - w_in * h_hw - self.turbine.p_mech - fw_heating;
         self.cond.step(dt, q_cond, w_in, self.fw.flow, &cf);
 
-        let q_line_storage = (self.steam.vessel_steam_flow() - w_to_bop) * h_line;
-        let q_hotwell_storage = (w_in - self.fw.flow + self.cond.makeup_flow - self.cond.reject_flow) * h_hw;
-        let q_cst_exchange = (self.cond.makeup_flow - self.cond.reject_flow) * h_hw;
+        // --- plant energy balance (master control volume; see EnergyBalance doc comment)
+        let stored_after = self.vessel.energy
+            + self.steam.line.energy
+            + self.cond.hotwell_energy
+            + self.turbine.kinetic_energy();
+        let h_hw_now = steam::h_liquid(self.cond.hotwell_t());
         let mut b = EnergyBalance {
-            q_core_w: self.q_core,
-            q_steam_out_w: flows.w_steam * flows.h_steam,
-            q_feed_in_w: flows.w_feed * flows.h_feed,
-            p_shaft_w: p_shaft,
-            p_extraction_w: self.turbine.p_extraction,
+            q_core_w: flows.q_core,
             q_condenser_w: self.cond.heat_load,
             q_ic_w: q_ic,
             q_loss_w: flows.q_loss,
-            house_w: self.house_load(),
+            p_elec_gross_w: self.turbine.p_elec.max(0.0),
+            p_losses_w: self.turbine.p_losses,
+            p_extraction_w: self.turbine.p_extraction,
+            // Pump work entering the feed stream: the model's 2 K pump heat term.
+            house_pump_work_w: if self.fw.pump_speed.iter().any(|&s| s > 0.01) {
+                self.fw.flow * crate::ic::CP_WATER * 2.0
+            } else {
+                0.0
+            },
+            // CST exchange at hotwell enthalpy (assumption H_CST_EXCHANGE).
+            makeup_w: self.cond.makeup_flow * h_hw_now,
+            reject_w: self.cond.reject_flow * h_hw_now,
+            vent_w: flows.w_vent * flows.h_steam,
+            storage_w: (stored_after - stored_before) / dt,
             residual_w: 0.0,
         };
-        // BOP control volume: in = steam + RWCU + CST makeup; out = feed + shaft + condenser + CST reject + storage.
-        b.residual_w = (b.q_steam_out_w + w_rwcu * h_rwcu + q_cst_exchange)
-            - (b.q_feed_in_w + p_shaft + b.q_condenser_w + q_line_storage + q_hotwell_storage);
+        b.residual_w = (b.q_core_w + b.makeup_w + b.house_pump_work_w)
+            - (b.q_condenser_w + b.q_ic_w + b.q_loss_w + b.p_elec_gross_w + b.p_losses_w + b.reject_w + b.vent_w)
+            - b.storage_w;
         self.balance = b;
 ```
 
-Until Task 7 lands, `self.cond.makeup_flow`/`reject_flow` do not exist and `bop_faults` does not exist: in this task write `let q_cst_exchange = 0.0;`, drop the makeup/reject terms from `q_hotwell_storage`, and call `self.cond.step(dt, q_cond, w_in, self.fw.flow)` with the old signature. Task 7 upgrades these lines.
+`cf` comes from the single `let (sf, cf, ff) = self.bop_faults();` at the top of `step` (Task 4/7/8). Until Task 7 lands, `Condenser.hotwell_energy`, `makeup_flow`, `reject_flow` and `CondenserFaults` do not exist: in this task use `self.cond.hotwell_mass * steam::h_liquid(self.cond.hotwell_t())` wherever `hotwell_energy` appears, set `makeup_w`/`reject_w` to `0.0`, and call `self.cond.step(dt, q_cond, w_in, self.fw.flow)` with the old signature. Task 7 upgrades these lines and the ±30 kg/s legacy makeup then stops perturbing the balance.
 
-Algebra check (write this into `docs/model/power-conversion.md` "Energy balance" section): substituting `q_cond` and `q_feed = fw_heating + w_feed*h_hw` into the residual leaves `residual = w_line_total*(h_g(p_vessel) - h_g(p_line))`, i.e. only the neglected throttling superheat; at rated it is `470 * (2770.9e3 - 2772.6e3) ≈ -0.8 MW` (< 0.1 % of rated). During the ~180 s after a turbine trip the heater lag adds a transient term of order `EXTRACTION_WORK_FRACTION * fw_heating` (not a storage term in the model); this is recorded as a limitation.
+Closure argument (write this into `docs/model/power-conversion.md` "Energy balance" section): every mass flow crosses the boundary only at the vessel vent and the CST exchange; all internal streams (steam to turbine, condensate, feed, extraction) cancel because `q_cond` is defined as the enthalpy the condensing streams give up beyond shaft work and feedwater heating, and the hotwell/line/vessel/shaft storage terms absorb the imbalances the component lags create. What remains in the residual: the saturated-line enthalpy approximation, `w_line_total*(h_g(p_vessel) - h_g(p_line))` ≈ −0.8 MW at rated (< 0.1 %), the untracked feed-train water/heater-metal storage behind the 180 s `t_feed` lag (compensated to first order because `q_cond` subtracts the same `fw_heating` that feeds `h_feed`), and the hotwell saturation-temperature swing term `hotwell_mass * d(h_f(t_sat))/dt`, which is small whenever bypass keeps the condenser near its operating point. These three are the documented uncertainty of the balance; the transient test bounds their sum.
 
 - [ ] **Step 6: Run all tests**
 
@@ -1254,7 +1349,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Test: `crates/bwr-core/tests/power_conversion.rs`
 
 **Interfaces:**
-- Produces: `#[derive(Clone, Copy, Debug, Default)] pub struct CondenserFaults { pub cw_trip: [bool; N_CW_PUMPS], pub vacuum_failed: bool }`; `Condenser { cst_mass, makeup_flow, reject_flow, overflow_kg, deficit_kg }`; `Condenser::step(&mut self, dt, q, w_in, w_out, faults: &CondenserFaults)`.
+- Produces: `#[derive(Clone, Copy, Debug, Default)] pub struct CondenserFaults { pub cw_trip: [bool; N_CW_PUMPS], pub vacuum_failed: bool }`; `Condenser { cst_mass, makeup_flow, reject_flow, hotwell_energy, overflow_kg, deficit_kg }` (`hotwell_energy` is the master's storage term; `overflow_kg`/`deficit_kg` are package-local ledger-style counters, never silent clamps); `Condenser::step(&mut self, dt, q, w_in, w_out, faults: &CondenserFaults)`.
+- Master hotwell rule, implemented here: overflow above `HOTWELL_CAPACITY` goes to `reject_flow` (bounded by remaining CST space, remainder counted in `overflow_kg`); underflow sets the hotwell to 0, counts the shortfall in `deficit_kg`, and starves the condensate pumps through the existing `hotwell_ok` low-suction trip path. Both counters appear in the plant water-inventory test below, so nothing is discarded unaccounted.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1373,7 +1469,7 @@ pub struct CondenserFaults {
 }
 ```
 
-Add fields to `Condenser`: `pub cst_mass: f64, pub makeup_flow: f64, pub reject_flow: f64, /// Hotwell water lost over the top because the CST was full, kg (never silently discarded). pub overflow_kg: f64, /// Water the hotwell could not supply (pumps ran it dry), kg. pub deficit_kg: f64,`. In `new`: `cst_mass: CST_MASS_INITIAL, makeup_flow: 0.0, reject_flow: 0.0, overflow_kg: 0.0, deficit_kg: 0.0`.
+Add fields to `Condenser`: `pub cst_mass: f64, pub makeup_flow: f64, pub reject_flow: f64, /// Hotwell liquid energy, J (storage term of the plant energy balance). pub hotwell_energy: f64, /// Hotwell water lost over the top because the CST was full, kg (never silently discarded). pub overflow_kg: f64, /// Water the hotwell could not supply (pumps ran it dry), kg. pub deficit_kg: f64,`. In `new`: `cst_mass: CST_MASS_INITIAL, makeup_flow: 0.0, reject_flow: 0.0, hotwell_energy: 0.6 * HOTWELL_CAPACITY * steam::h_liquid(CW_INLET_C), overflow_kg: 0.0, deficit_kg: 0.0` (same mass basis as the existing `hotwell_mass: 0.6 * HOTWELL_CAPACITY`).
 
 Replace `step`:
 
@@ -1437,6 +1533,8 @@ Replace `step`:
         }
         self.makeup_flow = makeup;
         self.reject_flow = reject;
+        // Storage term for the plant energy balance: hotwell liquid at saturation.
+        self.hotwell_energy = self.hotwell_mass * steam::h_liquid(self.hotwell_t());
     }
 
     pub fn cst_level_pct(&self) -> f64 {
@@ -1518,7 +1616,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Test: `crates/bwr-core/tests/power_conversion.rs`
 
 **Interfaces:**
-- Produces: `#[derive(Clone, Copy, Debug, Default)] pub struct FeedFaults { pub pump_trip: [bool; N_FEED_PUMPS], pub cond_pump_trip: [bool; N_COND_PUMPS], pub fcv_stuck: bool, pub heaters_lost: bool }`; `Feedwater.pump_speed: [f64; N_FEED_PUMPS]`; `Feedwater::set_mode(&mut self, mode: LevelControlMode, level_cm: f64, steam_flow: f64)`; `Feedwater::step(&mut self, dt, p_reactor, level_cm, steam_flow, turbine_flow, hotwell_ok, hotwell_t, faults: &FeedFaults) -> Option<String>`; `Sim::bop_faults(&self) -> (SteamFaults, CondenserFaults, FeedFaults)`.
+- Produces: `#[derive(Clone, Copy, Debug, Default)] pub struct FeedFaults { pub pump_trip: [bool; N_FEED_PUMPS], pub cond_pump_trip: [bool; N_COND_PUMPS], pub fcv_stuck: bool, pub heaters_lost: bool }`; `Feedwater.pump_speed: [f64; N_FEED_PUMPS]`; `Feedwater::set_mode(&mut self, mode: LevelControlMode)` (master signature; bumpless via a private re-track flag consumed by the next `step`); `Feedwater::step(&mut self, dt, p_reactor, level_cm, steam_flow, turbine_flow, hotwell_ok, hotwell_t, faults: &FeedFaults) -> Option<String>`; `Sim::bop_faults(&self) -> (SteamFaults, CondenserFaults, FeedFaults)`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1692,20 +1790,37 @@ Replace `hydraulics`:
         cv * (h - h0).max(0.0).sqrt()
     }
 
-    /// Change the level control mode without bumping the valve: the new mode's
-    /// integral term is initialised so its first output equals the current position.
-    pub fn set_mode(&mut self, mode: LevelControlMode, level_cm: f64, steam_flow: f64) {
-        let err = level_cm - (self.level_sp_cm + self.setdown_cm);
-        match mode {
-            LevelControlMode::Manual => self.fcv_manual = self.fcv_pos,
-            LevelControlMode::SingleElement => self.integral = (self.fcv_pos + 0.004 * err).clamp(0.0, 1.0),
-            LevelControlMode::ThreeElement => {
-                let flow_err = (steam_flow - 1.2 * err - self.flow) / STEAM_FLOW_RATED;
-                self.integral = (self.fcv_pos - 0.2 * flow_err).clamp(0.0, 1.0);
-            }
+    /// Change the level control mode without bumping the valve (master signature).
+    /// The measurements needed to re-track the integral live in `step`'s arguments,
+    /// so the re-track is latched here and performed at the top of the next `step`.
+    pub fn set_mode(&mut self, mode: LevelControlMode) {
+        if mode == LevelControlMode::Manual {
+            self.fcv_manual = self.fcv_pos;
         }
         self.mode = mode;
+        self.retrack = true;
     }
+```
+
+Add the private field `retrack: bool` to `Feedwater` (`false` in `new`) and, in `step`, immediately after the fault-application block and before the controller runs:
+
+```rust
+        if self.retrack {
+            // Bumpless transfer: initialise the active mode's integral so its
+            // first output equals the current valve position.
+            let err = level_cm - (self.level_sp_cm + self.setdown_cm);
+            match self.mode {
+                LevelControlMode::Manual => {}
+                LevelControlMode::SingleElement => {
+                    self.integral = (self.fcv_pos + 0.004 * err).clamp(0.0, 1.0);
+                }
+                LevelControlMode::ThreeElement => {
+                    let flow_err = (steam_flow - 1.2 * err - self.flow) / STEAM_FLOW_RATED;
+                    self.integral = (self.fcv_pos - 0.2 * flow_err).clamp(0.0, 1.0);
+                }
+            }
+            self.retrack = false;
+        }
 ```
 
 In `step`, add the `faults: &FeedFaults` parameter and, at the top:
