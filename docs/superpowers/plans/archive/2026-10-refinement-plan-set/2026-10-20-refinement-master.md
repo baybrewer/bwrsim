@@ -30,6 +30,9 @@ Copied from the spec and from Jim's CLAUDE.md. Every task in every package impli
 - Every numeric constant added or changed gets a row in `docs/model/parameters.csv` with a status of `confirmed`, `derived`, `calibrated`, `esbwr-estimate`, `assumed`, or `unavailable`.
 - **Derives rule:** every new struct or enum stored inside `Sim` (directly or nested) derives at least `Clone, Debug`; anything placed in `api.rs` also derives `Serialize, Deserialize` with `#[serde(rename_all = "camelCase")]`. Replacing an existing declaration preserves its existing derives (`Eos`: `Clone, Copy, Debug`; `IcTrain`: `Clone, Debug` + `Default`; `SteamSystem`: `Clone, Debug`).
 - **Non-finite inputs rule:** every `Command` carrying an `f64` is ignored (with event id `cmd`, text `Command ignored: non-finite value`) when the value is not finite. Every public step function treats a non-finite input as a `DomainError::PropertyOutOfRange`.
+- **dt rule:** every public step function validates `dt.is_finite() && dt > 0.0` before touching state; on failure a `Result`-returning step returns `Err(DomainError::PropertyOutOfRange { what: "dt".into(), value: dt })` and a void-returning step sets its `last_error` field; state is unchanged either way. Every public numeric argument is validated the same way (`what` names the argument).
+- **Register-row rule:** the `parameters.csv` row for a constant is added or updated in the SAME task that adds or changes the constant (never deferred to a later task), so `tests/register.rs` passes at every task boundary.
+- **Baseline regeneration protocol** (every package that changes physics): (1) run `cargo run --release -p bwr-core --example validation` in compare mode and save its output to `docs/validation/reports/<date>-pkg<NN>.md`; (2) classify every changed metric as physical (with the reason), schema-population (a column newly populated), or numerical; (3) pass the package's independent physical gates (its own tests); (4) run `--write` exactly once per reviewed change set; (5) commit the report and the baselines together. Never expect byte-identical traces after a column is newly populated; never adjust a tolerance after a failure to make the failure pass.
 - Commit after every task. Commit messages end with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
 - 2-space indentation in TypeScript; rustfmt defaults in Rust (do not run `cargo fmt` if the component is not installed; match surrounding style by hand).
 
@@ -78,6 +81,9 @@ docs/validation/cases.csv             (P2)  case register (id, scenario, purpose
 docs/validation/baseline/<case>.csv   (P2)  regression traces (regression evidence, not truth)
 docs/validation/reference/<case>.csv  (P9)  transcribed public traces, if any are found
 docs/validation/paired-failures.md    (P9)
+docs/validation/findings.md           (P3 creates, P9 extends)  F-nnn log of physical assertion failures that are recorded and #[ignore]d, never retuned
+docs/validation/results/*.csv         (P7, P9) tables written by tests when BWR_WRITE_RESULTS=1
+docs/validation/reports/<date>-pkg<NN>.md (every physics package) compare-mode output saved before regeneration
 docs/validation/results.md            (P10) published results and limitations
 ```
 
@@ -154,22 +160,37 @@ Names below are the only names later packages may use for these concepts. Signat
  3. core.update_reactivity(alpha_core, vessel.moderator_t())   (P4 for moderator_t; eos.t before P4)
  4. q_core <- core.step(dt, t_cool, coverage)           on Err: keep previous q_core, record error, kinetics not advanced
  5. steam valves step, requested steam flows            (bop: SteamSystem::step, compute_flows)
- 6. IC trains step -> requested IC steam withdrawal and condensate return   (P7; before P7 the IC returns q_removed)
- 7. feedwater step -> requested feed flow
+ 6. IC trains `request` -> requested IC steam withdrawal and condensate return   (P7; before P7 the IC `step` returns q_removed)
+ 7. feedwater step -> requested feed flow, bounded by hotwell inventory (P6: HotwellExhausted on shortfall)
  8. vessel.step(dt, &VesselInputs) -> BoundaryFlows     bounds ALL outflows to available inventory; this is the transfer-allocation point
- 9. apply the allocation ratio to consumers: steam.w_tcv, steam.w_bypass, fw.rwcu_reject, ic[i].w_steam_in are scaled by
-    flows.w_steam / requested_w_steam (and the IC/RWCU equivalents) so every downstream component sees APPLIED transfers
-10. steam line storage step with applied inflow          (P6)
-11. turbine.step with applied w_tcv
+ 9. apply the allocation ratio to consumers: the APPLIED flow values (steam.w_tcv, steam.w_bypass, the RWCU flow passed to the
+    condenser as flows.w_liquid_out, ic[i] applied IcRequest) are scaled by flows.w_steam / requested_w_steam (and the IC/RWCU
+    equivalents) so every downstream component sees APPLIED transfers; operator setpoints (fw.rwcu_reject, p_setpoint, ...) are
+    never mutated by allocation;
+    IC trains `commit` with the ratio-scaled IcRequest (P7)
+10. steam line storage step with applied inflow; the node bounds its own outflow (P6)
+11. turbine.step with the node's applied w_tcv (P6) / vessel-scaled w_tcv (before P6)
 12. condenser.step with applied w_tcv, w_bypass, rwcu, feed
 13. sensors.step(dt, truth)                              (P8)
 14. time += dt
 15. protection()                                        (reads sensors only, from P8)
 16. ledger.record(dt, &flows); extrema.update(...)       (P2 ledger; P10 extrema)
-17. drain vessel.last_error / core error / ic errors into domain_errors
+17. drain vessel.last_error / core error (held locally since step 4) / ic errors into domain_errors, all stamped with the same post-step time
 ```
 
 The allocation ratio is 1.0 whenever inventory is adequate; it differs from 1.0 only in the step in which `InventoryExhausted` is raised. P3 adds a coupled low-inventory regression (`tests/conservation.rs`) asserting that the condenser hotwell gains exactly what the vessel released.
+
+### Locked CSV headers (owned by the package in parentheses; every other package reads these columns by name)
+
+```
+docs/model/parameters.csv          (P1) id,value,unit,definition,reference_state,source_design,status,source_ids,interval_lo,interval_hi,assumption_id,location,notes
+docs/model/sources.csv             (P1) see P1 plan (12 columns, first column `id`)
+docs/model/esbwr-applicability.csv (P1) id,esbwr_source,esbwr_section,target_subsystem,bwrx_evidence,differences,adaptation,applicability_limits,test,classification
+docs/validation/cases.csv          (P2) id,scenario,duration_s,purpose,reference,tolerance_class,role,status   (role: calibration | validation | plausibility; P9 fills it)
+docs/model/protection.csv          (P8) id,function,signal,measurement,mode_applicability,threshold,threshold_unit,threshold_source,delay_s,latch,reset_condition,override,consequence,test
+```
+
+Tests that read a register (P1 `register.rs`, P5 SDM test, P9) parse by header name, never by column position, and refer to the parameter row by its `id` (e.g. `SDM_REQUIRED`).
 
 ### Scenario construction and bookkeeping
 
@@ -221,7 +242,7 @@ impl Ledger {
 }
 ```
 
-`Vessel::step(&mut self, dt: f64, inp: &VesselInputs) -> BoundaryFlows` (changed return type in P2). `Sim` gains `pub ledger: Ledger`.
+`Vessel::step(&mut self, dt: f64, inp: &VesselInputs) -> BoundaryFlows` (changed return type in P2). `Sim` gains `pub ledger: Ledger` and `pub fn last_flows(&self) -> &BoundaryFlows` (the flows applied in the most recent step; P2 stores them on `Sim`, P7 and tests read them).
 
 ### P2: `src/faults.rs`
 
@@ -282,7 +303,14 @@ pub struct Case {
     pub faults: Vec<ScriptedFault>,
     /// (from_t_s, dt_s): after from_t_s the runner switches to dt_s (long-duration cases, P7). None = single dt.
     pub dt_after_s: Option<(f64, f64)>,
+    /// Closed-loop operator (P9). P2 case literals use `operator: Operator::None`.
+    pub operator: Operator,
 }
+
+/// Closed-loop operators (P9). Named variants so `Case` stays `Clone + Debug` without boxing closures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operator { None, Startup { target_frac_pct: u8 }, PowerChange { from_pct: u8, to_pct: u8 }, ControlledShutdown, CooldownOnIc, RodWithdrawalError }
+pub const OPERATOR_DT_S: f64 = 1.0;   // operators are consulted once per OPERATOR_DT_S of sim time
 
 pub const TRACE_SCHEMA_VERSION: u32 = 2;
 pub const N_TRACE_COLS: usize = 58;
@@ -296,7 +324,7 @@ pub const TRACE_COLUMNS: [&str; N_TRACE_COLS] = [
     "level_nr_cm", "level_nr_cm_min_int", "level_nr_cm_max_int", "level_model_cm", // sensed/model split: P8
     "mass_kg", "energy_j", "gas_mass_kg",                                  // gas: P4
     "core_flow_kgs", "steam_flow_kgs", "feed_flow_kgs", "t_feed_c",
-    "fuel_t_c", "clad_t_c", "moderator_t_c",                               // clad: P5, moderator: P4
+    "t_coolant_c", "fuel_t_c", "clad_t_c", "moderator_t_c",                // clad: P5, moderator: P4
     "rods_avg_pos", "rods_min_pos", "rods_max_pos",
     "msiv_pos_0", "msiv_pos_1", "tsv_pos", "tcv_pos", "bypass_pos", "header_pressure_pa", // tsv/header: P6
     "turbine_rpm", "gross_we", "scrammed", "turbine_tripped", "breaker_closed", "mode",   // mode: 0 shutdown,1 refuel,2 startup,3 run
@@ -319,7 +347,14 @@ pub struct Trace {
     pub rows: Vec<[f64; N_TRACE_COLS]>,
     /// (sim time, text) for scram, trips, isolations, IC initiation, domain errors.
     pub events: Vec<(f64, String)>,
+    /// Ledger.integrated at the end of the run (keys as in Ledger); serialised as `# integrated,<key>,<value>` lines.
+    pub integrated: std::collections::BTreeMap<String, f64>,
+    /// Per-column extrema with their times of FIRST occurrence, accumulated at every physics step (not at sample rows);
+    /// serialised as `# extremum,<col>,<max>,<t_max>,<min>,<t_min>` lines. Metrics.peak/min read these, never the sampled rows.
+    pub extrema: std::collections::BTreeMap<String, Extremum>,
 }
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Extremum { pub max: f64, pub t_max: f64, pub min: f64, pub t_min: f64 }
 
 impl Trace {
     /// CSV: line 1 `# schema,2`; line 2 `# case,<id>`; line 3 `# dt_s,<v>`; line 4 header; rows with `{:.16e}`;
@@ -332,7 +367,7 @@ impl Trace {
 pub fn col_index(name: &str) -> usize; // panics on unknown column
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Metrics {
+pub struct Metrics {  // peak/min come from Trace.extrema (physics-step resolution), not from sampled rows
     pub final_values: std::collections::BTreeMap<String, f64>,
     pub peak: std::collections::BTreeMap<String, (f64, f64)>,  // name -> (value, time); uses *_max_int where available
     pub min: std::collections::BTreeMap<String, (f64, f64)>,
@@ -378,14 +413,27 @@ pub fn compare(reference: &Metrics, candidate: &Metrics, tol: &Tolerance) -> Vec
 /// Deterministic: same case + dt -> identical Trace. Runner clock is monotonic; commands and faults whose
 /// at_s <= time + dt/2 are applied before the step, commands before faults at equal times, each in list order.
 /// LoadScenario, SetPaused and SetSpeed are rejected (panic with the case id): scripted cases run at fixed dt.
+/// Timing validation (panic naming the case id on failure): dt, sample_dt_s, duration_s and any dt_after_s.1 are finite and > 0;
+/// sample_dt_s and duration_s are integer multiples of the dt in force (within 1e-9 relative); dt_after_s.0 lies on a sample boundary.
+/// Terminal handling: the log is drained after every boundary action AND after the last step, so terminal-boundary commands and
+/// operator actions appear in Trace.events exactly once; one final row is always emitted at time == duration_s.
+/// A Trace with no rows, or missing the schema/case/dt metadata, or missing integrated/extremum lines, is rejected by from_csv
+/// and by compare (a header-only baseline can never PASS). Nonfinite event times, metadata or tolerance inputs are violations.
 pub fn run_case(case: &Case, dt: f64) -> Trace;
-/// Closed-loop variant: `operator` is called before every step and returns commands to apply (P9).
+/// Closed-loop variant (P9): `operator` is called every OPERATOR_DT_S of sim time and returns commands to apply.
 pub fn run_case_with<F: FnMut(&crate::Sim, f64) -> Vec<Command>>(case: &Case, dt: f64, operator: F) -> Trace;
+/// Same, but on a caller-supplied Sim and returning it (P9 initial-condition tests).
+pub fn run_sim_with<F: FnMut(&crate::Sim, f64) -> Vec<Command>>(sim: crate::Sim, case: &Case, dt: f64, operator: F) -> (Trace, crate::Sim);
+/// `Case.operator` is dispatched by `run_case` to `validation::operators::{startup, power_change, controlled_shutdown, cooldown_on_ic, rod_withdrawal_error}`.
 
 pub fn standard_cases() -> Vec<Case>;
 ```
 
 `Sim` gains an append-only `pub log: Vec<(f64, String)>` written by `scram()`, turbine trips (detected via a private `prev_turbine_tripped` flag), MSIV isolation, IC auto-initiation, feed pump trips, ignored commands, and (from P3) domain errors. `run_case` drains it into `Trace.events`.
+
+**Log-line convention (locked; every `self.log.push` in every package):** the text is `"<key>: <detail>"` where `<key>` is one of
+`scram`, `turbine trip`, `msiv isolation`, `ic auto-initiation`, `feed pump trip`, `domain error`, `rod block`, `sri`, `ari`, `breaker open`, `command ignored`, `overload`, `ic model`, `ic manual`, `fault`.
+`Metrics.first_event_time` is keyed on the text before the first `:`. A package that needs a new key appends it to this list in the same commit. Examples: `feed pump trip: L8 high level`, `turbine trip: low condenser vacuum`, `ic auto-initiation: high pressure`. `tests/plant.rs` (P2) carries a test that every log line produced by the standard cases starts with a listed key.
 
 ### P3: `src/domain.rs`
 
@@ -399,6 +447,7 @@ pub enum DomainError {
     PropertyOutOfRange { what: String, value: f64 },
     FuelModelEnvelope { fuel_t_c: f64, clad_t_c: f64 },   // raised by P5
     IcModelEnvelope { train: usize, reason: String },     // raised by P7
+    HotwellExhausted { deficit_kg: f64 },                 // raised by P6 (feed request exceeds hotwell inventory)
 }
 impl DomainError { pub fn reason(&self) -> String; }
 ```
@@ -424,13 +473,17 @@ The simulation keeps running after a domain error; the flag persists until `Load
 ```rust
 // kinetics.rs
 pub const KIN_H_MAX: f64 = 1e-3;          // s, largest substep
-pub const KIN_PROMPT_SAFETY: f64 = 0.25;  // h <= KIN_PROMPT_SAFETY * GEN_TIME / (rho - BETA)
-pub const KIN_EXCESS_MAX: f64 = 0.2;      // dk/k above BETA: the supported reactivity envelope (physical limit, not a work cap)
+pub const KIN_PROMPT_SAFETY: f64 = 0.05;  // h <= KIN_PROMPT_SAFETY * GEN_TIME / (rho - BETA): an ACCURACY bound (<= 5 % prompt growth per substep), not just positivity
+pub const KIN_EXCESS_MAX: f64 = 0.02;     // dk/k above BETA: supported envelope. Growth rate 500/s; beyond this the fuel model is meaningless and f64 overflows within a plant step
 pub const KIN_N_FLOOR: f64 = 1e-12;       // period estimator uses max(n, KIN_N_FLOOR); inv_period = 0 when n0 < floor
+pub const KIN_N_MAX: f64 = 1e6;           // relative power ceiling: a candidate n1 > KIN_N_MAX or non-finite -> Err(PromptSupercritical), full rollback of n, c, inv_period
 impl Kinetics {
     /// Adaptive backward Euler. h = min(KIN_H_MAX, KIN_PROMPT_SAFETY*GEN_TIME/max(rho-BETA, 0)); substeps = ceil(dt/h)
     /// with NO work cap (a 100 s call at rho=0 is 100_000 substeps, as today). Err(PromptSupercritical) when
-    /// rho - BETA > KIN_EXCESS_MAX or the implicit denominator is still nonpositive. Period estimate is always finite.
+    /// rho - BETA > KIN_EXCESS_MAX, the implicit denominator is nonpositive, or any substep candidate is non-finite or > KIN_N_MAX;
+    /// on Err the ENTIRE entry state is restored (transactional across substeps). Period = (ln n1 - ln n0)/dt with the floor; always finite.
+    /// Accuracy evidence (P3): compared against an independent reference (inhour asymptotic period for rho in {-0.05, -0.01, 0.001, 0.003};
+    /// prompt-jump + h/10 refinement for rho - BETA in {0.005, 0.01, 0.02}) within 2 % on n after 0.05 s; the test is part of the envelope claim.
     pub fn advance(&mut self, rho: f64, s: f64, dt: f64) -> Result<usize, DomainError>;
 }
 // reactor.rs
@@ -462,9 +515,14 @@ pub fn solve_eos(mass: f64, energy: f64) -> Result<Eos, DomainError>;  // P4 add
 `VesselInputs` from P3: `{ q_core, q_ic, w_feed, h_feed, w_steam, w_liquid_out }` (unchanged) and from P7: `q_ic` is replaced by `w_ic_steam, w_ic_return, h_ic_return`.
 
 ```rust
-// ic.rs (P3 interim form; P7 replaces)
-pub struct IcStep { pub q_removed: f64, pub w_condensate_return: f64, pub energy_to_pool: f64, pub pool_boiloff_kg: f64, pub pool_cooling_w: f64 }
-impl IcTrain { pub fn step(&mut self, dt: f64, t_sat: f64, h_fg: f64, steam_available: bool) -> IcStep; }
+// ic.rs (P3 interim form; P7 extends the same request/commit shape with valves, tubes and mass ports)
+pub struct IcRequest { pub w_steam_in: f64, pub w_condensate_return: f64, pub h_condensate_return: f64 }   // P3: q/h_fg, same value, h_f
+pub struct IcStep { pub q_removed: f64, pub w_steam_in: f64, pub w_condensate_return: f64, pub h_condensate_return: f64, pub energy_to_pool: f64, pub pool_boiloff_kg: f64, pub pool_cooling_w: f64 }
+impl IcTrain {
+    pub fn request(&self, dt: f64, p_vessel: f64, w_steam_available: f64) -> IcRequest;   // pure
+    pub fn commit(&mut self, dt: f64, p_vessel: f64, applied: IcRequest) -> IcStep;      // the only state change; applied = request x vessel ratio (0 on EOS rejection)
+}
+// Sim integrates every IcStep field: energy_to_pool and pool_cooling_w go to the ledger/energy balance as boundary terms from P3 on.
 pub const CP_WATER: f64 = 4186.0; pub const H_FG_ATM: f64 = 2.257e6; pub const POOL_BOIL_T: f64 = 100.0; pub const POOL_IDLE_COOLING_K_PER_S: f64 = 0.0005;
 ```
 
@@ -498,6 +556,28 @@ impl Vessel {
 
 `Snapshot.vessel` gains `regime: Regime` (TS: `"vented" | "saturated" | "waterSolid" | "gasBlanketed"`). P4 owns the `api.rs`/`types.ts`/`mock.ts` edits for this field.
 
+P4 extensions (amended 2026-10-21 from the cycle-2 batch-3 review; consumed by P7's IC request hint and by tests):
+
+```rust
+// vessel.rs: Eos carries the partial pressures; `p == p_steam + p_gas` in every regime.
+pub struct Eos { pub t: f64, pub p: f64, pub p_steam: f64, pub p_gas: f64, pub x: f64, pub regime: Regime }
+pub const DISSOLVED_GAS_CAPACITY_KG: f64 = 1.0;  // gas up to this mass exerts no partial pressure
+pub const P_EOS_MAX: f64 = 16.0e6;               // numerical total-pressure limit, every regime; sat_p never clamps below it
+pub const GAS_BLANKET_ALARM_T_C: f64 = 90.0;
+// steam.rs
+pub const T_COMPRESSED_MAX: f64 = 300.0;         // linear-compressibility domain; water-solid states above it are rejected
+impl Vessel {
+    /// Dome holds steam above atmospheric pressure (label-independent). The IC supply hint at
+    /// step 6 is `if vessel.steam_available() { mass * x / dt } else { 0.0 }`.
+    pub fn steam_available(&self) -> bool;
+    pub fn friction_dp(&self) -> f64;   // k_fric * phi2 * W^2, for momentum-balance checks
+}
+```
+
+Transfer contract at step 8: `VesselInputs.w_steam` is a request for steam (water) mass. The vessel bounds it by the steam-space inventory and `w_liquid_out` by the liquid inventory; any binding cap is reported as `InventoryExhausted` with the deficit, and the ratio `flows.w_steam / requested` is the allocation ratio at step 9. Free noncondensable gas is swept out with the steam in the dome mass ratio, outside the water ledger and never counted against the request. `mass == 0` is a valid (zero-water) vessel state; a state with volume-derived quality above 1 is `EosOutOfRange`.
+
+P3 tests migrated by P4 (not regressions): `solve_eos` non-finite arguments raise `PropertyOutOfRange` (non-finite rule) instead of `EosOutOfRange`; the P3 "outflows scaled so `mass + dm*dt >= 0`" rule becomes phase-aware (steam-space and liquid caps), so P3's one-step total-drain and Sim-level drain tests are migrated in P4 Task 4 Step 4, and a drained vessel under net heating exits via `EosOutOfRange` (superheated vapour) rather than `InventoryExhausted`.
+
 ### P5: core, fuel, rods
 
 ```rust
@@ -513,14 +593,16 @@ pub enum RodMotion {
 pub struct Rods { /* layout, weights, pos, selected as today; plus */
     pub motion: Vec<RodMotion>,
     pub stuck: Vec<bool>,     // set from Fault::RodStuck by Sim each step
+    pub last_error: Option<DomainError>, // dt rule: error channel of the void-returning `step`/`set_motor_target`; Core::step_rods forwards it into Core.last_error (drained at step 17)
 }
 impl Rods {
     /// Commanded endpoint: Motor target, 0.0 for Scram/Sri/MotorRunIn, pos for Idle.
     pub fn target(&self, i: usize) -> f64;
     pub fn targets(&self) -> Vec<f64>;                // for Snapshot.rods.targets
-    pub fn set_motor_target(&mut self, i: usize, target: f64);
-    pub fn scram_hydraulic(&mut self);                // every non-stuck rod -> Scram (Sri rods become Scram)
-    pub fn motor_run_in(&mut self);                   // every non-stuck rod not already Scram -> MotorRunIn
+    pub fn set_motor_target(&mut self, i: usize, target: f64);   // rejects non-finite or out-of-range targets via last_error
+    pub fn refresh_stuck(&mut self, mask: &[bool]);                // Sim each step: sets `stuck`; a newly stuck rod is parked Idle
+    pub fn scram_hydraulic(&mut self);                // every non-stuck rod with pos > 0 -> Scram (Sri rods become Scram; rods already in stay Idle)
+    pub fn motor_run_in(&mut self);                   // every non-stuck rod with pos > 0 not already Scram -> MotorRunIn
     pub fn select_rod_insert(&mut self);              // SRI group -> Sri (unless already Scram)
     pub fn scramming(&self) -> bool;                  // any rod in Scram (Sri does NOT count)
     pub fn moving(&self) -> bool;
@@ -531,12 +613,20 @@ impl Rods {
     pub fn strongest_rod(&self) -> usize;
 }
 #[derive(Clone, Copy, Debug)]
-pub struct ReactivityCoeffs { pub void: f64, pub doppler_a: f64, pub mod_temp: f64, pub xenon_worth: f64 }  // Default = params
+pub struct ReactivityCoeffs { pub void: f64, pub doppler: f64, pub mod_t: f64, pub xenon_worth: f64 }  // Default = params; replaces Core::feedback and Xenon::reactivity
 pub struct Core { /* plus */ pub clad_t: f64, pub coeffs: ReactivityCoeffs }
 impl DecayHeat {
     /// Finite irradiation `irr_s` at power `n`, then cooled for `cooled_s`.
     pub fn after_history(n: f64, irr_s: f64, cooled_s: f64) -> Self;
 }
+// params.rs (P5): IRRADIATION_HISTORY_S = 6.31e7 (2 years, assumed), GAP_RESISTANCE_K_PER_W, CLAD_COOLANT_RESISTANCE_K_PER_W
+// (sum equals the removed FUEL_RESISTANCE so rated fuel temperature is unchanged), CLAD_HEAT_CAP_J_PER_K,
+// FUEL_MODEL_T_MAX_C = 1000.0 (clad, envelope not damage), UNCOVERED_ENVELOPE_S = 60.0, CORE_COVERED_FRAC = 0.999,
+// Q_FUEL_RATED (made pub and registered), DECAY_FIT_MAX_REL_ERR (only when the decay-heat reference is retrieved; P5 Task 6).
+// Sim (P5): `pub clad_t_step_max: f64` = max(entry, exit clad_t) of the step; the FuelModelEnvelope check reads it, not `core.clad_t`.
+// Sim (P5): while `scrammed` is latched, `Sim::step` re-asserts `scram_hydraulic()` + `motor_run_in()` after the stuck-mask refresh so a freed rod resumes; nothing is replayed after `ResetScram`.
+// Sim (P5): `pub fn full_power_with(coeffs: ReactivityCoeffs) -> Sim` (sensitivity).
+// Sim (P9, not P5): `pub fn settle_until_steady(&mut self, max_s: f64) -> f64` (returns seconds settled).
 ```
 
 Scram initiation paths are distinct and layered: `Sim::scram()` (RPS) calls `rods.scram_hydraulic()` then `rods.motor_run_in()`; `Sim::alternate_rod_insertion()` (P8; signals from the register with status `assumed`, guarded by `ARI_ENABLED: bool = false` until sourced) calls the same two rod methods through a separate latch `Sim.ari_latched`. `Sim.scrammed` remains the RPS latch; `ResetScram` sets Scram/MotorRunIn rods to Idle only when every such rod is at 0.0. SRI rods return to Idle on reaching 0.0.
@@ -548,30 +638,66 @@ Scram initiation paths are distinct and layered: `Sim::scram()` (RPS) calls `rod
 ```rust
 // bop.rs
 #[derive(Clone, Copy, Debug)]
-pub struct SteamLine { pub mass: f64, pub p: f64, pub energy: f64 }  // lumped main steam line + header storage; energy = mass * u_g(p)
+pub struct SteamLine { pub mass: f64, pub energy: f64, pub p: f64, pub q_wall_w: f64 }
+// Lumped main steam line + header storage. mass and energy are INTEGRATED from applied enthalpy flows
+// (dm = w_in - w_out; dE = w_in*h_in - w_out*h_out). p is solved from mass via rho_g(p) = mass / V_STEAM_LINE_M3 on the
+// saturation line within the registered property bounds (bracket validated; out of bounds -> DomainError::PropertyOutOfRange,
+// transactional). The saturated-state constraint cannot hold energy exactly, so the mismatch is an EXPLICIT boundary term
+// q_wall_w = (E_integrated - mass*u_g(p)) / dt (ASSUMED: exchange with line metal), reported in EnergyBalance.q_line_wall_w.
+// Allocation with the node (from P6): the vessel bounds vessel->line inflow (w_line); the node then solves and bounds
+// line->consumer outflow (w_tcv, w_bypass) against its own inventory plus applied inflow. Consumers see the NODE's applied outflow.
+// P3's assertion `w_tcv + w_bypass == vessel steam outflow` is migrated by P6 to the storage-aware identity
+// `w_tcv + w_bypass == flows.w_steam - dm_line/dt`, keeping a separate assertion `sum(w_line) == flows.w_steam`.
 pub struct SteamSystem { /* plus */
     pub tsv_pos: f64,                 // turbine stop valve, 0..1, closes in TSV_STROKE s on trip
     pub w_line: [f64; N_STEAM_LINES], // per-line flow through each MSIV (vessel -> line node)
     pub line: SteamLine,
 }
-pub struct Turbine { /* plus */ pub p_extraction: f64 /* W of shaft work forgone to feedwater heating */, pub p_losses: f64 /* W mechanical + generator losses */ }
-pub struct Condenser { /* plus */ pub cst_mass: f64, pub makeup_flow: f64, pub reject_flow: f64, pub hotwell_energy: f64 }
-pub struct Feedwater { /* plus */ pub pump_speed: [f64; N_FEED_PUMPS] /* 0..1, coastdown */ }
+pub struct Turbine { /* plus */
+    pub p_extraction: f64,  // W of shaft work forgone to feedwater heating (applied, bounded by steam availability)
+    pub p_losses: f64,      // W dissipated this step, computed from entry energy + applied steam work - exit energy (never clipped)
+    // p_elec is SIGNED: negative = grid import while motoring; Snapshot.gross_mwe reports the signed value
+}
+pub struct Condenser { /* plus */
+    pub energy: f64,        // J, condenser + hotwell water energy, evolved by the first law each step
+    pub q_in_w: f64,        // W thermal load arriving (steam + drains); NOT the rejection
+    pub q_cw_w: f64,        // W actually rejected to cooling water = m_cw*cp*(T_out - T_in); zero with no CW pumps
+    pub cst_mass: f64, pub makeup_flow: f64, pub reject_flow: f64,
+    pub makeup_h: f64, pub reject_h: f64,  // J/kg recorded at transfer time
+    pub overflow_kg: f64, pub deficit_kg: f64,
+}
+// Condenser temperature and pressure are DERIVED from `energy` and inventory (sat state of the hotwell water + air partial pressure),
+// not lagged toward a target; with CW lost, q_cw_w = 0 and energy accumulates (pressure rises) until the trip.
+pub struct Feedwater { /* plus */
+    pub pump_speed: [f64; N_FEED_PUMPS],  // 0..1, coastdown; hydraulics use speed^2 affinity per pump
+    pub heater_energy: f64,               // J stored in heater metal/shells: the 180 s lag is this storage, so heat after steam loss is accounted
+    pub q_extraction_applied_w: f64,      // the ONE extraction value used by turbine, feedwater and condenser equations; bounded by steam-side availability
+    pub pump_work_w: f64,                 // the 2 K pump term, counted once (fluid work), excluded from extraction heat
+}
+// Hotwell bound (step 7): requested feed is bounded by hotwell inventory, w_feed = min(request, hotwell_mass/dt), BEFORE vessel allocation;
+// a shortfall raises DomainError::HotwellExhausted { deficit_kg } (new variant, added to domain.rs by P6) and the applied w_feed is used everywhere
+// (vessel, condenser withdrawal, heater energy). Hotwell mass is never set to zero from a negative value.
 
 /// Whole-plant energy balance, W, evaluated every step. Control volume: vessel + steam lines + turbine + condenser/hotwell + feed train + IC tubes.
 /// Sign convention: positive = into the control volume. residual = in - out - storage_rate.
-///   in      = q_core + makeup_flow*h_makeup + house_pump_work
-///   out     = q_condenser + q_ic (to pools) + q_loss + p_elec_gross + p_losses + reject_flow*h_hotwell + w_vent*h_g
-///   storage = d/dt(vessel.energy) + d/dt(line.energy) + d/dt(hotwell_energy) + d/dt(ic tube energy)   (finite differences over the step)
+///   in      = q_core + makeup_flow*makeup_h + house_pump_work (fluid pump work, counted once)
+///   out     = q_condenser (= q_cw_w, to cooling water) + q_ic (pool-side absorption) + q_loss + p_elec_gross (signed) + p_losses
+///             + reject_flow*reject_h (incl. overflow to a full CST) + w_vent*h_g + q_line_wall_w
+///   storage = d/dt(vessel.energy) + d/dt(line.energy) + d/dt(condenser.energy) + d/dt(fw.heater_energy) + d/dt(shaft kinetic energy)
+///             + d/dt(ic tube energy, P7)   (finite differences over the step)
 /// p_extraction is NOT a boundary term (it is internal: steam -> feedwater); it is reported for reconciliation only.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EnergyBalance {
     pub q_core_w: f64, pub q_condenser_w: f64, pub q_ic_w: f64, pub q_loss_w: f64,
     pub p_elec_gross_w: f64, pub p_losses_w: f64, pub p_extraction_w: f64, pub house_pump_work_w: f64,
-    pub makeup_w: f64, pub reject_w: f64, pub vent_w: f64,
+    pub makeup_w: f64, pub reject_w: f64, pub vent_w: f64, pub q_line_wall_w: f64,
     pub storage_w: f64, pub residual_w: f64,
 }
+// Closure gate: |residual_w| < 0.01 * RATED_POWER_W at steady state AND through the first 60 s of fp_turbine_trip, CW loss and vacuum
+// degradation. A failure is fixed by finding the missing transfer or storage term; tolerances are never loosened after a failure.
 ```
+
+Signature changes owned by P6: `SteamSystem::new(msivs_open: bool, tsv_open: bool)`; `SteamSystem::compute_flows(&mut self, dt: f64, p_vessel: f64)` (the `tsv_open: bool` parameter is removed; TSV is state); `SteamSystem::vessel_steam_flow(&self) -> f64` (sum of `w_line`, the vessel's requested outflow); `SteamSystem::init_line_steady(&mut self, p_vessel: f64)` (scenario build); `Turbine::step(&mut self, dt, w_turbine, p_chest, p_cond, extraction_heat_w: f64)`; `Condenser::step(&mut self, dt, q, w_in, w_out, faults: &CondenserFaults)`; `Feedwater::step(.., faults: &FeedFaults)`; `Feedwater::set_mode(&mut self, mode)` (bumpless); fault views `SteamFaults`, `CondenserFaults`, `FeedFaults` are plain `Copy` structs of bools/options built by `Sim::bop_faults()` from `Sim.faults` each step. Constants: `MSIV_DP_FRACTION`, `LINE_FLOW_RATED`, `K_LINE`, `K_MSIV_OPEN` (MSIV as series resistance `K_LINE + K_MSIV_OPEN/pos^2`), `V_STEAM_LINE_M3`, `TSV_STROKE`, `TSV_OPEN_RATE`, `EXTRACTION_WORK_FRACTION = 0.25` (interval 0.15..0.35; 0.35 would exceed the isentropic drop), `AIR_UA_DEGRADATION`, `CST_CAPACITY_KG`, `CST_MASS_INITIAL`, `HOTWELL_MAKEUP_KGS`, `FW_STATIC_DP`, `FW_PUMP_COASTDOWN_S`, `SRI_TRIGGER_POWER_FRAC`, `RWCU_REJECT_MAX_KGS`. RWCU reject is pumped and feasible at any vessel pressure (assumption row); only the flow cap applies.
 
 `Sim` gains `pub balance: EnergyBalance`. `Snapshot.steam` gains `tsv_pos`, `line_flows_kgs: Vec<f64>`, `header_pressure_mpa`; `Snapshot.condenser` gains `cst_level_pct`, `makeup_kgs`, `reject_kgs`; `Snapshot.turbine` gains `extraction_mw`.
 
@@ -591,20 +717,26 @@ pub struct IcTrain {
     pub tube_energy: f64,                         // J, for the energy balance storage term
     pub heat: f64,
     pub w_steam_in: f64,                          // requested; Sim scales to applied after vessel allocation
+    pub last_error: Option<DomainError>,          // dt rule (P3 interim form, kept by P7): commit's error channel, drained at step 17
     pub w_condensate_return: f64,
     pub pool_t: f64,
     pub pool_mass: f64,
 }
 #[derive(Clone, Copy, Debug, Default)]
+pub struct IcRequest { pub w_steam_in: f64, pub w_condensate_return: f64, pub h_condensate_return: f64 }
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct IcStep { pub q_removed: f64, pub w_steam_in: f64, pub w_condensate_return: f64, pub h_condensate_return: f64, pub energy_to_pool: f64, pub pool_boiloff_kg: f64, pub pool_cooling_w: f64 }
 impl IcTrain {
     pub fn in_service(&self) -> bool;  // steam valve open and any return valve open
-    /// `w_steam_available` is the vessel's requested-allocation hint (kg/s the vessel can supply this step); the train never requests more.
-    pub fn step(&mut self, dt: f64, p_vessel: f64, w_steam_available: f64) -> IcStep;
+    /// Pure (no state change). `w_steam_available` is the vessel's allocation hint (kg/s; INFINITY when adequate, 0.0 with no steam space); the train never requests more.
+    pub fn request(&self, dt: f64, p_vessel: f64, w_steam_available: f64) -> IcRequest;
+    /// Advances valves, tubes and pool with the APPLIED flows: the request scaled by the vessel's steam and return ratios
+    /// (1.0 normally, the vessel's bounding scale when exhausted, 0.0 when the vessel applied nothing).
+    pub fn commit(&mut self, dt: f64, p_vessel: f64, applied: IcRequest) -> IcStep;
 }
 ```
 
-When steam supply disappears (`w_steam_available == 0`), `heat` is limited to the energy that can be released from `tube_mass` cooling; it does not continue through a lag. `Snapshot.ic[i]` gains `steam_valve_pos`, `return_valve_pos: Vec<f64>`, `condensate_return_kgs`, `available`. The existing `valve_pos` field is kept as `max(return_valve_pos)` for backward compatibility with the mimic.
+`Sim::step` calls `request` at step 6, builds `VesselInputs` from the summed requests, calls `commit` at step 9 with the ratio-scaled requests. No pool ever absorbs energy the vessel did not give up. IC energy accounting: `BoundaryFlows.q_ic` is vessel-side removal (ledger); `EnergyBalance.q_ic_w = sum(IcStep.q_removed)` is pool-side absorption (boundary term); `Sim.ic_tube_storage_w = sum(d tube_energy / dt)` is storage; identity `flows.q_ic == balance.q_ic_w + ic_tube_storage_w` holds every step and is tested. When steam supply disappears (`w_steam_available == 0`), `heat` is limited to the energy that can be released from `tube_mass` cooling; it does not continue through a lag. `Snapshot.ic[i]` gains `steam_valve_pos`, `return_valve_pos: Vec<f64>`, `condensate_return_kgs`, `available`. The existing `valve_pos` field is kept as `max(return_valve_pos)` for backward compatibility with the mimic.
 
 ### P8: protection, sensors, display
 
@@ -623,8 +755,8 @@ impl LagSensor {
     pub fn out_of_range(&self) -> bool;                    // state < lo || state > hi (so an exact rail value is in range)
     pub fn fail(&mut self);                                // freezes reading at its current value, sets failed
 }
-#[derive(Clone, Copy, Debug)]
-pub struct Sensors { pub level_nr: LagSensor, pub level_wr: LagSensor, pub pressure: LagSensor, pub header_pressure: LagSensor, pub condenser_pressure: LagSensor }
+#[derive(Clone, Debug)]
+pub struct Sensors { pub level_nr: LagSensor, pub level_wr: LagSensor, pub pressure: LagSensor, pub header_pressure: LagSensor, pub condenser_pressure: LagSensor, pub last_error: Option<DomainError> }  // dt rule: error channel of the void-returning Sensors::step, drained at step 17 (so Sensors derives Clone, Debug, not Copy; LagSensor stays Clone, Copy, Debug)
 impl Sensors { pub fn from_truth(sim: &Sim) -> Self; pub fn step(&mut self, dt: f64, sim_truth: &SensorTruth); }
 pub struct SensorTruth { pub level_nr_cm: f64, pub level_wr_cm: f64, pub pressure_pa: f64, pub header_pressure_pa: f64, pub condenser_pressure_pa: f64 }
 ```
@@ -639,7 +771,7 @@ Measurement sources for every protection row are fixed in `docs/model/protection
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Extrema {
-    pub power_frac_max: f64, pub pressure_mpa_max: f64, pub level_nr_cm_min: f64, pub level_nr_cm_max: f64,
+    pub power_frac_max: f64, pub thermal_mw_max: f64, pub pressure_mpa_max: f64, pub level_nr_cm_min: f64, pub level_nr_cm_max: f64,
     pub fuel_t_c_max: f64, pub clad_t_c_max: f64, pub cond_pressure_kpa_max: f64, pub steps: u32,
 }
 impl Extrema { pub fn seed(snapshot_values: &Extrema) -> Self; /* copies the current values as both min and max, steps = 0 */ }
@@ -647,7 +779,7 @@ impl Extrema { pub fn seed(snapshot_values: &Extrema) -> Self; /* copies the cur
 
 `Extrema` is seeded in `finalize_init` and after every `take`, never from zeros. `Snapshot` gains `effective_speed`, `dropped_sim_time_s`, `extrema: Extrema`. `history.ts` keeps every snapshot and folds `extrema` into each sample so charts draw an envelope band.
 
-`tests/contract.rs` writes `ui/src/sim/contract.generated.ts` with: one `Snapshot` fixture per scenario **plus** synthesized fixtures that cover every enum value (`ModeSwitch`, `Regime`, `Severity`, `LevelControlMode`, `ScenarioName`, rod motion strings) and both states of every nullable field; a fixture for every `Command` variant (enumerated through an exhaustive `match`); `const _exhaustive: Record<keyof Snapshot, true>` built from the Rust field names (reverse direction); and a Rust-side unit-suffix test (every leaf field name ends with one of `_s, _mw, _mwe, _we, _mpa, _kpa, _pa, _c, _k, _m, _cm, _kgs, _kg, _pct, _rpm, _hz, _deg, _frac, _rel, _cps, _j_kg, _kj_kg` or is in an explicit dimensionless allowlist). CI runs `git diff --exit-code ui/src/sim/contract.generated.ts` after `cargo test`.
+`tests/contract.rs` writes `ui/src/sim/contract.generated.ts` with: one `Snapshot` fixture per scenario **plus** synthesized fixtures that cover every enum value (`ModeSwitch`, `Regime`, `Severity`, `LevelControlMode`, `ScenarioName`, rod motion strings) and both states of every nullable field; a fixture for every `Command` variant (enumerated through an exhaustive `match`); `const _exhaustive: Record<keyof Snapshot, true>` built from the Rust field names (reverse direction); and a Rust-side unit-suffix test (every leaf field name ends with one of `_s, _mw, _mwe, _we, _mpa, _kpa, _pa, _c, _k, _m, _cm, _kgs, _kg, _pct, _rpm, _hz, _deg, _frac, _rel, _cps, _j_kg, _kj_kg, _cph, _pcm` or is in an explicit dimensionless allowlist). CI runs `git diff --exit-code ui/src/sim/contract.generated.ts` after `cargo test`.
 
 ---
 

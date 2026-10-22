@@ -40,7 +40,7 @@ Inherited verbatim from the master's Global Constraints section. Package-specifi
 | `crates/bwr-core/src/params.rs` | Modify | New constants; remove `FUEL_RESISTANCE` |
 | `crates/bwr-core/src/reactor.rs` | Modify | `RodMotion`, `Rods` restructure, `ReactivityCoeffs`, `clad_t`, two-node update, `after_history`, SDM |
 | `crates/bwr-core/src/sim.rs` | Modify | Call-site migration, stuck-fault mirroring, envelope detection, `full_power_with`, alarms |
-| `crates/bwr-core/src/api.rs` | Modify | `clad_temp_c`, `fuel_envelope_exceeded`; remove `core_damage` |
+| `crates/bwr-core/src/api.rs` | Modify | `clad_temp_c`, `fuel_envelope_exceeded`; remove the legacy damage-verdict field |
 | `crates/bwr-core/tests/core_transients.rs` | Create | Package tests |
 | `crates/bwr-core/examples/sensitivity.rs` | Create | Coefficient sensitivity study |
 | `ui/src/sim/types.ts`, `ui/src/sim/mock.ts` | Modify | Contract mirror |
@@ -112,7 +112,7 @@ insertion path (`Sim::alternate_rod_insertion()`, separate latch, guarded by
 reuses the same two rod methods.
 
 FMCRD dual insertion (hydraulic plus electric run-in on the same drive) is a
-shared concept with ESBWR (DCD Rev. 10 Tier 2 Ch. 4.6, see
+concept adapted from ESBWR (E-10, classification `adapted-model`; DCD Rev. 10 Tier 2 Ch. 4.6, see
 esbwr-applicability.csv). BWRX-specific stroke times are not public; the
 values above are assumptions with the stated sensitivity (A-001).
 

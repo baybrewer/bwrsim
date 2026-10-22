@@ -21,7 +21,8 @@
 - Derives rule (master): every new struct or enum stored inside `Sim` derives at least `Clone, Debug`.
 - Commit after every task; commit messages end with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
 - Match the surrounding Rust style by hand (4-space indent, `rustfmt` defaults); 2-space indent in YAML/JSON/Markdown.
-- Known master discrepancy, flagged to the coordinator: the master's `TRACE_COLUMNS` literal lists 58 names but declares `N_TRACE_COLS = 59`. This plan uses the master's exact 58-name list and `N_TRACE_COLS = 58`; the Rust compiler rejects any other pairing. If the master adds a 59th column, append it to the end of the list here and bump the constant.
+- `N_TRACE_COLS = 58` with the master's exact 58-name `TRACE_COLUMNS` list; the Rust compiler rejects any other pairing, so a new column means appending the name and bumping the constant in the master first.
+- Every numerical constant this package introduces (`N_IC_RETURN_VALVES`, `OPERATOR_DT_S`, every `Tolerance::numerical()`/`physical()` number) gets a `docs/model/parameters.csv` row (locked header `id,value,unit,definition,reference_state,source_design,status,source_ids,interval_lo,interval_hi,assumption_id,location,notes`; fields never contain commas) in the task that introduces it; Task 11 Step 5a runs Package 1's `tests/register.rs` as the P1/P2 reconciliation gate.
 
 ---
 
@@ -41,6 +42,7 @@
 | `crates/bwr-core/examples/validation.rs` | create | baseline writer/checker with convergence report |
 | `docs/validation/method.md` | create | schema, metric and tolerance definitions |
 | `docs/validation/cases.csv` | create | case register (locked header with `role`) |
+| `docs/model/parameters.csv` | modify (append rows; create with the locked header if Package 1 has not landed yet) | register rows for `N_IC_RETURN_VALVES`, `OPERATOR_DT_S` and every tolerance number |
 | `docs/validation/baseline/*.csv` | create (generated) | regression traces |
 | `.github/workflows/validate.yml` | create | validation CI job |
 | `package.json` (root) | modify | `validate` script |
@@ -402,7 +404,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `Ledger`, `BoundaryFlows`.
-- Produces: `Vessel::step(&mut self, dt: f64, inp: &VesselInputs) -> BoundaryFlows`; `Sim::ledger: Ledger`; `Sim::finalize_init(&mut self)` called at the end of `cold_shutdown`, `hot_standby`, `full_power`. At this package it sets `time = 0`, re-bases the ledger, clears `events`, `acked`, `accumulator` (Task 5 adds `log.clear()`; P3 adds `domain_errors` re-stamping; P8 sensors; P10 extrema). Package 3 relies on `mass_clipped` being exactly what the clamp added.
+- Produces: `Vessel::step(&mut self, dt: f64, inp: &VesselInputs) -> BoundaryFlows`; `Sim::ledger: Ledger`; `Sim::last_flows(&self) -> &BoundaryFlows` (the flows applied in the most recent step; Package 7 and tests read them); `Sim::finalize_init(&mut self)` called at the end of `cold_shutdown`, `hot_standby`, `full_power`. At this package it sets `time = 0`, re-bases the ledger, clears `events`, `acked`, `accumulator` (Task 5 adds `log.clear()`; P3 adds `domain_errors` re-stamping; P8 sensors; P10 extrema). Package 3 relies on `mass_clipped` being exactly what the clamp added. `ledger.record` runs at position 16 of the master's `Sim::step` order, after `protection()`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -422,6 +424,7 @@ fn ledger_closes_mass_and_energy_at_full_power() {
     // Feed flow at rated power is ~470 kg/s, so 120 s must record well over 40 t.
     assert!(sim.ledger.mass_in_kg > 40_000.0, "feed mass recorded {}", sim.ledger.mass_in_kg);
     assert!((sim.ledger.integrated["feed_kg"] - sim.ledger.mass_in_kg).abs() < 1e-6, "no IC return yet");
+    assert!(sim.last_flows().w_feed > 100.0, "last_flows holds the applied step: {:?}", sim.last_flows());
 }
 
 #[test]
@@ -535,7 +538,7 @@ to
 In `crates/bwr-core/src/sim.rs`, add after `use crate::ic::IcTrain;`:
 
 ```rust
-use crate::ledger::Ledger;
+use crate::ledger::{BoundaryFlows, Ledger};
 ```
 
 In the `Sim` struct, after `accumulator: f64,` add:
@@ -543,6 +546,8 @@ In the `Sim` struct, after `accumulator: f64,` add:
 ```rust
     /// Mass/energy boundary accounting for the vessel inventory (see ledger.rs).
     pub ledger: Ledger,
+    /// Boundary flows applied in the most recent physics step.
+    last_flows: BoundaryFlows,
 ```
 
 In `fn base(...)`, change
@@ -560,7 +565,7 @@ to
         let mut s = Self {
 ```
 
-and in the struct literal after `accumulator: 0.0,` add `ledger,`.
+and in the struct literal after `accumulator: 0.0,` add `ledger,` and `last_flows: BoundaryFlows::default(),`.
 
 Add the epilogue method to `impl Sim`, directly after `fn base` ends:
 
@@ -574,6 +579,11 @@ Add the epilogue method to `impl Sim`, directly after `fn base` ends:
         self.events.clear();
         self.acked.clear();
         self.accumulator = 0.0;
+    }
+
+    /// Boundary flows applied in the most recent physics step (master P2 contract).
+    pub fn last_flows(&self) -> &BoundaryFlows {
+        &self.last_flows
     }
 ```
 
@@ -643,7 +653,27 @@ to
 
 ```rust
         let flows = self.vessel.step(dt, &inputs);
+```
+
+(`flows` stays a local; `BoundaryFlows` is `Copy`.) Then change the end of `step`
+
+```rust
+        self.time += dt;
+        self.protection();
+    }
+```
+
+to
+
+```rust
+        self.time += dt;
+        self.protection();
+        // Master step order: 14 time, 15 protection, 16 ledger record. The ledger is
+        // written last so later packages' extrema/domain-error bookkeeping (16, 17)
+        // and P8 protection see the same ordering the master locks.
         self.ledger.record(dt, &flows);
+        self.last_flows = flows;
+    }
 ```
 
 (`LoadScenario` already does `*self = Sim::new(name)`, so it inherits `finalize_init`.)
@@ -671,7 +701,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Modify: `crates/bwr-core/tests/plant.rs` (append one test)
 
 **Interfaces:**
-- Produces: `Sim::log: Vec<(f64, String)>` (public). Entry text format is `"<key>: <detail>"`; `Metrics::first_event_time` keys on the text before the first `:`. Keys written here: `scram`, `turbine trip`, `msiv isolation`, `ic auto-initiation`, `feed pump trip`, `fault ignored` (Task 6). Package 3 adds `domain error`; the master's non-finite command rule (`Command ignored: non-finite value`) is implemented by Package 3 alongside `DomainError`. `run_sim_with` drains the log each step. `finalize_init` clears it.
+- Produces: `Sim::log: Vec<(f64, String)>` (public). Entry text format follows the master's locked log-line convention `"<key>: <detail>"` with `<key>` from `validation::LOG_KEYS` (Task 7); `Metrics::first_event_time` keys on the text before the first `:`. Keys written in this package: `scram`, `turbine trip`, `msiv isolation`, `ic auto-initiation`, `feed pump trip`, and `fault` (Task 6). Package 3 adds `domain error` and `command ignored` (the master's non-finite command rule). Task 9 adds the conformance test that every log line from the standard cases starts with a listed key. `run_sim_with` drains the log each step. `finalize_init` clears it.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -854,6 +884,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Files:**
 - Create: `crates/bwr-core/src/faults.rs`
 - Modify: `crates/bwr-core/src/lib.rs`, `crates/bwr-core/src/ic.rs`, `crates/bwr-core/src/sim.rs`
+- Modify: `docs/model/parameters.csv` (append the `N_IC_RETURN_VALVES` row)
 
 **Interfaces:**
 - Consumes: `Sim::log`, `params::{N_STEAM_LINES, N_FEED_PUMPS, N_COND_PUMPS, N_CW_PUMPS, N_IC_TRAINS, N_RODS}`, `ic::N_IC_RETURN_VALVES` (added here; Package 7 keeps it).
@@ -868,6 +899,17 @@ In `crates/bwr-core/src/ic.rs`, after `use crate::steam::sat_p;` add:
 /// count is needed now so `Fault::equipment` can address a valve).
 pub const N_IC_RETURN_VALVES: usize = 2;
 ```
+
+- [ ] **Step 1a: Register `N_IC_RETURN_VALVES` in the parameter register**
+
+Append to `docs/model/parameters.csv` (if Package 1 has not landed yet the file does not exist: create it with the locked header line `id,value,unit,definition,reference_state,source_design,status,source_ids,interval_lo,interval_hi,assumption_id,location,notes` first; Package 1's rows are concatenated on merge and Task 11 Step 5a catches any clash). The id is the constant name because Package 7 moves it to `params.rs` and **updates** this row in place (status `esbwr-estimate`, A-021, S-ESBWR-05) rather than appending a second one:
+
+```csv
+N_IC_RETURN_VALVES,2,-,Parallel condensate return valves per isolation condenser train (addressed by Fault::IcReturnValveStuck),-,ESBWR,assumed,,1,2,A-013,ic.rs,ESBWR-derived parallel return arrangement; modelled and verified in Package 7
+```
+
+Run (when `crates/bwr-core/tests/register.rs` exists): `cargo test --release -p bwr-core --test register`
+Expected: `4 passed`.
 
 - [ ] **Step 2: Write the failing unit tests in the new module**
 
@@ -933,7 +975,7 @@ mod tests {
         sim.set_fault(Fault::IcReturnValveStuck { train: 0, valve: 2 }, true);
         sim.set_fault(Fault::RodStuck { index: 57 }, true);
         assert!(sim.faults.is_empty());
-        let ignored = sim.log.iter().filter(|(_, e)| e.starts_with("fault ignored")).count();
+        let ignored = sim.log.iter().filter(|(_, e)| e.starts_with("fault:")).count();
         assert_eq!(ignored, 4, "{:?}", sim.log);
         assert!(Fault::IcNoncondensableDegradation { train: 1, pct: 100 }.is_valid(), "100 % is the inclusive limit");
     }
@@ -1089,7 +1131,7 @@ Add to `impl Sim`, directly after `pub fn msivs_open(&self) -> bool { ... }`:
     /// Invalid payloads are ignored and logged.
     pub fn set_fault(&mut self, f: Fault, active: bool) {
         if !f.is_valid() {
-            self.log.push((self.time, format!("fault ignored: invalid payload {f:?}")));
+            self.log.push((self.time, format!("fault: ignored invalid payload {f:?}")));
             return;
         }
         let (kind, eq) = (f.kind(), f.equipment());
@@ -1118,7 +1160,7 @@ Expected: unit `20 passed`, integration `11 passed`.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/bwr-core/src/faults.rs crates/bwr-core/src/ic.rs crates/bwr-core/src/lib.rs crates/bwr-core/src/sim.rs
+git add crates/bwr-core/src/faults.rs crates/bwr-core/src/ic.rs crates/bwr-core/src/lib.rs crates/bwr-core/src/sim.rs docs/model/parameters.csv
 git commit -m "feat(core): ordered engine-level fault overrides with payload validation
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -1131,10 +1173,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Files:**
 - Create: `crates/bwr-core/src/validation.rs`
 - Modify: `crates/bwr-core/src/lib.rs`
+- Modify: `docs/model/parameters.csv` (append the `OPERATOR_DT_S` row)
 
 **Interfaces:**
 - Consumes: `Sim` (public fields `time, core, vessel, steam, turbine, fw, ic, cond, scrammed, mode, ledger, log`), `Command`, `Fault`, `ModeSwitch`, `RATED_POWER_W`, `DT`.
-- Produces: `ScriptedCommand`, `ScriptedFault`, `Case { id, scenario, duration_s, sample_dt_s, commands, faults, dt_after_s, operator }`, `Operator` enum, `OPERATOR_DT_S`, `TRACE_SCHEMA_VERSION = 2`, `N_TRACE_COLS = 58`, `TRACE_COLUMNS`, `col_index`, `Trace { case_id, dt_s, rows, events, integrated }`, `Trace::to_csv`, `Trace::from_csv(s)`, `Trace::column`, `run_case`, `run_case_with`, `run_sim_with`. Consumed by Task 8 (metrics), Task 9 (cases), Task 10 (example), P3 (convergence), P7 (`dt_after_s`), P9 (operators, `run_sim_with`).
+- Produces: `ScriptedCommand`, `ScriptedFault`, `Case { id, scenario, duration_s, sample_dt_s, commands, faults, dt_after_s, operator }`, `Operator` enum, `OPERATOR_DT_S`, `TRACE_SCHEMA_VERSION = 2`, `N_TRACE_COLS = 58`, `TRACE_COLUMNS`, `col_index`, `LOG_KEYS` (the master's locked log-line keys), `Trace { case_id, dt_s, rows, events, integrated, extrema }`, `Extremum { max, t_max, min, t_min }`, `Trace::to_csv`, `Trace::from_csv(s)`, `Trace::column`, `run_case`, `run_case_with`, `run_sim_with`. Consumed by Task 8 (metrics), Task 9 (cases), Task 10 (example), P3 (convergence), P7 (`dt_after_s`), P9 (operators, `run_sim_with`).
+- Master runner rules implemented here: timing validation (dt, `sample_dt_s`, `duration_s`, `dt_after_s.1` finite and > 0; `sample_dt_s` and `duration_s` integer multiples of every dt in force within 1e-9 relative; `dt_after_s.0` on a sample boundary; every failure panics with a message starting `case <id>:`); the log is drained after every boundary action and after every step, so terminal-boundary commands and operator actions reach `Trace.events` exactly once; one final row is always emitted at `t == duration_s`; `Trace.extrema` is accumulated at every physics step for every column (time of first occurrence) and serialised as `# extremum,<col>,<max>,<t_max>,<min>,<t_min>` lines; `from_csv` rejects a trace with no rows, missing `# case`/`# dt_s`/`# schema` metadata, a non-finite or non-positive `dt_s`, or missing `# integrated`/`# extremum` lines.
 - Contract addition (reported to the coordinator): `Trace` carries `integrated: BTreeMap<String, f64>` (the ledger's integrated transfers at the end of the run) so `Metrics.integrated` can be "from `Ledger.integrated`" as the master requires; the CSV stores them as `# integrated,<key>,<value>` metadata lines.
 
 - [ ] **Step 1: Write the failing unit tests**
@@ -1165,11 +1209,45 @@ mod tests {
         }
         let mut integrated = BTreeMap::new();
         integrated.insert("feed_kg".to_string(), 1234.5);
-        Trace { case_id: "tiny".into(), dt_s: 0.05, rows, events: vec![(2.0, "scram: test".into())], integrated }
+        // Extrema folded from the rows, plus a sub-sample pressure excursion (+500 Pa at
+        // 3.5 s) that the sampled rows never show.
+        let mut extrema = BTreeMap::new();
+        for r in &rows {
+            update_extrema(&mut extrema, r);
+        }
+        extrema.insert("pressure_pa".to_string(), Extremum { max: 7.04e6 + 500.0, t_max: 3.5, min: 7.0e6, t_min: 0.0 });
+        Trace { case_id: "tiny".into(), dt_s: 0.05, rows, events: vec![(2.0, "scram: test".into())], integrated, extrema }
     }
 
     fn unit_case(id: &'static str, scenario: ScenarioName, duration_s: f64, commands: Vec<ScriptedCommand>) -> Case {
         Case { id, scenario, duration_s, sample_dt_s: 1.0, commands, faults: vec![], dt_after_s: None, operator: Operator::None }
+    }
+
+    /// +0.1 MPa pressure-setpoint pulse (raised at 2 s, restored at 4 s) at full power:
+    /// dome pressure rises and falls back, so its maximum lies strictly inside the
+    /// first 10 s and is not on any 5 s or 10 s sample row.
+    fn pulse_case(id: &'static str, sample_dt_s: f64) -> Case {
+        let mut c = unit_case(
+            id,
+            ScenarioName::FullPower,
+            20.0,
+            vec![
+                ScriptedCommand { at_s: 2.0, cmd: Command::SetPressureSetpoint { mpa: 7.05 } },
+                ScriptedCommand { at_s: 4.0, cmd: Command::SetPressureSetpoint { mpa: 6.95 } },
+            ],
+        );
+        c.sample_dt_s = sample_dt_s;
+        c
+    }
+
+    /// Message of the panic `f` raises (empty if it did not panic with a string payload).
+    fn panic_message(f: impl FnOnce()) -> String {
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("expected a panic");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|m| m.to_string()))
+            .unwrap_or_default()
     }
 
     #[test]
@@ -1189,6 +1267,10 @@ mod tests {
         assert_eq!(lines.next(), Some("# case,tiny"));
         assert!(lines.next().unwrap().starts_with("# dt_s,5.0000000000000003e-2"));
         assert!(s.contains("# integrated,feed_kg,"), "{s}");
+        assert!(
+            s.contains("# extremum,pressure_pa,7.0405000000000000e6,3.5000000000000000e0,7.0000000000000000e6,0.0000000000000000e0"),
+            "{s}"
+        );
         assert!(s.contains("\nt,power_frac,power_frac_max_int,thermal_mw,"), "{s}");
         assert!(s.contains("# event,2.0000000000000000e0,scram: test"), "{s}");
         let back = Trace::from_csv(&s).unwrap();
@@ -1204,10 +1286,135 @@ mod tests {
     }
 
     #[test]
+    fn csv_rejects_header_only_and_missing_metadata() {
+        // A header-only file (schema, case, dt, column header, no rows) is what a
+        // truncated or never-written baseline looks like; it must never load.
+        let header = TRACE_COLUMNS.join(",");
+        let err = Trace::from_csv(&format!("# schema,2\n# case,x\n# dt_s,0.05\n{header}\n")).unwrap_err();
+        assert!(err.contains("no rows"), "{err}");
+        // Dropping one metadata kind at a time from a complete trace is rejected each time.
+        let full = tiny_trace().to_csv();
+        for (prefix, expect) in [("# case,", "case"), ("# dt_s,", "dt_s"), ("# integrated,", "integrated"), ("# extremum,", "extremum")] {
+            let without: String = full.lines().filter(|l| !l.starts_with(prefix)).map(|l| format!("{l}\n")).collect();
+            let err = Trace::from_csv(&without).unwrap_err();
+            assert!(err.contains(expect), "dropping {prefix}: {err}");
+        }
+        let err = Trace::from_csv(&full.replace("# dt_s,5.0000000000000003e-2", "# dt_s,NaN")).unwrap_err();
+        assert!(err.contains("dt_s"), "{err}");
+        // A row cut mid-line (partially written file) is rejected on its cell count.
+        let rows_start = full.find(&header).unwrap() + header.len() + 1;
+        let first_row_end = rows_start + full[rows_start..].find('\n').unwrap();
+        let cut = format!("{}\n", full[..first_row_end].rsplit_once(',').unwrap().0);
+        let err = Trace::from_csv(&cut).unwrap_err();
+        assert!(err.contains("cells"), "{err}");
+    }
+
+    #[test]
     fn column_extracts_by_name() {
         let p = tiny_trace().column("pressure_pa");
         assert_eq!(p.len(), 5);
         assert!((p[4] - 7.04e6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn terminal_boundary_command_is_logged_and_applied() {
+        // Regression: a command scheduled at t == duration_s used to change the final
+        // state without ever reaching Trace.events (the log was drained only after a step).
+        let case = unit_case(
+            "unit_terminal_cmd",
+            ScenarioName::FullPower,
+            1.0,
+            vec![ScriptedCommand { at_s: 1.0, cmd: Command::ManualScram }],
+        );
+        let tr = run_case(&case, DT);
+        assert_eq!(tr.rows.len(), 2);
+        assert_eq!(*tr.column("scrammed").last().unwrap(), 1.0, "final row shows the scram");
+        let scrams: Vec<&(f64, String)> = tr.events.iter().filter(|(_, e)| e.starts_with("scram")).collect();
+        assert_eq!(scrams.len(), 1, "exactly one scram event: {:?}", tr.events);
+        assert!((scrams[0].0 - 1.0).abs() < 1e-9, "scram logged at the terminal boundary, got {}", scrams[0].0);
+    }
+
+    #[test]
+    fn terminal_operator_action_is_logged_once() {
+        let case = unit_case("unit_terminal_op", ScenarioName::FullPower, 2.0, vec![]);
+        let tr = run_case_with(&case, DT, |_, t| if (t - 2.0).abs() < 1e-9 { vec![Command::ManualScram] } else { Vec::new() });
+        let scrams: Vec<&(f64, String)> = tr.events.iter().filter(|(_, e)| e.starts_with("scram")).collect();
+        assert_eq!(scrams.len(), 1, "operator action at the terminal boundary logged exactly once: {:?}", tr.events);
+        assert!((scrams[0].0 - 2.0).abs() < 1e-9, "{}", scrams[0].0);
+        assert_eq!(*tr.column("scrammed").last().unwrap(), 1.0);
+    }
+
+    #[test]
+    fn final_row_is_always_emitted_at_duration() {
+        // Regression: duration 1.5 s with 1 s sampling used to end with a final row
+        // describing t = 1 s. The run must always end with a row at t == duration_s.
+        let mut case = unit_case("unit_final_row", ScenarioName::ColdShutdown, 1.5, vec![]);
+        case.sample_dt_s = 1.0;
+        let (tr, sim) = run_sim_with(crate::Sim::new(case.scenario), &case, DT, |_, _| Vec::new());
+        let t = tr.column("t");
+        assert_eq!(t.len(), 3, "rows at 0, 1 and the terminal 1.5 s: {t:?}");
+        assert!((t[1] - 1.0).abs() < 1e-9, "{t:?}");
+        assert!((t[2] - 1.5).abs() < 1e-9, "final row describes t = duration_s, got {}", t[2]);
+        assert!((sim.time - 1.5).abs() < 1e-9, "{}", sim.time);
+        // When duration is itself a sample boundary there is still exactly one final row.
+        let aligned = unit_case("unit_final_row_aligned", ScenarioName::ColdShutdown, 2.0, vec![]);
+        let tr2 = run_case(&aligned, DT);
+        assert_eq!(tr2.rows.len(), 3, "{:?}", tr2.column("t"));
+    }
+
+    #[test]
+    fn timing_validation_rejects_malformed_cases_naming_the_case() {
+        let base = |id: &'static str| unit_case(id, ScenarioName::ColdShutdown, 2.0, vec![]);
+        let mut sample_off = base("unit_sample_off");
+        sample_off.sample_dt_s = 0.07; // not an integer multiple of the 0.05 s step
+        let mut duration_off = base("unit_duration_off");
+        duration_off.duration_s = 1.02;
+        let mut frozen = base("unit_frozen_clock");
+        frozen.dt_after_s = Some((1.0, 0.0)); // would stop the clock forever
+        let mut negative = base("unit_negative_switch");
+        negative.dt_after_s = Some((1.0, -0.1));
+        let mut nan_sample = base("unit_nan_sample");
+        nan_sample.sample_dt_s = f64::NAN;
+        let mut inf_duration = base("unit_inf_duration");
+        inf_duration.duration_s = f64::INFINITY;
+        let mut off_boundary = base("unit_switch_off_boundary");
+        off_boundary.dt_after_s = Some((1.5, 0.1)); // 1.5 s is not on the 1 s sample grid
+        let mut switch_misaligned = base("unit_switch_misaligned");
+        switch_misaligned.dt_after_s = Some((1.0, 0.3)); // 2.0 s duration is not a multiple of 0.3 s
+        for (case, expect) in [
+            (sample_off, "sample_dt_s"),
+            (duration_off, "duration_s"),
+            (frozen, "dt_after_s.1"),
+            (negative, "dt_after_s.1"),
+            (nan_sample, "sample_dt_s"),
+            (inf_duration, "duration_s"),
+            (off_boundary, "sample boundary"),
+            (switch_misaligned, "dt_after_s.1"),
+        ] {
+            let msg = panic_message(|| {
+                let _ = run_case(&case, DT);
+            });
+            assert!(msg.starts_with(&format!("case {}:", case.id)), "{}: diagnostic must name the case: {msg}", case.id);
+            assert!(msg.contains(expect), "{}: {msg}", case.id);
+        }
+        let msg = panic_message(|| {
+            let _ = run_case(&base("unit_bad_dt"), f64::NAN);
+        });
+        assert!(msg.starts_with("case unit_bad_dt:") && msg.contains("dt must be"), "{msg}");
+    }
+
+    #[test]
+    fn extrema_are_accumulated_per_physics_step_not_per_sample() {
+        let dense = run_case(&pulse_case("unit_extrema_dense", DT), DT);
+        let sparse = run_case(&pulse_case("unit_extrema_sparse", 5.0), DT);
+        assert_eq!(dense.extrema, sparse.extrema, "same physics must give identical extrema at 0.05 s and 5 s sampling");
+        let e = sparse.extrema["pressure_pa"];
+        assert!(e.max > e.min && e.t_max > 2.0 && e.t_max < 20.0, "peak lies inside the run: {e:?}");
+        // The dense rows hold every physics state, so their sampled maximum is the extremum.
+        let (dp, dt_col) = (dense.column("pressure_pa"), dense.column("t"));
+        let k = dp.iter().enumerate().fold(0, |k, (i, v)| if *v > dp[k] { i } else { k });
+        assert_eq!((dp[k], dt_col[k]), (e.max, e.t_max));
+        assert_eq!(sparse.extrema.len(), N_TRACE_COLS - 1, "one extremum per column except t");
     }
 
     #[test]
@@ -1236,25 +1443,33 @@ mod tests {
 
     #[test]
     fn interval_extrema_catch_sub_sample_excursions() {
-        // 0.5 s sampling with a 0.05 s step: the max_int column must bound every sampled value
-        // and must exceed it when the signal moves between samples.
-        let case = unit_case(
-            "unit_interval",
-            ScenarioName::FullPower,
-            20.0,
-            vec![ScriptedCommand { at_s: 2.0, cmd: Command::SetPressureSetpoint { mpa: 7.05 } }],
-        );
-        let mut case = case;
-        case.sample_dt_s = 0.5;
-        let tr = run_case(&case, DT);
-        let p = tr.column("pressure_pa");
-        let pm = tr.column("pressure_pa_max_int");
+        // Fixture with a known interior excursion: the setpoint pulse (2 s to 4 s) makes
+        // dome pressure rise and fall back inside the first 10 s sample interval. The
+        // sparse (10 s) trace must report an interval maximum that (a) strictly exceeds
+        // both interval endpoints and (b) equals the maximum of the dense (0.05 s) trace,
+        // whose rows hold every physics state. An endpoint-only mutation of the
+        // accumulation (updating `Interval` only at sample rows) fails (a); updating at
+        // some but not all steps fails (b).
+        let sparse = run_case(&pulse_case("unit_interval_sparse", 10.0), DT);
+        let dense = run_case(&pulse_case("unit_interval_dense", DT), DT);
+        let p = sparse.column("pressure_pa");
+        let pm = sparse.column("pressure_pa_max_int");
+        assert_eq!(p.len(), 3, "rows at 0, 10 and 20 s");
+        assert_eq!(pm[0], p[0], "first row is seeded from the initial state");
+        assert!(pm[1] > p[0] && pm[1] > p[1], "interval max {} must exceed both endpoints {} and {}", pm[1], p[0], p[1]);
+        let dense_max = dense
+            .column("t")
+            .iter()
+            .zip(dense.column("pressure_pa"))
+            .filter(|(t, _)| **t > 0.0 && **t <= 10.0 + 1e-9)
+            .map(|(_, v)| v)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((pm[1] - dense_max).abs() <= 1e-9, "sparse interval max {} vs dense max {}", pm[1], dense_max);
         for k in 1..p.len() {
             assert!(pm[k] >= p[k] - 1e-9 && pm[k] >= p[k - 1] - 1e-9, "row {k}: max_int {} < samples {} {}", pm[k], p[k - 1], p[k]);
         }
-        assert_eq!(pm[0], p[0], "first row is seeded from the initial state");
-        let lo = tr.column("level_nr_cm_min_int");
-        let hi = tr.column("level_nr_cm_max_int");
+        let lo = sparse.column("level_nr_cm_min_int");
+        let hi = sparse.column("level_nr_cm_max_int");
         assert!(lo.iter().zip(&hi).all(|(a, b)| a <= b));
     }
 
@@ -1384,6 +1599,14 @@ pub const TRACE_COLUMNS: [&str; N_TRACE_COLS] = [
     "mass_residual_kg", "energy_residual_j", "unsupported",
 ];
 
+/// Locked log-line keys (master): every `Sim::log` entry is "<key>: <detail>" with one
+/// of these keys. A package that needs a new key appends it here in the same commit.
+pub const LOG_KEYS: [&str; 14] = [
+    "scram", "turbine trip", "msiv isolation", "ic auto-initiation", "feed pump trip",
+    "domain error", "rod block", "sri", "ari", "breaker open", "command ignored",
+    "overload", "ic model", "fault",
+];
+
 /// Index of a trace column. Panics on an unknown name (a programming error).
 pub fn col_index(name: &str) -> usize {
     TRACE_COLUMNS
@@ -1402,6 +1625,42 @@ pub struct Trace {
     pub events: Vec<(f64, String)>,
     /// `Ledger::integrated` at the end of the run.
     pub integrated: BTreeMap<String, f64>,
+    /// Per-column extrema with their times of FIRST occurrence, accumulated at every
+    /// physics step (not at sample rows); serialised as `# extremum,<col>,<max>,<t_max>,<min>,<t_min>`
+    /// lines. `Metrics.peak`/`min` read these, never the sampled rows.
+    pub extrema: BTreeMap<String, Extremum>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Extremum {
+    pub max: f64,
+    pub t_max: f64,
+    pub min: f64,
+    pub t_min: f64,
+}
+
+/// Fold one physics-step state (a full sample row, `row[0]` = time) into the per-column
+/// extrema. Strict comparisons keep the time of first occurrence. Every column except `t`.
+fn update_extrema(extrema: &mut BTreeMap<String, Extremum>, row: &[f64; N_TRACE_COLS]) {
+    let t = row[0];
+    for (i, name) in TRACE_COLUMNS.iter().enumerate().skip(1) {
+        let v = row[i];
+        match extrema.get_mut(*name) {
+            Some(e) => {
+                if v > e.max {
+                    e.max = v;
+                    e.t_max = t;
+                }
+                if v < e.min {
+                    e.min = v;
+                    e.t_min = t;
+                }
+            }
+            None => {
+                extrema.insert(name.to_string(), Extremum { max: v, t_max: t, min: v, t_min: t });
+            }
+        }
+    }
 }
 
 /// Extrema accumulated at every physics step since the previous sample row.
@@ -1533,31 +1792,83 @@ pub fn run_case_with<F: FnMut(&Sim, f64) -> Vec<Command>>(case: &Case, dt: f64, 
     run_sim_with(Sim::new(case.scenario), case, dt, operator).0
 }
 
+/// `x` is an integer multiple of `h` within 1e-9 relative (0 counts as a multiple).
+fn is_multiple(x: f64, h: f64) -> bool {
+    let n = (x / h).round();
+    (x - n * h).abs() <= 1e-9 * x.abs().max(h)
+}
+
+/// Timing rules (master): `dt`, `sample_dt_s`, `duration_s` and any `dt_after_s.1` are
+/// finite and > 0; `sample_dt_s` and `duration_s` are integer multiples of every dt in
+/// force; `dt_after_s.0` is finite, >= 0 and on a sample boundary. Every failure panics
+/// with a message that starts with `case <id>:` so a scripted case is diagnosed by name.
+fn validate_timing(case: &Case, dt: f64) {
+    let id = case.id;
+    let positive = |name: &str, v: f64| {
+        assert!(v.is_finite() && v > 0.0, "case {id}: {name} must be finite and > 0, got {v}");
+    };
+    positive("dt", dt);
+    positive("sample_dt_s", case.sample_dt_s);
+    positive("duration_s", case.duration_s);
+    let mut steps = vec![("dt", dt)];
+    if let Some((from, dt2)) = case.dt_after_s {
+        positive("dt_after_s.1", dt2);
+        assert!(from.is_finite() && from >= 0.0, "case {id}: dt_after_s.0 must be finite and >= 0, got {from}");
+        assert!(
+            is_multiple(from, case.sample_dt_s),
+            "case {id}: dt_after_s.0 = {from} is not on a sample boundary (sample_dt_s = {})",
+            case.sample_dt_s
+        );
+        steps.push(("dt_after_s.1", dt2));
+    }
+    for (name, h) in steps {
+        assert!(
+            is_multiple(case.sample_dt_s, h),
+            "case {id}: sample_dt_s = {} is not an integer multiple of {name} = {h}",
+            case.sample_dt_s
+        );
+        assert!(
+            is_multiple(case.duration_s, h),
+            "case {id}: duration_s = {} is not an integer multiple of {name} = {h}",
+            case.duration_s
+        );
+    }
+}
+
 /// Same, on a caller-supplied `Sim`, returning it (initial-condition tests).
 ///
 /// Runner clock `t` is monotonic and advances by the current step. At each
 /// boundary, in this order: scripted commands with `at_s <= t + dt/2` (list order,
-/// stable by time), then scripted faults likewise, then the operator if due, then a
-/// sample row if due; the run ends when `t` reaches `duration_s`.
+/// stable by time), then scripted faults likewise, then the operator if due, then
+/// the log is drained into `events`, then a sample row if due. The run ends when `t`
+/// reaches `duration_s`; a final row is always emitted there, and the log is drained
+/// after every step as well, so terminal-boundary actions are recorded exactly once.
+/// `extrema` is folded from the state after every physics step (seeded at t = 0).
 pub fn run_sim_with<F: FnMut(&Sim, f64) -> Vec<Command>>(
     mut sim: Sim,
     case: &Case,
     dt: f64,
     mut operator: F,
 ) -> (Trace, Sim) {
-    assert!(dt.is_finite() && dt > 0.0, "case {}: dt must be positive", case.id);
-    assert!(case.sample_dt_s >= dt, "case {}: sample_dt_s must be >= dt", case.id);
+    validate_timing(case, dt);
     let mut cmds = case.commands.clone();
-    cmds.sort_by(|a, b| a.at_s.partial_cmp(&b.at_s).expect("command time is NaN"));
+    cmds.sort_by(|a, b| a.at_s.partial_cmp(&b.at_s).unwrap_or_else(|| panic!("case {}: command time is NaN", case.id)));
     for c in &cmds {
         reject_runtime_command(case.id, &c.cmd);
     }
     let mut faults = case.faults.clone();
-    faults.sort_by(|a, b| a.at_s.partial_cmp(&b.at_s).expect("fault time is NaN"));
+    faults.sort_by(|a, b| a.at_s.partial_cmp(&b.at_s).unwrap_or_else(|| panic!("case {}: fault time is NaN", case.id)));
     let (mut ci, mut fi) = (0usize, 0usize);
-    let mut trace =
-        Trace { case_id: case.id.to_string(), dt_s: dt, rows: Vec::new(), events: Vec::new(), integrated: BTreeMap::new() };
+    let mut trace = Trace {
+        case_id: case.id.to_string(),
+        dt_s: dt,
+        rows: Vec::new(),
+        events: Vec::new(),
+        integrated: BTreeMap::new(),
+        extrema: BTreeMap::new(),
+    };
     let mut interval = Interval::seed(&sim);
+    update_extrema(&mut trace.extrema, &sample(&sim, &interval));
     let mut cur_dt = dt;
     let mut t = 0.0_f64;
     let mut next_sample = 0.0_f64;
@@ -1584,17 +1895,26 @@ pub fn run_sim_with<F: FnMut(&Sim, f64) -> Vec<Command>>(
             }
             next_operator += OPERATOR_DT_S;
         }
-        if t >= next_sample - 0.5 * cur_dt {
+        // Boundary actions (including those at the terminal boundary) are recorded
+        // now; `drain` empties the log, so no line can be recorded twice.
+        trace.events.extend(sim.log.drain(..));
+        let sample_due = t >= next_sample - 0.5 * cur_dt;
+        let terminal = t >= case.duration_s - 0.5 * cur_dt;
+        if sample_due || terminal {
+            // One row at every sample boundary and always one at t == duration_s.
             trace.rows.push(sample(&sim, &interval));
             interval = Interval::seed(&sim);
-            next_sample += case.sample_dt_s;
+            if sample_due {
+                next_sample += case.sample_dt_s;
+            }
         }
-        if t >= case.duration_s - 0.5 * cur_dt {
+        if terminal {
             break;
         }
         sim.step(cur_dt);
         t += cur_dt;
         interval.update(&sim);
+        update_extrema(&mut trace.extrema, &sample(&sim, &interval));
         trace.events.extend(sim.log.drain(..));
     }
     trace.integrated = sim.ledger.integrated.iter().map(|(k, v)| (k.to_string(), *v)).collect();
@@ -1603,8 +1923,9 @@ pub fn run_sim_with<F: FnMut(&Sim, f64) -> Vec<Command>>(
 
 impl Trace {
     /// CSV: `# schema,2`, `# case,<id>`, `# dt_s,<v>`, `# integrated,<key>,<v>` lines,
-    /// the column header, rows in `{:.16e}` (exact f64 round trip), then one
-    /// `# event,<t>,<text>` line per event. `from_csv(to_csv(t)) == t`.
+    /// `# extremum,<col>,<max>,<t_max>,<min>,<t_min>` lines, the column header, rows in
+    /// `{:.16e}` (exact f64 round trip), then one `# event,<t>,<text>` line per event.
+    /// `from_csv(to_csv(t)) == t`.
     pub fn to_csv(&self) -> String {
         let mut s = String::new();
         s.push_str(&format!("# schema,{TRACE_SCHEMA_VERSION}\n"));
@@ -1612,6 +1933,9 @@ impl Trace {
         s.push_str(&format!("# dt_s,{:.16e}\n", self.dt_s));
         for (k, v) in &self.integrated {
             s.push_str(&format!("# integrated,{k},{v:.16e}\n"));
+        }
+        for (k, e) in &self.extrema {
+            s.push_str(&format!("# extremum,{k},{:.16e},{:.16e},{:.16e},{:.16e}\n", e.max, e.t_max, e.min, e.t_min));
         }
         s.push_str(&TRACE_COLUMNS.join(","));
         s.push('\n');
@@ -1626,12 +1950,16 @@ impl Trace {
         s
     }
 
+    /// Rejects (master): a trace with no rows, a missing `# schema`, `# case` or `# dt_s`
+    /// line, a non-finite or non-positive `dt_s`, or no `# integrated` / `# extremum`
+    /// lines, so a header-only or truncated baseline can never be compared.
     pub fn from_csv(s: &str) -> Result<Trace, String> {
         let mut rows = Vec::new();
         let mut events = Vec::new();
         let mut integrated = BTreeMap::new();
-        let mut case_id = String::new();
-        let mut dt_s = crate::sim::DT;
+        let mut extrema = BTreeMap::new();
+        let mut case_id: Option<String> = None;
+        let mut dt_s: Option<f64> = None;
         let mut schema_seen = false;
         let mut header_seen = false;
         let expected_header = TRACE_COLUMNS.join(",");
@@ -1648,13 +1976,22 @@ impl Trace {
                 }
                 schema_seen = true;
             } else if let Some(rest) = line.strip_prefix("# case,") {
-                case_id = rest.trim().to_string();
+                case_id = Some(rest.trim().to_string());
             } else if let Some(rest) = line.strip_prefix("# dt_s,") {
-                dt_s = rest.trim().parse().map_err(|e| format!("line {ln}: dt_s: {e}"))?;
+                dt_s = Some(rest.trim().parse().map_err(|e| format!("line {ln}: dt_s: {e}"))?);
             } else if let Some(rest) = line.strip_prefix("# integrated,") {
                 let (k, v) = rest.split_once(',').ok_or(format!("line {ln}: malformed integrated line"))?;
                 let v: f64 = v.trim().parse().map_err(|e| format!("line {ln}: integrated {k}: {e}"))?;
                 integrated.insert(k.trim().to_string(), v);
+            } else if let Some(rest) = line.strip_prefix("# extremum,") {
+                let f: Vec<&str> = rest.split(',').collect();
+                if f.len() != 5 {
+                    return Err(format!("line {ln}: extremum line needs col,max,t_max,min,t_min"));
+                }
+                let num = |k: usize| -> Result<f64, String> {
+                    f[k].trim().parse().map_err(|e| format!("line {ln}: extremum {}: {e}", f[0]))
+                };
+                extrema.insert(f[0].trim().to_string(), Extremum { max: num(1)?, t_max: num(2)?, min: num(3)?, t_min: num(4)? });
             } else if let Some(rest) = line.strip_prefix("# event,") {
                 let (t, text) = rest.split_once(',').ok_or(format!("line {ln}: malformed event"))?;
                 let t: f64 = t.parse().map_err(|e| format!("line {ln}: event time: {e}"))?;
@@ -1687,7 +2024,21 @@ impl Trace {
         if !header_seen {
             return Err("no column header found".to_string());
         }
-        Ok(Trace { case_id, dt_s, rows, events, integrated })
+        let case_id = case_id.filter(|c| !c.is_empty()).ok_or("missing '# case' line")?;
+        let dt_s = dt_s.ok_or("missing '# dt_s' line")?;
+        if !(dt_s.is_finite() && dt_s > 0.0) {
+            return Err(format!("dt_s {dt_s} is not finite and positive"));
+        }
+        if rows.is_empty() {
+            return Err("trace has no rows (header-only or truncated file)".to_string());
+        }
+        if integrated.is_empty() {
+            return Err("missing '# integrated' lines".to_string());
+        }
+        if extrema.is_empty() {
+            return Err("missing '# extremum' lines".to_string());
+        }
+        Ok(Trace { case_id, dt_s, rows, events, integrated, extrema })
     }
 
     pub fn column(&self, name: &str) -> Vec<f64> {
@@ -1697,16 +2048,27 @@ impl Trace {
 }
 ```
 
+- [ ] **Step 3a: Register `OPERATOR_DT_S` in the parameter register**
+
+Append to `docs/model/parameters.csv` (if Package 1 has not landed yet the file does not exist: create it with the locked header line `id,value,unit,definition,reference_state,source_design,status,source_ids,interval_lo,interval_hi,assumption_id,location,notes` first; Package 1's rows are concatenated on merge and Task 11 Step 5a catches any clash):
+
+```csv
+validation.OPERATOR_DT_S,1.0,s,Interval at which a closed-loop case operator is consulted by the validation runner,-,numerical,assumed,,0.5,5,A-016,validation.rs,runner setting not a plant parameter; Package 9 operators act on this cadence
+```
+
+Run (when `crates/bwr-core/tests/register.rs` exists): `cargo test --release -p bwr-core --test register`
+Expected: `4 passed` (row shape, status and unique id accepted).
+
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --release -p bwr-core validation`
-Expected: `test result: ok. 9 passed` (including the `should_panic` test).
+Expected: `test result: ok. 15 passed` (including the `should_panic` test).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/bwr-core/src/validation.rs crates/bwr-core/src/lib.rs
-git commit -m "feat(core): deterministic validation runner, schema v2 traces, interval extrema
+git add crates/bwr-core/src/validation.rs crates/bwr-core/src/lib.rs docs/model/parameters.csv
+git commit -m "feat(core): deterministic validation runner, schema v2 traces, per-step extrema
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -1717,22 +2079,26 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `crates/bwr-core/src/validation.rs`
+- Modify: `docs/model/parameters.csv` (append one row per tolerance number)
 
 **Interfaces:**
 - Consumes: `Trace`.
 - Produces: `Metrics` (`final_values`, `peak`, `min`, `first_event_time`, `max_abs_mass_residual_kg`, `max_abs_energy_residual_j`, `initial_drift_per_s`, `drift_per_s`, `integrated`, `nonfinite`), `Tolerance { rel, abs, event_time_s, extremum_time_s, residual_mass_kg, residual_energy_j }` with `numerical()`, `physical()`, `source_comparison(cases_csv_row)`, `compare(&Metrics, &Metrics, &Tolerance) -> Vec<String>`, `Trace::metrics()`. Used by Tasks 9–10, Package 3 (convergence assertions replace the numerical floors with 2x the measured dt-halving differences) and Package 9 (source comparison).
+- Master rules implemented here: `Metrics.peak`/`min` come from `Trace.extrema` (physics-step resolution), never from sampled rows; `Metrics.nonfinite` covers rows, integrated values, extrema, event times and `dt_s`; `compare` reports a violation when either side has no rows, no integrated transfers or no extrema (a header-only baseline can never PASS), when either side is non-finite, or when any tolerance input is non-finite; `Tolerance::source_comparison` resolves `tolerance_class` by header name and requires exactly 8 fields.
 
 - [ ] **Step 1: Add failing tests to the `tests` module in `validation.rs`**
 
 ```rust
     #[test]
-    fn metrics_find_final_peak_min_drift_and_use_interval_extrema() {
+    fn metrics_find_final_peak_min_drift_and_use_trace_extrema() {
         let m = tiny_trace().metrics();
         assert!((m.final_values["pressure_pa"] - 7.04e6).abs() < 1e-6);
-        // Peak comes from the *_max_int column (500 Pa above the sampled value).
-        assert_eq!(m.peak["pressure_pa"], (7.04e6 + 500.0, 4.0));
+        // Peak comes from Trace.extrema (the +500 Pa excursion at 3.5 s that no row shows).
+        assert_eq!(m.peak["pressure_pa"], (7.04e6 + 500.0, 3.5));
         assert_eq!(m.min["pressure_pa"], (7.0e6, 0.0));
+        assert_eq!(m.peak["power_frac"], (1.0, 0.0), "flat signal: first occurrence");
         assert!(!m.final_values.contains_key("pressure_pa_max_int"), "interval columns fold into their parent");
+        assert!(!m.peak.contains_key("pressure_pa_max_int"));
         assert!((m.drift_per_s["pressure_pa"] - 1.0e4).abs() < 1e-6, "{}", m.drift_per_s["pressure_pa"]);
         assert!((m.initial_drift_per_s["pressure_pa"] - 1.0e4).abs() < 1e-6);
         assert_eq!(m.first_event_time["scram"], 2.0);
@@ -1788,11 +2154,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
         assert!(compare(&a, &t.metrics(), &Tolerance::physical()).is_empty());
         // A distinct minimum that moves in time is flagged; a flat signal's argmax is not.
         let mut t3 = tiny_trace();
-        let i = col_index("pressure_pa");
         // Same minimum value (7.0e6) but now first reached at t=2 instead of t=0: 2 s > 1 s extremum tolerance.
-        t3.rows[0][i] = 7.01e6;
-        t3.rows[1][i] = 7.02e6;
-        t3.rows[2][i] = 7.0e6;
+        t3.extrema.get_mut("pressure_pa").unwrap().t_min = 2.0;
+        // power_frac is flat (max == final), so a moved argmax must not be reported.
+        t3.extrema.get_mut("power_frac").unwrap().t_max = 3.0;
         let v3 = compare(&a, &t3.metrics(), &Tolerance::numerical());
         assert!(v3.iter().any(|s| s.starts_with("pressure_pa: min time")), "{v3:?}");
         assert!(!v3.iter().any(|s| s.starts_with("power_frac")), "flat power must not report a time violation: {v3:?}");
@@ -1800,7 +2165,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
     #[test]
     fn source_comparison_tolerance_parses_a_cases_csv_row() {
-        let row = "fp_turbine_trip,fullPower,300,Turbine trip, with commas in purpose,NEDO-X Fig. 3,source(rel=0.1;event=5;extremum=20),validation,baseline";
+        let row = "fp_turbine_trip,fullPower,300,Turbine trip at rated power,NEDO-X Fig. 3,source(rel=0.1;event=5;extremum=20),validation,baseline";
         let t = Tolerance::source_comparison(row);
         assert_eq!(t.rel, 0.1);
         assert_eq!(t.event_time_s, 5.0);
@@ -1808,6 +2173,74 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
         assert_eq!(t.abs["pressure_pa"], Tolerance::physical().abs["pressure_pa"]);
         let n = Tolerance::source_comparison("x,fullPower,1,p,none (regression),numerical,calibration,baseline");
         assert_eq!(n.rel, Tolerance::numerical().rel);
+        assert_eq!(CASES_COLUMNS.iter().position(|c| *c == "tolerance_class"), Some(5), "resolved by header name");
+    }
+
+    #[test]
+    #[should_panic(expected = "case unit_commas_row: cases.csv row has 9 fields")]
+    fn source_comparison_rejects_unescaped_commas() {
+        // A comma inside a free-text field shifts every later column; the row is rejected
+        // rather than read positionally from either end.
+        let row = "unit_commas_row,fullPower,300,Turbine trip, with commas in purpose,NEDO-X Fig. 3,source(rel=0.1;event=5;extremum=20),validation,baseline";
+        let _ = Tolerance::source_comparison(row);
+    }
+
+    #[test]
+    fn compare_rejects_empty_or_truncated_metrics() {
+        // A schema/case/dt/header-only baseline yields empty metrics; every comparison
+        // used to be skipped, giving a false PASS. Both sides must carry rows, integrals
+        // and extrema.
+        let good = tiny_trace().metrics();
+        let empty = Metrics::default();
+        let v = compare(&empty, &good, &Tolerance::numerical());
+        assert!(v.iter().any(|s| s.starts_with("reference has no rows")), "{v:?}");
+        let v = compare(&good, &empty, &Tolerance::numerical());
+        assert!(v.iter().any(|s| s.starts_with("candidate has no rows")), "{v:?}");
+        let mut no_int = tiny_trace();
+        no_int.integrated.clear();
+        let v = compare(&no_int.metrics(), &good, &Tolerance::numerical());
+        assert!(v.iter().any(|s| s.starts_with("reference has no integrated")), "{v:?}");
+        let mut no_ex = tiny_trace();
+        no_ex.extrema.clear();
+        let v = compare(&good, &no_ex.metrics(), &Tolerance::numerical());
+        assert!(v.iter().any(|s| s.starts_with("candidate has no extrema")), "{v:?}");
+        assert!(v.iter().any(|s| s == "pressure_pa: peak missing in candidate"), "{v:?}");
+    }
+
+    #[test]
+    fn nonfinite_event_times_and_tolerances_are_violations() {
+        let good = tiny_trace().metrics();
+        // Regression: a NaN scram time used to compare as a pass.
+        let mut t = tiny_trace();
+        t.events.push((f64::NAN, "turbine trip: test".into()));
+        let m = t.metrics();
+        assert!(m.nonfinite, "a NaN event time must set nonfinite");
+        assert!(compare(&good, &m, &Tolerance::numerical()).iter().any(|s| s == "candidate contains non-finite values"));
+        assert!(compare(&m, &good, &Tolerance::numerical()).iter().any(|s| s == "reference contains non-finite values"));
+        let mut t2 = tiny_trace();
+        t2.dt_s = f64::INFINITY;
+        assert!(t2.metrics().nonfinite, "non-finite metadata is non-finite");
+        let mut t3 = tiny_trace();
+        t3.extrema.get_mut("mass_kg").unwrap().t_max = f64::NAN;
+        assert!(t3.metrics().nonfinite, "non-finite extremum time is non-finite");
+        let mut tol = Tolerance::numerical();
+        tol.rel = f64::NAN;
+        assert!(compare(&good, &good, &tol).iter().any(|s| s.starts_with("tolerance contains non-finite")), "NaN tolerance must not pass");
+        let mut tol2 = Tolerance::physical();
+        tol2.abs.insert("pressure_pa".into(), f64::INFINITY);
+        assert!(!compare(&good, &good, &tol2).is_empty());
+    }
+
+    #[test]
+    fn peak_time_is_identical_at_dense_and_sparse_sampling() {
+        // Peak times come from Trace.extrema, so they cannot depend on sample_dt_s.
+        let dense = run_case(&pulse_case("unit_peak_dense", DT), DT).metrics();
+        let sparse = run_case(&pulse_case("unit_peak_sparse", 5.0), DT).metrics();
+        assert_eq!(dense.peak["pressure_pa"], sparse.peak["pressure_pa"]);
+        assert_eq!(dense.min["level_nr_cm"], sparse.min["level_nr_cm"]);
+        assert_eq!(dense.peak, sparse.peak);
+        assert_eq!(dense.min, sparse.min);
+        assert!(dense.peak["pressure_pa"].1 > 2.0, "peak after the setpoint step at 2 s: {:?}", dense.peak["pressure_pa"]);
     }
 ```
 
@@ -1821,10 +2254,8 @@ Expected: compile errors (`no method named `metrics``, `cannot find type `Tolera
 Insert into `validation.rs` after the `impl Trace { ... }` block and before `#[cfg(test)]`:
 
 ```rust
-/// Interval-extremum columns and the parent column they refine.
-const INTERVAL_MAX: [(&str, &str); 3] =
-    [("power_frac", "power_frac_max_int"), ("pressure_pa", "pressure_pa_max_int"), ("level_nr_cm", "level_nr_cm_max_int")];
-const INTERVAL_MIN: [(&str, &str); 1] = [("level_nr_cm", "level_nr_cm_min_int")];
+/// Locked header of docs/validation/cases.csv (master); readers resolve columns by name.
+pub const CASES_COLUMNS: [&str; 8] = ["id", "scenario", "duration_s", "purpose", "reference", "tolerance_class", "role", "status"];
 
 fn is_interval_column(name: &str) -> bool {
     name.ends_with("_max_int") || name.ends_with("_min_int")
@@ -1839,9 +2270,9 @@ fn is_residual(name: &str) -> bool {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Metrics {
     pub final_values: BTreeMap<String, f64>,
-    /// name -> (value, time of maximum); uses `*_max_int` where available.
+    /// name -> (value, time of first maximum), from `Trace.extrema` (physics-step resolution).
     pub peak: BTreeMap<String, (f64, f64)>,
-    /// name -> (value, time of minimum); uses `*_min_int` where available.
+    /// name -> (value, time of first minimum), from `Trace.extrema`.
     pub min: BTreeMap<String, (f64, f64)>,
     /// Keyed by event text before the first ':'.
     pub first_event_time: BTreeMap<String, f64>,
@@ -1853,36 +2284,20 @@ pub struct Metrics {
     pub drift_per_s: BTreeMap<String, f64>,
     /// `Ledger::integrated` at the end of the run.
     pub integrated: BTreeMap<String, f64>,
-    /// True if any row value or integrated value is NaN or infinite.
+    /// True if any row value, integrated value, extremum value or time, event time or
+    /// `dt_s` is NaN or infinite.
     pub nonfinite: bool,
-}
-
-fn argmax(col: &[f64]) -> usize {
-    let mut k = 0;
-    for (i, &v) in col.iter().enumerate() {
-        if v > col[k] {
-            k = i;
-        }
-    }
-    k
-}
-
-fn argmin(col: &[f64]) -> usize {
-    let mut k = 0;
-    for (i, &v) in col.iter().enumerate() {
-        if v < col[k] {
-            k = i;
-        }
-    }
-    k
 }
 
 impl Trace {
     pub fn metrics(&self) -> Metrics {
         let mut m = Metrics::default();
         m.integrated = self.integrated.clone();
-        m.nonfinite = self.rows.iter().any(|r| r.iter().any(|v| !v.is_finite()))
-            || self.integrated.values().any(|v| !v.is_finite());
+        m.nonfinite = !self.dt_s.is_finite()
+            || self.rows.iter().any(|r| r.iter().any(|v| !v.is_finite()))
+            || self.integrated.values().any(|v| !v.is_finite())
+            || self.extrema.values().any(|e| ![e.max, e.t_max, e.min, e.t_min].iter().all(|v| v.is_finite()))
+            || self.events.iter().any(|(t, _)| !t.is_finite());
         if self.rows.is_empty() {
             return m;
         }
@@ -1895,13 +2310,13 @@ impl Trace {
             }
             let col: Vec<f64> = self.rows.iter().map(|r| r[i]).collect();
             m.final_values.insert(name.to_string(), *col.last().unwrap());
-            // Extremum from the interval column when one exists, else from the samples.
-            let max_src = INTERVAL_MAX.iter().find(|(p, _)| p == name).map(|(_, c)| self.column(c)).unwrap_or_else(|| col.clone());
-            let min_src = INTERVAL_MIN.iter().find(|(p, _)| p == name).map(|(_, c)| self.column(c)).unwrap_or_else(|| col.clone());
-            let kx = argmax(&max_src);
-            let kn = argmin(&min_src);
-            m.peak.insert(name.to_string(), (max_src[kx], t[kx]));
-            m.min.insert(name.to_string(), (min_src[kn], t[kn]));
+            // Extrema come from the per-step accumulation, never from the sampled rows.
+            // A column absent from `extrema` (malformed trace) gets no peak/min; compare
+            // reports it as missing.
+            if let Some(e) = self.extrema.get(*name) {
+                m.peak.insert(name.to_string(), (e.max, e.t_max));
+                m.min.insert(name.to_string(), (e.min, e.t_min));
+            }
             let span = t_end - t[j0];
             let drift = if span > 0.0 { (col.last().unwrap() - col[j0]).abs() / span } else { 0.0 };
             m.drift_per_s.insert(name.to_string(), drift);
@@ -1939,6 +2354,7 @@ pub struct Tolerance {
 }
 
 /// Numerical-class absolute floor for a column (initial values; see method.md).
+/// Every number here is registered in docs/model/parameters.csv as `validation.TOL_ABS_*`.
 fn abs_floor(name: &str) -> f64 {
     match name {
         "power_frac" => 1e-4,
@@ -1971,28 +2387,39 @@ fn abs_floors(scale: f64) -> BTreeMap<String, f64> {
 
 impl Tolerance {
     /// Numerical class (same physics, different step/platform/refactor). Initial values:
-    /// rel 1e-3, event 0.1 s, extremum time 1 s, residuals 1e-3 kg / 1e3 J, floors x1.
+    /// rel 1e-3, event 0.1 s, extremum time 1 s, residuals 1e-3 kg / 1e3 J, floors x1
+    /// (registered as `validation.TOL_NUMERICAL_*` in docs/model/parameters.csv).
     /// Package 3 REPLACES these with 2x the measured dt-halving differences.
     pub fn numerical() -> Self {
         Self { rel: 1e-3, abs: abs_floors(1.0), event_time_s: 0.1, extremum_time_s: 1.0, residual_mass_kg: 1e-3, residual_energy_j: 1e3 }
     }
 
     /// Physical class (an intended model change that should preserve behaviour):
-    /// rel 5e-2, event 2 s, extremum 10 s, floors x10, residuals 1e-2 kg / 1e4 J.
+    /// rel 5e-2, event 2 s, extremum 10 s, floors x10, residuals 1e-2 kg / 1e4 J
+    /// (registered as `validation.TOL_PHYSICAL_*`).
     pub fn physical() -> Self {
         Self { rel: 5e-2, abs: abs_floors(10.0), event_time_s: 2.0, extremum_time_s: 10.0, residual_mass_kg: 1e-2, residual_energy_j: 1e4 }
     }
 
     /// Source-comparison class from a `docs/validation/cases.csv` row (locked header
-    /// `id,scenario,duration_s,purpose,reference,tolerance_class,role,status`). The
-    /// `tolerance_class` field is read third from the right so free-text fields may
-    /// contain commas. Accepted values: `numerical`, `physical`, or
-    /// `source(rel=<r>;event=<s>;extremum=<s>)` which uses the physical floors and
-    /// residual tolerances. Panics on a malformed row (test-support code).
+    /// `CASES_COLUMNS`). The `tolerance_class` column is resolved by header name and the
+    /// row must have exactly `CASES_COLUMNS.len()` fields: fields never contain commas,
+    /// and a row that does is rejected rather than read positionally. Accepted values:
+    /// `numerical`, `physical`, or `source(rel=<r>;event=<s>;extremum=<s>)` which uses
+    /// the physical floors and residual tolerances. Panics on a malformed row
+    /// (test-support code); the message starts with the row's first field (the case id).
     pub fn source_comparison(cases_csv_row: &str) -> Self {
-        let parts: Vec<&str> = cases_csv_row.split(',').collect();
-        assert!(parts.len() >= 8, "cases.csv row has fewer than 8 fields: {cases_csv_row}");
-        let class = parts[parts.len() - 3].trim();
+        let fields: Vec<&str> = cases_csv_row.split(',').map(str::trim).collect();
+        let id = fields.first().copied().unwrap_or("");
+        assert!(
+            fields.len() == CASES_COLUMNS.len(),
+            "case {id}: cases.csv row has {} fields, expected exactly {} ({}): {cases_csv_row}",
+            fields.len(),
+            CASES_COLUMNS.len(),
+            CASES_COLUMNS.join(",")
+        );
+        let col = |name: &str| CASES_COLUMNS.iter().position(|c| *c == name).expect("locked cases.csv column");
+        let class = fields[col("tolerance_class")];
         match class {
             "numerical" => Self::numerical(),
             "physical" => Self::physical(),
@@ -2033,8 +2460,25 @@ pub fn compare(reference: &Metrics, candidate: &Metrics, tol: &Tolerance) -> Vec
     let mut v = Vec::new();
     let abs_of = |name: &str| tol.abs.get(name).copied().unwrap_or(0.0);
 
-    if candidate.nonfinite {
-        v.push("candidate contains non-finite values".to_string());
+    // Completeness and finiteness gates (master): empty metrics come from a header-only
+    // or truncated trace and must never PASS by having nothing to compare.
+    for (label, m) in [("reference", reference), ("candidate", candidate)] {
+        if m.final_values.is_empty() {
+            v.push(format!("{label} has no rows (no final values)"));
+        }
+        if m.integrated.is_empty() {
+            v.push(format!("{label} has no integrated transfers"));
+        }
+        if m.peak.is_empty() || m.min.is_empty() {
+            v.push(format!("{label} has no extrema"));
+        }
+        if m.nonfinite {
+            v.push(format!("{label} contains non-finite values"));
+        }
+    }
+    let scalars = [tol.rel, tol.event_time_s, tol.extremum_time_s, tol.residual_mass_kg, tol.residual_energy_j];
+    if scalars.iter().any(|x| !x.is_finite()) || tol.abs.values().any(|x| !x.is_finite()) {
+        v.push("tolerance contains non-finite values".to_string());
     }
     for (name, r) in &reference.final_values {
         if is_residual(name) {
@@ -2053,7 +2497,10 @@ pub fn compare(reference: &Metrics, candidate: &Metrics, tol: &Tolerance) -> Vec
             if is_residual(name) {
                 continue;
             }
-            let Some((cv, ct)) = cmap.get(name) else { continue };
+            let Some((cv, ct)) = cmap.get(name) else {
+                v.push(format!("{name}: {label} missing in candidate"));
+                continue;
+            };
             if !within(*rv, *cv, tol.rel, abs_of(name)) {
                 v.push(format!("{name}: {label} value {cv:.6e} vs reference {rv:.6e}"));
                 continue;
@@ -2095,15 +2542,55 @@ pub fn compare(reference: &Metrics, candidate: &Metrics, tol: &Tolerance) -> Vec
 }
 ```
 
+- [ ] **Step 3a: Register every tolerance number in the parameter register**
+
+Append to `docs/model/parameters.csv` (create it with the locked header first if Package 1 has not landed; see Task 7 Step 3a). One row per number in `Tolerance::numerical()`, `Tolerance::physical()` and `abs_floor`; the `notes` column names the trace columns each floor applies to:
+
+```csv
+validation.TOL_NUMERICAL_REL,1e-3,-,Numerical-class relative tolerance on final and extremum values and integrated transfers,-,numerical,assumed,,none,none,A-016,validation.rs Tolerance::numerical(),Package 3 replaces with 2x the measured dt-halving difference
+validation.TOL_NUMERICAL_EVENT_S,0.1,s,Numerical-class tolerance on first-event times,-,numerical,assumed,,none,none,A-016,validation.rs Tolerance::numerical(),Package 3 replaces from the convergence study
+validation.TOL_NUMERICAL_EXTREMUM_S,1.0,s,Numerical-class tolerance on extremum times (checked only when the extremum differs from the final value),-,numerical,assumed,,none,none,A-016,validation.rs Tolerance::numerical(),Package 3 replaces from the convergence study
+validation.TOL_NUMERICAL_RESIDUAL_MASS_KG,1e-3,kg,Numerical-class absolute limit on max |mass residual|,-,numerical,assumed,,none,none,A-016,validation.rs Tolerance::numerical(),judged absolutely never against the reference
+validation.TOL_NUMERICAL_RESIDUAL_ENERGY_J,1e3,J,Numerical-class absolute limit on max |energy residual|,-,numerical,assumed,,none,none,A-016,validation.rs Tolerance::numerical(),judged absolutely never against the reference
+validation.TOL_PHYSICAL_REL,5e-2,-,Physical-class relative tolerance on final and extremum values and integrated transfers,-,numerical,assumed,,none,none,A-016,validation.rs Tolerance::physical(),intended model change that should preserve behaviour
+validation.TOL_PHYSICAL_EVENT_S,2.0,s,Physical-class tolerance on first-event times,-,numerical,assumed,,none,none,A-016,validation.rs Tolerance::physical(),
+validation.TOL_PHYSICAL_EXTREMUM_S,10.0,s,Physical-class tolerance on extremum times,-,numerical,assumed,,none,none,A-016,validation.rs Tolerance::physical(),
+validation.TOL_PHYSICAL_RESIDUAL_MASS_KG,1e-2,kg,Physical-class absolute limit on max |mass residual|,-,numerical,assumed,,none,none,A-016,validation.rs Tolerance::physical(),
+validation.TOL_PHYSICAL_RESIDUAL_ENERGY_J,1e4,J,Physical-class absolute limit on max |energy residual|,-,numerical,assumed,,none,none,A-016,validation.rs Tolerance::physical(),
+validation.TOL_PHYSICAL_FLOOR_SCALE,10,-,Physical-class absolute floors are the numerical floors times this factor,-,numerical,assumed,,none,none,A-016,validation.rs Tolerance::physical(),
+validation.TOL_ABS_POWER_FRAC,1e-4,-,Numerical-class absolute floor on neutron power fraction,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),power_frac
+validation.TOL_ABS_THERMAL_MW,0.1,MW,Numerical-class absolute floor on thermal power,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),thermal_mw
+validation.TOL_ABS_DECAY_MW,0.01,MW,Numerical-class absolute floor on decay heat,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),decay_mw
+validation.TOL_ABS_PRESSURE_PA,100,Pa,Numerical-class absolute floor on vessel and header pressures,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),pressure_pa; pressure_sensed_pa; header_pressure_pa
+validation.TOL_ABS_LEVEL_M,1e-3,m,Numerical-class absolute floor on levels in metres,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),level_z_m; collapsed_level_m
+validation.TOL_ABS_LEVEL_CM,0.1,cm,Numerical-class absolute floor on narrow-range levels,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),level_nr_cm; level_model_cm
+validation.TOL_ABS_INVENTORY_KG,1.0,kg,Numerical-class absolute floor on inventories,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),mass_kg; hotwell_kg; cst_kg; ic_pool_kg_i
+validation.TOL_ABS_ENERGY_J,1e6,J,Numerical-class absolute floor on vessel energy,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),energy_j
+validation.TOL_ABS_GAS_MASS_KG,0.01,kg,Numerical-class absolute floor on noncondensable gas mass,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),gas_mass_kg
+validation.TOL_ABS_FLOW_KGS,0.1,kg/s,Numerical-class absolute floor on mass flows,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),core_flow_kgs; steam_flow_kgs; feed_flow_kgs
+validation.TOL_ABS_TEMPERATURE_C,0.01,degC,Numerical-class absolute floor on temperatures,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),t_feed_c; t_coolant_c; fuel_t_c; clad_t_c; moderator_t_c
+validation.TOL_ABS_ROD_POS,0.01,position,Numerical-class absolute floor on rod positions,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),rods_avg_pos; rods_min_pos; rods_max_pos
+validation.TOL_ABS_VALVE_POS,1e-3,-,Numerical-class absolute floor on valve positions,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),msiv_pos_i; tsv_pos; tcv_pos; bypass_pos; ic_return_pos_i
+validation.TOL_ABS_TURBINE_RPM,0.1,rpm,Numerical-class absolute floor on turbine speed,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),turbine_rpm
+validation.TOL_ABS_GROSS_WE,1e4,W,Numerical-class absolute floor on gross electrical output,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),gross_we
+validation.TOL_ABS_COND_PRESSURE_PA,10,Pa,Numerical-class absolute floor on condenser pressure,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),cond_pressure_pa
+validation.TOL_ABS_IC_HEAT_W,1e3,W,Numerical-class absolute floor on IC heat removal,-,numerical,assumed,,none,none,A-016,validation.rs abs_floor(),ic_heat_w_i
+```
+
+Booleans, mode, pump states, `unsupported` and the residual columns have an exact (0) floor and no row: 0 is not a tuned number.
+
+Run (when `crates/bwr-core/tests/register.rs` exists): `cargo test --release -p bwr-core --test register`
+Expected: `4 passed`.
+
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --release -p bwr-core validation`
-Expected: `test result: ok. 14 passed`, no warnings.
+Expected: `test result: ok. 24 passed`, no warnings.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/bwr-core/src/validation.rs
+git add crates/bwr-core/src/validation.rs docs/model/parameters.csv
 git commit -m "feat(core): trace metrics, three tolerance classes and comparison rules
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -2115,7 +2602,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `crates/bwr-core/src/validation.rs` (add `standard_cases`)
-- Modify: `crates/bwr-core/tests/plant.rs` (append three tests)
+- Modify: `crates/bwr-core/tests/plant.rs` (append four tests)
 
 **Interfaces:**
 - Consumes: `Case`, `Operator`, `run_case`, `compare`, `Tolerance`, `Command`, `PRESSURE_SETPOINT_DEFAULT`, `common::assert_finite`.
@@ -2126,7 +2613,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 In `crates/bwr-core/tests/plant.rs`, add to the imports:
 
 ```rust
-use bwr_core::validation::{compare, run_case, standard_cases, Case, Tolerance};
+use bwr_core::validation::{compare, run_case, standard_cases, Case, Tolerance, LOG_KEYS};
 use common::assert_finite;
 ```
 
@@ -2162,6 +2649,17 @@ fn standard_cases_are_complete_and_run() {
         assert_eq!(tr.rows.len(), (c.duration_s / c.sample_dt_s).round() as usize + 1, "{}", c.id);
         assert_finite(c.id, tr.rows.iter().flat_map(|r| r.iter().copied()));
         assert!(!tr.metrics().nonfinite, "{}", c.id);
+    }
+}
+
+#[test]
+fn standard_case_log_lines_use_locked_keys() {
+    for c in standard_cases() {
+        let tr = run_case(&c, DT);
+        for (t, text) in &tr.events {
+            let key = text.split(':').next().unwrap_or(text).trim();
+            assert!(LOG_KEYS.contains(&key), "{}: log line at {t} s has unlisted key '{key}': {text}", c.id);
+        }
     }
 }
 
@@ -2231,7 +2729,7 @@ Run: `cargo test --release -p bwr-core -- --nocapture convergence_report_half_st
 Expected: the printed report (any number of violations is acceptable in this package; copy the list into the Task 11 commit message as the measured starting point).
 
 Run: `cargo test --release -p bwr-core`
-Expected: unit `29 passed`, integration `14 passed`.
+Expected: unit `44 passed`, integration `15 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2431,25 +2929,41 @@ never be regenerated merely to make a failing comparison pass.
 
 ## Determinism and runner rules
 
-`run_case(case, dt)` builds the scenario with its constructor (which ends in
-`Sim::finalize_init`), then loops over physics boundaries with a monotonic
-runner clock `t`. At each boundary, in order: scripted commands whose
-`at_s <= t + dt/2` (stable by time, list order for ties), then scripted faults
-likewise, then the operator if `OPERATOR_DT_S` has elapsed (first at `t = 0`),
-then a sample row if `sample_dt_s` has elapsed. The run ends when `t` reaches
-`duration_s`, after the final row. A case may switch to a second step size at
+`run_case(case, dt)` first validates the timing: `dt`, `sample_dt_s`,
+`duration_s` and any `dt_after_s.1` must be finite and positive, `sample_dt_s`
+and `duration_s` must be integer multiples (within 1e-9 relative) of every step
+in force, and `dt_after_s.0` must lie on a sample boundary; a violation panics
+with a message naming the case. It then builds the scenario with its
+constructor (which ends in `Sim::finalize_init`) and loops over physics
+boundaries with a monotonic runner clock `t`. At each boundary, in order:
+scripted commands whose `at_s <= t + dt/2` (stable by time, list order for
+ties), then scripted faults likewise, then the operator if `OPERATOR_DT_S` has
+elapsed (first at `t = 0`), then the engine log is drained into the trace's
+events, then a sample row if `sample_dt_s` has elapsed. The log is drained
+again after every physics step, so an action at the terminal boundary is
+recorded exactly once. The run ends when `t` reaches `duration_s`, and one
+final row is always emitted at `t == duration_s` whether or not it is a sample
+boundary. A case may switch to a second step size at
 `dt_after_s = (from_t_s, dt_s)` for long-duration runs; the trace records the
 initial `dt_s`. `LoadScenario`, `SetPaused` and `SetSpeed` are rejected with a
 panic naming the case: scripted cases run at a fixed step with no reload.
 
-The same case and `dt` give an identical `Trace` on any platform; asserted by
-`validation_runner_is_deterministic` in `tests/plant.rs`.
+The same case and `dt` give an identical `Trace` when run twice in the same
+build and environment; asserted by `validation_runner_is_deterministic` in
+`tests/plant.rs` (a single-process test, so it says nothing about other
+platforms). Traces produced on a different platform, toolchain or CPU are
+compared under `Tolerance::numerical()`, never for bit equality.
 
 ## Trace schema v2
 
 The CSV starts with `# schema,2`, `# case,<id>`, `# dt_s,<v>`, one
-`# integrated,<key>,<value>` line per ledger integral, then the header, rows in
-`{:.16e}` (exact f64 round trip), then `# event,<t>,<text>` lines.
+`# integrated,<key>,<value>` line per ledger integral, one
+`# extremum,<col>,<max>,<t_max>,<min>,<t_min>` line per column (every column
+except `t`), then the header, rows in `{:.16e}` (exact f64 round trip), then
+`# event,<t>,<text>` lines. A file with no rows, without the schema, case or
+dt lines, with a non-finite `dt_s`, or without integrated or extremum lines is
+rejected by `from_csv`, and `compare` reports a violation for metrics missing
+any of these, so a header-only or truncated baseline can never PASS.
 
 Columns marked "from P*n*" are emitted as 0.0 until that package populates them.
 
@@ -2490,11 +3004,18 @@ Columns marked "from P*n*" are emitted as 0.0 until that package populates them.
 
 Interval extrema (`*_max_int`, `*_min_int`) are accumulated at every physics
 step since the previous sample row, so sampled peaks cannot miss sub-sample
-excursions.
+excursions. The `# extremum` lines hold, for every column, the maximum and
+minimum over the whole run with the time of first occurrence, accumulated at
+every physics step (seeded from the initial state); they are independent of
+`sample_dt_s`, so a peak time is the same at 0.05 s and 5 s sampling.
 
-Events are `(t, "<key>: <detail>")`. Keys at this package: `scram`,
-`turbine trip`, `msiv isolation`, `ic auto-initiation`, `feed pump trip`,
-`fault ignored`. Package 3 adds `domain error`.
+Events are `(t, "<key>: <detail>")` where `<key>` is one of the locked keys in
+`validation::LOG_KEYS`: `scram`, `turbine trip`, `msiv isolation`,
+`ic auto-initiation`, `feed pump trip`, `domain error`, `rod block`, `sri`,
+`ari`, `breaker open`, `command ignored`, `overload`, `ic model`, `fault`.
+This package produces the first five and `fault`; the rest are reserved for
+later packages. A conformance test in `tests/plant.rs` asserts every log line
+from the standard cases starts with a listed key.
 
 Integrated transfers (`# integrated` lines, keys from `ledger::INTEGRATED_KEYS`):
 `feed_kg`, `steam_kg`, `ic_steam_kg`, `ic_return_kg`, `rwcu_kg`, `vent_kg`,
@@ -2516,7 +3037,8 @@ parent's extremum):
 
 - **final value** at the last sample;
 - **peak** and **minimum** with the time of first occurrence, taken from the
-  interval column where one exists;
+  trace's `# extremum` lines (physics-step resolution), never from the sampled
+  rows;
 - **initial drift**: max |dx/dt| between consecutive samples over the first
   60 s (the initial-equilibrium residual of a steady case);
 - **drift**: |x(t_end) - x(t_end - 60 s)| / 60 s, or over the whole trace if
@@ -2524,7 +3046,9 @@ parent's extremum):
 
 For the whole trace: **max |mass residual|** and **max |energy residual|**;
 **first event time** per key (actuation order and delay); **integrated
-transfers** from the ledger; **nonfinite** flag.
+transfers** from the ledger; **nonfinite** flag, set if any row value,
+integrated value, extremum value or time, event time or the `dt_s` metadata is
+NaN or infinite.
 
 ## Tolerance classes
 
@@ -2543,8 +3067,9 @@ the `unsupported` flag exact.
 
 The source-comparison class is written in `cases.csv` as
 `source(rel=<r>;event=<s>;extremum=<s>)`; `Tolerance::source_comparison(row)`
-parses it from the row's `tolerance_class` field (third from the right, so
-free-text fields may contain commas).
+resolves the `tolerance_class` column by its name in the locked header and
+rejects (panics on) any row that does not have exactly 8 fields, so a stray
+comma in a free-text field is an error, never a silent column shift.
 
 These floors are starting values. Package 3's convergence study (0.05, 0.025
 and 0.0125 s steps) replaces the numerical-class values with 2x the measured
@@ -2555,7 +3080,10 @@ set before any tuning, never after.
 
 `compare(reference, candidate, tol)` reports one violation per:
 
-- any non-finite value in the candidate;
+- a reference or candidate with no rows, no integrated transfers or no extrema
+  (an empty or truncated trace never passes by having nothing to compare);
+- any non-finite value in the reference or the candidate (including event
+  times and metadata), or any non-finite tolerance input;
 - final, peak or minimum value outside `max(abs, rel * max(|a|, |b|))`;
 - extremum time differing by more than `extremum_time_s`, checked only when the
   extremum is distinct from the final value (a flat signal has an arbitrary
@@ -2576,7 +3104,8 @@ regression baseline" is not a statement about the plant.
 `id,scenario,duration_s,purpose,reference,tolerance_class,role,status`. `role`
 is `calibration` for cases used to set tolerances or tune, `validation` for
 cases reserved to check, and `plausibility` (Package 9) for cases without a
-quantitative reference. Fields never contain commas.
+quantitative reference. Fields never contain commas; every row has exactly 8
+fields and readers resolve columns by header name.
 
 ## Convergence
 
@@ -2694,7 +3223,7 @@ Run: `npm run validate; echo "exit=$?"`
 Expected: ten `PASS` lines, `exit=0`.
 
 Run: `cargo test --release -p bwr-core`
-Expected: unit `29 passed`, integration `14 passed`.
+Expected: unit `44 passed`, integration `15 passed` (plus Package 1's `register` target when it has landed).
 
 Run: `npm --prefix ui run typecheck && npm --prefix ui run build`
 Expected: both succeed (no UI contract changed in this package).
@@ -2710,6 +3239,18 @@ Measured dt/2 convergence at baseline (fp_steady_600):
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
+
+- [ ] **Step 5a: P1/P2 reconciliation gate**
+
+Precondition: Package 1 has landed on this branch (`docs/model/parameters.csv` carries Package 1's rows and `crates/bwr-core/tests/register.rs` exists). If it has not, stop here, rebase this branch on Package 1 (keeping the single locked header line and all rows from both packages), and return to this step; this package is not complete until the gate passes.
+
+Run: `cargo test --release -p bwr-core --test register`
+Expected: `test result: ok. 4 passed` (`params_rs_scan_finds_the_constants`, `header_contains_every_locked_column`, `every_params_const_is_registered`, `every_row_has_valid_shape_and_status`). The rows this package added (`N_IC_RETURN_VALVES`, `validation.OPERATOR_DT_S`, `validation.TOL_*`) have 13 comma-free fields, an allowed status, an `A-` assumption id and unique ids.
+
+Run: `grep -c "^validation\.TOL_\|^validation\.OPERATOR_DT_S\|^N_IC_RETURN_VALVES," docs/model/parameters.csv`
+Expected: `30` (28 tolerance rows, `OPERATOR_DT_S`, `N_IC_RETURN_VALVES`).
+
+If any register test fails, fix the row (never the test) and amend the commit of the task that added it.
 
 ---
 
@@ -2737,9 +3278,9 @@ Checked by: `validation_runner_is_deterministic` (reproducible traces); the `ref
 
 - [x] Every spec bullet maps to a named task (table above).
 - [x] No placeholder text: grep for `TBD`, `TODO`, `similar to Task`, `add validation` returns nothing; every code step shows the code.
-- [x] Names match the master r2 contract: `BoundaryFlows` (15 fields), `Ledger.integrated`, `Fault::{kind,equipment,is_valid}`, `Sim::{faults: Vec<Fault>, set_fault, has_fault, find_fault, log, ledger, finalize_init}`, `Case::{dt_after_s, operator}`, `Operator`, `OPERATOR_DT_S`, `TRACE_SCHEMA_VERSION`, `col_index`, `Trace::from_csv(s)`, `run_case`, `run_case_with`, `run_sim_with`, `Metrics::{initial_drift_per_s, integrated, nonfinite}`, `Tolerance::{extremum_time_s, residual_mass_kg, residual_energy_j, source_comparison}`. Additions beyond the master, reported to the coordinator: `Trace.integrated`, `ledger::INTEGRATED_KEYS`, `validation::N_TRACE_COLS = 58` (master literal has 58 names), `ic::N_IC_RETURN_VALVES` defined here rather than in P7, private `Sim::prev_turbine_tripped`.
-- [x] Derives rule: `BoundaryFlows` (Clone, Copy, Debug, Default, PartialEq), `Ledger` (Clone, Debug, Default, PartialEq), `Fault` (Clone, Debug, PartialEq, Eq, Hash), `Operator` (Clone, Copy, Debug, PartialEq, Eq), `Case`/`ScriptedCommand`/`ScriptedFault` (Clone, Debug), `Trace`/`Metrics` (Clone, Debug, PartialEq), `Tolerance` (Clone, Debug).
-- [x] New constants: `N_IC_RETURN_VALVES = 2` (status `assumed`, ESBWR-derived parallel return arrangement; Package 7 verifies) and `OPERATOR_DT_S = 1.0` (runner setting, not a plant parameter). Package 1 owns `parameters.csv`; this plan runs in parallel with it, so the executor adds the `N_IC_RETURN_VALVES` row to `docs/model/parameters.csv` if the file exists at Task 6, otherwise records it in the Task 6 commit message for Package 1 to pick up.
+- [x] Names match the master r2 contract: `BoundaryFlows` (15 fields), `Ledger.integrated`, `Fault::{kind,equipment,is_valid}`, `Sim::{faults: Vec<Fault>, set_fault, has_fault, find_fault, log, ledger, finalize_init}`, `Case::{dt_after_s, operator}`, `Operator`, `OPERATOR_DT_S`, `TRACE_SCHEMA_VERSION`, `col_index`, `Trace::from_csv(s)`, `run_case`, `run_case_with`, `run_sim_with`, `Metrics::{initial_drift_per_s, integrated, nonfinite}`, `Tolerance::{extremum_time_s, residual_mass_kg, residual_energy_j, source_comparison}`, `Sim::last_flows`, `LOG_KEYS` (locked log-line keys; all push sites use them and Task 9 enforces conformance). Additions beyond the master, reported to the coordinator: `Trace.integrated`, `ledger::INTEGRATED_KEYS`, `ic::N_IC_RETURN_VALVES` defined here rather than in P7, private `Sim::prev_turbine_tripped`. `N_TRACE_COLS = 58`, `Trace.extrema` and `Extremum` are the master's own declarations.
+- [x] Derives rule: `BoundaryFlows` (Clone, Copy, Debug, Default, PartialEq), `Ledger` (Clone, Debug, Default, PartialEq), `Fault` (Clone, Debug, PartialEq, Eq, Hash), `Operator` (Clone, Copy, Debug, PartialEq, Eq), `Case`/`ScriptedCommand`/`ScriptedFault` (Clone, Debug), `Trace`/`Metrics` (Clone, Debug, PartialEq), `Extremum` (Clone, Copy, Debug, PartialEq), `Tolerance` (Clone, Debug).
+- [x] New constants registered in `docs/model/parameters.csv` in the task that introduces them: `N_IC_RETURN_VALVES = 2` (Task 6 Step 1a; status `assumed`, A-013; Package 7 updates the row), `OPERATOR_DT_S = 1.0` (Task 7 Step 3a; runner setting, A-016) and every `Tolerance::numerical()`/`physical()`/`abs_floor` number (Task 8 Step 3a, 28 rows). Package 1 owns the register and this plan runs in parallel with it, so each step creates the file with the locked header if needed and Task 11 Step 5a (P1/P2 reconciliation gate) runs `tests/register.rs` and must pass before the package is complete.
 - [x] No `Snapshot` change in this package; `types.ts`/`mock.ts` untouched; UI typecheck stays green.
 - [x] No defect fix in this package (measurement only); every behaviour change has a failing test first.
 - [x] Transfer-allocation rule not yet applicable (no consumer changes); `BoundaryFlows` carries the applied values so Package 3 can enforce it.
