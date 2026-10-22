@@ -53,6 +53,21 @@ pub fn irm_full_scale(range: u8) -> f64 {
     0.4 * 10f64.powf((range as f64 - 10.0) / 2.0)
 }
 
+/// Everything `Sim::step` may mutate before the step is accepted. The
+/// condenser runs last and is transactional itself, so it is not saved.
+struct StepCheckpoint {
+    core: Core,
+    vessel: Vessel,
+    steam: SteamSystem,
+    turbine: Turbine,
+    fw: Feedwater,
+    ic: Vec<IcTrain>,
+    q_core: f64,
+    kin_fault_active: bool,
+    events: BTreeMap<String, (String, f64)>,
+    acked: HashSet<String>,
+}
+
 impl Sim {
     pub fn new(scenario: ScenarioName) -> Self {
         match scenario {
@@ -347,29 +362,55 @@ impl Sim {
         None
     }
 
+    fn checkpoint(&self) -> StepCheckpoint {
+        StepCheckpoint {
+            core: self.core.clone(),
+            vessel: self.vessel.clone(),
+            steam: self.steam.clone(),
+            turbine: self.turbine.clone(),
+            fw: self.fw.clone(),
+            ic: self.ic.clone(),
+            q_core: self.q_core,
+            kin_fault_active: self.kin_fault_active,
+            events: self.events.clone(),
+            acked: self.acked.clone(),
+        }
+    }
+
+    /// Roll back a step a subsystem could not represent: restore the
+    /// checkpoint, halt with `model_error` set and report that time did not advance.
+    fn reject_step(&mut self, saved: StepCheckpoint, err: impl std::fmt::Display) -> bool {
+        let msg = format!("Physics model limit: {err}");
+        self.core = saved.core;
+        self.vessel = saved.vessel;
+        self.steam = saved.steam;
+        self.turbine = saved.turbine;
+        self.fw = saved.fw;
+        self.ic = saved.ic;
+        self.q_core = saved.q_core;
+        self.kin_fault_active = saved.kin_fault_active;
+        self.events = saved.events;
+        self.acked = saved.acked;
+        self.model_error = Some(msg.clone());
+        self.paused = true;
+        self.event("model_limit", msg);
+        false
+    }
+
     /// One physics step; returns whether simulated time advanced. A non-positive
     /// or non-finite `dt` is a no-op. The step is transactional: if the vessel
-    /// cannot represent the resulting state, every subsystem and controller
-    /// mutated before the vessel step (core, steam/EHC, turbine governor,
-    /// feedwater, operator events) is restored, time does not advance and the
-    /// simulator pauses with `model_error` set (a later step retries). The IC
-    /// trains and condenser are only committed after acceptance.
+    /// or the condenser cannot represent the resulting state, every subsystem
+    /// and controller the step mutated (core, vessel, IC trains, steam/EHC,
+    /// turbine governor, feedwater, operator events) is restored, time does not
+    /// advance and the simulator pauses with `model_error` set (a later step
+    /// retries). The condenser rejects without changing itself.
     pub fn step(&mut self, dt: f64) -> bool {
         if !(dt.is_finite() && dt > 0.0) {
             return false;
         }
         let p = self.vessel.eos.p;
         let t_cool = self.vessel.eos.t;
-        let saved = (
-            self.core.clone(),
-            self.steam.clone(),
-            self.turbine.clone(),
-            self.fw.clone(),
-            self.q_core,
-            self.kin_fault_active,
-            self.events.clone(),
-            self.acked.clone(),
-        );
+        let saved = self.checkpoint();
 
         // --- reactor core
         self.core.update_reactivity(self.vessel.alpha_core, t_cool);
@@ -393,14 +434,19 @@ impl Sim {
         let gen_online = self.turbine.breaker_closed && !self.turbine.tripped;
         let fast_open = self.turbine.tripped || (self.prev_gen_online && !gen_online);
         self.steam.step_ext(dt, p, tcv_demand, byp_ok, self.turbine.tripped, fast_open);
+        // The flow transmitter reads what last left the vessel (committed below),
+        // not this step's hydraulic request, which the vessel may not supply (R6).
+        let w_steam_measured = self.steam.total_flow();
         let p_line = if self.vessel.eos.subcooled { P_ATM } else { p };
-        self.steam.compute_flows_from(p_line, self.vessel.sat().h_g, !self.turbine.tripped);
+        // The line carries what the vessel debits: displaced liquid when water-solid.
+        self.steam.compute_flows_from(p_line, self.vessel.steam_line_enthalpy(), !self.turbine.tripped);
 
         // --- isolation condensers: requests only; nothing is committed until
         // the vessel has decided how much IC steam it can supply. `t_cool` (not
         // sat_p(p)) is the condensing temperature: sealed gas raises total pressure.
         let steam_avail = !self.vessel.eos.subcooled;
         let ic_req: Vec<_> = self.ic.iter().map(|t| t.request(dt, t_cool, steam_avail)).collect();
+        debug_assert!(ic_req.iter().all(|r| r.w_steam_in == 0.0 || r.h_steam_in == self.vessel.steam_port_enthalpy()));
         let mut ic_ports = IcPorts::default();
         let mut h_return_sum = 0.0;
         for r in &ic_req {
@@ -415,7 +461,7 @@ impl Sim {
         // and the vessel receives the same enthalpy the heater balance debits (N6).
         self.fw.setdown_cm = if self.scrammed { -100.0 } else { 0.0 };
         let hotwell_ok = self.cond.hotwell_mass > 0.05 * HOTWELL_CAPACITY;
-        let msg = self.fw.step_hydraulics(dt, p, self.level_cm(), self.steam.total_flow(), hotwell_ok);
+        let msg = self.fw.step_hydraulics(dt, p, self.level_cm(), w_steam_measured, hotwell_ok);
         if let Some(m) = msg {
             self.event("fw_trip", m);
         }
@@ -432,14 +478,8 @@ impl Sim {
         };
         self.vessel.step_with_ic(dt, &inputs, &ic_ports);
         if let Some(err) = self.vessel.last_error.clone() {
-            let msg = format!("Physics model limit: {err}");
-            (self.core, self.steam, self.turbine, self.fw, self.q_core, self.kin_fault_active, self.events, self.acked) = saved;
-            self.model_error = Some(msg.clone());
-            self.paused = true;
-            self.event("model_limit", msg);
-            return false;
+            return self.reject_step(saved, err);
         }
-        self.model_error = None;
 
         // Commit exactly the IC transfers the vessel accepted: steam draw,
         // condensate return and pool duty all scale by one ratio.
@@ -453,8 +493,12 @@ impl Sim {
         let f = self.vessel.flows;
         let steam_req = self.steam.total_flow();
         let accepted = if steam_req > 0.0 { f.w_steam / steam_req } else { 0.0 };
-        let w_tcv = self.steam.w_tcv * accepted;
-        let w_byp = self.steam.w_bypass * accepted;
+        // Commit the delivered allocation over the hydraulic request: the snapshot,
+        // protection and next step's level control must see flow that left (R6).
+        // The request is rebuilt from valve positions every step, so nothing is lost.
+        self.steam.w_tcv *= accepted;
+        self.steam.w_bypass *= accepted;
+        let (w_tcv, w_byp) = (self.steam.w_tcv, self.steam.w_bypass);
         // Extraction is funded only by steam the turbine received (Sol N2).
         self.fw.step_heater(dt, w_feed, w_tcv, self.cond.hotwell_t());
         self.turbine.step(dt, w_tcv, self.steam.p_chest, self.cond.pressure());
@@ -462,7 +506,10 @@ impl Sim {
         // extraction heat the feedwater heaters actually took this step.
         let w_in = w_tcv + w_byp + f.w_liquid;
         let q_in = (w_tcv + w_byp) * f.h_steam - self.turbine.p_mech + f.w_liquid * f.h_liquid - self.fw.q_extraction_w;
-        self.cond.step_energy(dt, q_in, w_in, w_feed);
+        if let Err(err) = self.cond.step_energy(dt, q_in, w_in, w_feed) {
+            return self.reject_step(saved, err);
+        }
+        self.model_error = None;
         debug_assert!((self.cond.w_out_accepted - w_feed).abs() <= 1e-9 * w_feed.max(1.0));
 
         self.time += dt;
@@ -836,7 +883,9 @@ impl Sim {
     pub fn snapshot(&self) -> Snapshot {
         let c = &self.core;
         let v = &self.vessel;
-        let s = v.sat();
+        // Inlet subcooling is measured against core boiling (total pressure), not
+        // the vapour partial-pressure saturation `sat()` that sets port enthalpies.
+        let s = v.core_sat();
         let pcm = |x: f64| x * 1e5;
         let ip = c.kin.inv_period;
         let period = if ip.abs() < 1e-4 { None } else { Some(1.0 / ip) };
@@ -848,6 +897,9 @@ impl Sim {
         Snapshot {
             time_s: self.time,
             speed: self.speed,
+            // Nominal values; the desktop host overwrites both with measured ones.
+            effective_speed: if self.paused { 0.0 } else { self.speed },
+            clock_backlog_s: self.backlog_s(),
             paused: self.paused,
             mode_switch: self.mode,
             scrammed: self.scrammed,

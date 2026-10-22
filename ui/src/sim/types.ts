@@ -160,7 +160,12 @@ export interface Alarm {
 
 export interface Snapshot {
   timeS: number;
+  /** Requested sim-speed multiplier (simulated seconds per wall-clock second). */
   speed: number;
+  /** Achieved simulated seconds per wall-clock second, smoothed; 0 while paused. Below `speed` when the host cannot keep up. */
+  effectiveSpeed: number;
+  /** Simulated seconds owed to the clock but not yet stepped (engine accumulator plus host wall-clock backlog x speed). */
+  clockBacklogS: number;
   paused: boolean;
   modeSwitch: ModeSwitch;
   scrammed: boolean;

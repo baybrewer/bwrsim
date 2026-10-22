@@ -15,6 +15,9 @@ struct SimState(Arc<Mutex<Sim>>);
 /// inside `Sim::advance`; any excess waits in the backlog for the next iteration.
 const MAX_ADVANCE_PER_ITER_S: f64 = 0.5;
 
+/// Smoothing time constant of the achieved-speed readout, wall-clock s.
+const EFFECTIVE_SPEED_TAU_S: f64 = 1.0;
+
 #[tauri::command]
 fn sim_command(state: State<'_, SimState>, cmd: Command) -> Result<(), String> {
     state.0.lock().map_err(|e| e.to_string())?.apply(cmd);
@@ -40,6 +43,9 @@ pub fn run() {
                 // bounded, but the remainder is carried instead of discarded so delayed
                 // wake-ups do not change the simulated duration.
                 let mut backlog = 0.0f64;
+                // Achieved-speed readout: simulated time gained per wall second between emits.
+                let mut effective_speed = 0.0f64;
+                let mut last_emit_time_s: Option<f64> = None;
                 loop {
                     std::thread::sleep(Duration::from_millis(20));
                     let now = Instant::now();
@@ -58,8 +64,24 @@ pub fn run() {
                             s.advance(dt);
                             backlog -= dt;
                         }
-                        if now - last_emit >= Duration::from_millis(100) {
-                            Some(s.snapshot())
+                        let since_emit = (now - last_emit).as_secs_f64();
+                        if since_emit >= 0.1 {
+                            let mut snap = s.snapshot();
+                            // The first sample after start or resume seeds the filter.
+                            let alpha = if effective_speed == 0.0 { 1.0 } else { (since_emit / EFFECTIVE_SPEED_TAU_S).min(1.0) };
+                            match last_emit_time_s {
+                                _ if s.paused => effective_speed = 0.0,
+                                // A scenario load resets sim time; that window has no valid sample.
+                                Some(t0) if snap.time_s >= t0 => {
+                                    let rate = (snap.time_s - t0) / since_emit;
+                                    effective_speed += (rate - effective_speed) * alpha;
+                                }
+                                _ => {}
+                            }
+                            last_emit_time_s = Some(snap.time_s);
+                            snap.effective_speed = effective_speed;
+                            snap.clock_backlog_s = s.backlog_s() + backlog * s.speed;
+                            Some(snap)
                         } else {
                             None
                         }

@@ -315,7 +315,7 @@ fn check_value(c: &TsContract, path: &str, ty: &str, v: &Value) -> Result<(), St
 const UNIT_SUFFIXES: &[&str] = &["S", "Mw", "Mwe", "Kpa", "Mpa", "C", "Cm", "M", "Kgs", "Kg", "Rpm", "Hz", "Deg", "Pct", "Cps", "KjKg", "Cph"];
 /// Numeric fields that are genuinely dimensionless (fractions, counts, indices, pcm).
 const DIMENSIONLESS: &[&str] = &[
-    "speed", "total", "rods", "doppler", "void", "moderator", "xenon", "kEff", "irmRange", "gridSize", "selected",
+    "speed", "effectiveSpeed", "total", "rods", "doppler", "void", "moderator", "xenon", "kEff", "irmRange", "gridSize", "selected",
     "positions", "targets", "layout", "powerFrac", "xenonRel", "iodineRel", "coreAvgVoid", "chimneyVoid", "exitQuality",
     "msivPos", "tcvPos", "bypassPos", "bypassManualPos", "fcvPos", "fcvManualPos", "valvePos",
 ];
@@ -924,7 +924,8 @@ fn eos_error_halts_the_step_without_advancing_time() {
 /// (the same balance drives examples/validation.rs).
 fn port_balance_step(sim: &mut Sim) -> (f64, f64) {
     let t0 = sim.vessel.eos.t;
-    let sat0 = sim.vessel.sat();
+    // IC steam leaves at the start-of-step port enthalpy the trains requested with.
+    let h_ic_steam = sim.vessel.steam_port_enthalpy();
     let heat_loss = HEAT_LOSS_HOT * ((t0 - 20.0) / 268.0).max(0.0);
     sim.step(DT);
     let ic_in: f64 = sim.ic.iter().map(|t| t.last.w_steam_in).sum();
@@ -936,8 +937,8 @@ fn port_balance_step(sim: &mut Sim) -> (f64, f64) {
     let de = sim.q_core - heat_loss + w_feed * sim.fw.h_feed() + ic_ret_e
         - w_steam * sim.steam.h_steam
         - f.w_vent * f.h_vent
-        - ic_in * sat0.h_g
-        - w_rwcu * sat0.h_f;
+        - ic_in * h_ic_steam
+        - w_rwcu * f.h_liquid;
     (dm * DT, de * DT)
 }
 
@@ -1122,4 +1123,119 @@ fn rejected_step_does_not_consume_clock_backlog() {
     assert_eq!(sim.time, 0.0);
     assert!(sim.paused && sim.model_error.is_some());
     assert!((sim.backlog_s() - 0.1).abs() < 1e-12, "backlog {} s, expected 0.1 s retained", sim.backlog_s());
+}
+
+// ------------------------------------------------------------------ round 3 integration
+
+/// Sol R6: in a vapour-limited step the published turbine and bypass flows are
+/// the steam the vessel delivered, not the hydraulic request.
+#[test]
+fn published_steam_flow_is_the_accepted_vessel_delivery() {
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 1.0);
+    let t = sim.vessel.eos.t;
+    let m = V_VESSEL_FLUID * bwr_core::steam::sat_t(t).rho_f * (1.0 - 1e-8);
+    sim.vessel.mass = m;
+    sim.vessel.energy = bwr_core::vessel::energy_for(m, t).unwrap();
+    sim.vessel.eos = bwr_core::vessel::solve_eos(m, sim.vessel.energy).expect("eos");
+    assert!(sim.step(DT), "{:?}", sim.model_error);
+    let delivered = sim.vessel.flows.w_steam;
+    assert!(delivered < 1.0, "case must be vapour-limited, delivered {delivered} kg/s");
+    let s = sim.snapshot().steam;
+    let published = s.steam_to_turbine_kgs + s.steam_to_bypass_kgs;
+    assert!((published - delivered).abs() <= 1e-9 * delivered.max(1.0), "published {published} vs delivered {delivered} kg/s");
+}
+
+/// Sol 21: the engine reports the nominal rate (0 while paused) and its own clock backlog.
+#[test]
+fn snapshot_reports_nominal_speed_and_engine_backlog() {
+    let mut sim = Sim::new(ScenarioName::HotStandby);
+    sim.apply(Command::SetSpeed { speed: 2.0 });
+    sim.advance(0.06);
+    let s = sim.snapshot();
+    assert!(sim.backlog_s() > 0.0);
+    assert_eq!(s.clock_backlog_s, sim.backlog_s());
+    assert_eq!(s.effective_speed, s.speed);
+    sim.apply(Command::SetPaused { paused: true });
+    assert_eq!(sim.snapshot().effective_speed, 0.0);
+}
+
+/// R3 condenser: a shell that cannot represent the step's end state rejects
+/// it, and the whole plant step rolls back (vessel and IC trains included,
+/// since they commit before the condenser runs).
+#[test]
+fn condenser_rejection_rolls_back_the_plant_step() {
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 1.0);
+    sim.cond.cw_pumps = [false; N_CW_PUMPS];
+    sim.cond.hotwell_mass = 0.0;
+    sim.cond.set_temperature(bwr_core::steam::sat_p(CONDENSER_RELIEF_P).t);
+    // Plant steam always brings its own liquid, so (like the vessel EOS fixtures)
+    // the unrepresentable state is injected: relief must vent ~440 kg from a
+    // shell holding only this step's returns.
+    sim.cond.energy_j += 1.0e9;
+    for t in sim.ic.iter_mut() {
+        t.cmd_open = true;
+    }
+    let before = transactional_state(&sim);
+    assert!(!sim.step(DT), "condenser dryout must reject the step");
+    assert!(sim.model_error.as_deref().is_some_and(|e| e.contains("condenser")) && sim.paused, "{:?}", sim.model_error);
+    assert!(has_alarm(&sim, "model_limit"));
+    assert_eq!(transactional_state(&sim), before, "rejected step mutated plant state");
+}
+
+/// R3 condenser: one public 60 s step from a 35 degC shell with both CW pumps
+/// is accepted and cannot cool the shell below the CW inlet.
+#[test]
+fn long_cold_condenser_step_is_accepted_above_cw_inlet() {
+    let mut sim = Sim::new(ScenarioName::ColdShutdown);
+    for index in 0..N_CW_PUMPS {
+        sim.apply(Command::SetCwPump { index, on: true });
+    }
+    sim.cond.set_temperature(35.0);
+    assert!(sim.step(60.0), "{:?}", sim.model_error);
+    assert!(sim.cond.t_sat > CW_INLET_C, "shell {} degC", sim.cond.t_sat);
+}
+
+/// Sol R1: sealed, gas-bearing inventory heated to 150 degC, MSIVs shut, no
+/// feed, all ICs open. Vessel + IC primary energy changes by exactly core heat
+/// minus pool duty and vessel ambient loss, summed independently each step
+/// (the vessel debit and IC receipt use one steam enthalpy).
+#[test]
+fn gas_bearing_heatup_with_ic_closes_primary_energy_at_plant_level() {
+    let mut sim = Sim::new(ScenarioName::ColdShutdown);
+    sim.vessel.head_vent_open = false;
+    let gas = sim.vessel.gas_mass;
+    assert!(gas > 1.0, "cold vessel must hold head-space air, {gas} kg");
+    let m = sim.vessel.mass;
+    sim.vessel.energy = bwr_core::vessel::energy_for(m, 150.0).unwrap();
+    sim.vessel.eos =
+        bwr_core::vessel::solve_eos_with(m, sim.vessel.energy, bwr_core::vessel::HeadSpace::Sealed { gas_mass: gas }).unwrap();
+    assert!(sim.vessel.eos.p_gas > 0.0 && !sim.vessel.eos.subcooled, "{:?}", sim.vessel.eos);
+    sim.steam.msiv_cmd = [false; N_STEAM_LINES];
+    sim.steam.msiv_pos = [0.0; N_STEAM_LINES];
+    sim.fw = bwr_core::bop::Feedwater::new(0, 40.0, LevelControlMode::Manual, 0.0);
+    for t in sim.ic.iter_mut() {
+        t.cmd_open = true;
+        t.valve_pos = 1.0;
+        t.tube_mass = 500.0;
+        t.heat = IC_TRAIN_RATED_W;
+    }
+    let primary = |s: &Sim| {
+        let ic_m: f64 = s.ic.iter().map(|t| t.tube_mass).sum();
+        let ic_e: f64 = s.ic.iter().map(|t| t.tube_mass * t.tube_h).sum();
+        (s.vessel.mass + ic_m, s.vessel.energy + ic_e)
+    };
+    let (m0, e0) = primary(&sim);
+    let mut external = 0.0;
+    for _ in 0..20 {
+        let loss = HEAT_LOSS_HOT * ((sim.vessel.eos.t - 20.0) / 268.0).max(0.0);
+        assert!(sim.step(DT), "{:?}", sim.model_error);
+        let q_pool: f64 = sim.ic.iter().map(|t| t.last.q_pool).sum();
+        external += (sim.q_core - q_pool - loss) * DT;
+    }
+    assert!(sim.vessel.flows.w_ic_steam > 1.0, "IC idle: {:?}", sim.vessel.flows);
+    let (m1, e1) = primary(&sim);
+    assert!((m1 - m0).abs() < 1e-6, "mass created {} kg", m1 - m0);
+    assert!((e1 - e0 - external).abs() < 10.0, "energy residual {} J", e1 - e0 - external);
 }

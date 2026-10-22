@@ -23,6 +23,8 @@ export function TopBar(props: {
   const [scenario, setScenario] = useState<ScenarioName>("hotStandby");
   const [confirmLoad, setConfirmLoad] = useState(false);
   const allIn = s.rods.positions.every((p) => p < 0.5);
+  // The host is falling behind the requested speed (smoothed rate below 90 %, or time piling up).
+  const lagging = !s.paused && (s.effectiveSpeed < 0.9 * s.speed || s.clockBacklogS > 1);
 
   return (
     <header className="topbar">
@@ -47,6 +49,10 @@ export function TopBar(props: {
               {x}×
             </Btn>
           ))}
+        </div>
+        <div className={`sim-rate${lagging ? " tone-warn" : ""}`} title="Achieved simulated seconds per real second, and simulated time owed but not yet computed">
+          ACHIEVED {s.paused ? "—" : `${s.effectiveSpeed.toFixed(1)}×`} · BACKLOG {s.clockBacklogS.toFixed(1)} s
+          {lagging && " · LAGGING"}
         </div>
       </div>
 

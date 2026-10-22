@@ -4,7 +4,7 @@
 //! Each case writes a CSV trace to docs/validation/traces/<case>.csv and prints
 //! its extrema. The run exits non-zero if any case produces a non-finite value,
 //! a physics model error, a kinetics fault, or a residual above the tolerances
-//! below. Three gates:
+//! below. Five gates:
 //!
 //! 1. Vessel ports: the vessel's integrated state against the port quantities
 //!    the connected systems report (BOP steam and feed, RWCU, head vent, IC
@@ -15,11 +15,20 @@
 //!    heater node) against what crossed the plant boundary: core heat, vessel
 //!    ambient loss, IC pool duty and boil-off, CW rejection, turbine shaft
 //!    power, feed pump work, heater ambient loss, CST makeup/reject/overflow,
-//!    shell relief, head vent and the condenser's domain residual. RWCU reject
-//!    returns to the condenser, so it is internal. Shaft power is the boundary
-//!    with the turbine-generator; the electrical output is reported beside it.
+//!    shell relief and head vent. RWCU reject returns to the condenser, so it is
+//!    internal. Shaft power is the boundary with the turbine-generator; the
+//!    electrical output is reported beside it. Numerical corrections are not
+//!    boundary terms: the condenser's stored energy must equal the equilibrium
+//!    energy of its reported temperature and inventory after every step, to
+//!    roundoff (a state it cannot represent is a model error instead).
 //! 3. Timestep refinement: one case is rerun at dt = 0.025 s and its peak
 //!    pressure and minimum level must agree with the dt = 0.05 s run.
+//! 4. Outcomes: the startup case must reach criticality and synchronise the
+//!    generator without a scram; the isolation-condenser endurance cases (1, 2
+//!    and 3 trains in service after MSIV closure) must hold pressure below the
+//!    vessel design pressure and remove decay heat (see `ic_endurance_accept`).
+//! 5. Condenser limiting step: cold shutdown, both CW pumps, condenser at 35 degC,
+//!    one public 60 s step against 1 s and DT steps of the same minute.
 //!
 //! These are conservation, convergence and robustness checks of the implemented
 //! model, not an independent physical validation against plant data; the
@@ -28,8 +37,9 @@
 use std::path::PathBuf;
 
 use bwr_core::api::{Command, ModeSwitch, ScenarioName};
+use bwr_core::bop::LevelControlMode;
 use bwr_core::params::*;
-use bwr_core::sim::DT;
+use bwr_core::sim::{irm_full_scale, DT};
 use bwr_core::Sim;
 
 /// Energy residual bound as a fraction of the integrated core heat.
@@ -47,7 +57,14 @@ const REFINE_CASE: &str = "turbine_trip";
 const REFINE_DT: f64 = 0.025;
 const REFINE_PEAK_P_TOL_MPA: f64 = 0.02;
 const REFINE_MIN_LEVEL_TOL_CM: f64 = 3.0;
+/// Per-step bound on the condenser's |E - E_eq(T, M)|, J: the temperature
+/// solve's roundoff on a ~2e10 J node, far below any physical exchange.
+const COND_EQ_TOL_J: f64 = 1.0e-2;
 const SAMPLE_EVERY_S: f64 = 1.0;
+/// Sample columns used by the outcome checks.
+const COL_Q_CORE_MW: usize = 2;
+const COL_P_MPA: usize = 3;
+const COL_IC_MW: usize = 9;
 const CSV_HEADER: &str =
     "t_s,power_frac,q_core_mw,pressure_mpa,level_nr_cm,coolant_t_c,fuel_t_c,steam_kgs,feed_kgs,ic_mw,net_mwe,cond_kpa,mass_res_kg,energy_res_j,plant_mass_res_kg,plant_energy_res_j";
 
@@ -56,27 +73,176 @@ struct Case {
     scenario: ScenarioName,
     duration_s: f64,
     events: Vec<(f64, Command)>,
+    /// Closed-loop operator actions, called before every step.
+    driver: Option<fn(&mut Sim, &mut DriveState)>,
+    /// IC trains in service: the others are held closed (out of service)
+    /// against auto-initiation before every step.
+    ic_in_service: usize,
+    /// Case-specific outcome acceptance; returns failures.
+    accept: Option<fn(&Case, &Outcome) -> Vec<String>>,
 }
+
+impl Case {
+    fn scripted(name: &'static str, scenario: ScenarioName, duration_s: f64, events: Vec<(f64, Command)>) -> Self {
+        Self { name, scenario, duration_s, events, driver: None, ic_in_service: N_IC_TRAINS, accept: None }
+    }
+}
+
+/// IC endurance: MSIV closure from full power, run for this long.
+const IC_ENDURANCE_S: f64 = 1800.0;
+/// Decay heat removal is judged over the last this many seconds.
+const IC_REMOVAL_WINDOW_S: f64 = 600.0;
 
 fn cases() -> Vec<Case> {
     let msiv = |line| Command::SetMsiv { line, open: false };
+    let isolate = || vec![(5.0, msiv(0)), (5.0, msiv(1))];
+    let ic_case = |name, n| Case {
+        ic_in_service: n,
+        accept: Some(ic_endurance_accept as fn(&Case, &Outcome) -> Vec<String>),
+        ..Case::scripted(name, ScenarioName::FullPower, IC_ENDURANCE_S, isolate())
+    };
     vec![
-        Case { name: "full_power_steady", scenario: ScenarioName::FullPower, duration_s: 300.0, events: vec![] },
-        Case { name: "turbine_trip", scenario: ScenarioName::FullPower, duration_s: 180.0, events: vec![(5.0, Command::TripTurbine)] },
+        Case::scripted("full_power_steady", ScenarioName::FullPower, 300.0, vec![]),
+        Case::scripted("turbine_trip", ScenarioName::FullPower, 180.0, vec![(5.0, Command::TripTurbine)]),
+        Case::scripted(
+            "manual_scram",
+            ScenarioName::FullPower,
+            180.0,
+            vec![(5.0, Command::ManualScram), (5.0, Command::SetModeSwitch { mode: ModeSwitch::Shutdown })],
+        ),
+        Case::scripted("msiv_closure_ic_cooling", ScenarioName::FullPower, 600.0, isolate()),
+        ic_case("ic_endurance_1_train", 1),
+        ic_case("ic_endurance_2_trains", 2),
+        ic_case("ic_endurance_3_trains", 3),
         Case {
-            name: "manual_scram",
-            scenario: ScenarioName::FullPower,
-            duration_s: 180.0,
-            events: vec![(5.0, Command::ManualScram), (5.0, Command::SetModeSwitch { mode: ModeSwitch::Shutdown })],
-        },
-        Case { name: "msiv_closure_ic_cooling", scenario: ScenarioName::FullPower, duration_s: 600.0, events: vec![(5.0, msiv(0)), (5.0, msiv(1))] },
-        Case {
-            name: "hot_standby_startup",
-            scenario: ScenarioName::HotStandby,
-            duration_s: 300.0,
-            events: vec![(5.0, Command::RodSetTarget { indices: (0..N_RODS).collect(), target: 6.0 })],
+            driver: Some(startup_driver),
+            accept: Some(startup_accept),
+            ..Case::scripted("startup_to_sync", ScenarioName::HotStandby, STARTUP_S, vec![])
         },
     ]
+}
+
+/// Startup run length, s: examples/startup.rs synchronises at about 5300 s.
+const STARTUP_S: f64 = 6600.0;
+/// Power the startup driver raises to after synchronisation, fraction of rated.
+const STARTUP_TARGET: f64 = 0.4;
+
+/// State of a closed-loop driver and the milestones it observed.
+#[derive(Default)]
+struct DriveState {
+    next_s: f64,
+    order: Vec<usize>,
+    ptr: usize,
+    stage: u8,
+    critical_s: Option<f64>,
+    sync_s: Option<f64>,
+}
+
+/// The examples/startup.rs operator, once per simulated second: hot standby
+/// -> banked rod withdrawal on a period limit -> heat-up -> turbine roll ->
+/// synchronisation -> power ascension to `STARTUP_TARGET`. Kept in step with
+/// that example (examples cannot share a module without a new file).
+fn startup_driver(sim: &mut Sim, d: &mut DriveState) {
+    if sim.time > 0.0 && d.critical_s.is_none() && sim.core.rho_total >= 0.0 {
+        d.critical_s = Some(sim.time);
+    }
+    if sim.time + 1e-9 < d.next_s {
+        return;
+    }
+    d.next_s += 1.0;
+    if d.order.is_empty() {
+        d.order = (0..N_RODS).collect();
+        let w = &sim.core.rods.weights;
+        d.order.sort_by(|&a, &b| w[b].partial_cmp(&w[a]).unwrap());
+        sim.apply(Command::SetLevelSetpoint { cm: -40.0 });
+    }
+    let n = sim.core.kin.n;
+    let period = 1.0 / sim.core.kin.inv_period;
+    let lvl = sim.vessel.level_nr_cm();
+    sim.apply(Command::SetRwcuReject { kgs: if lvl > 20.0 { 15.0 } else { 0.0 } });
+    let r = sim.irm_range;
+    if n / irm_full_scale(r) > 0.8 && r < 10 {
+        sim.apply(Command::SetIrmRange { range: r + 1 });
+    }
+    let goal = if d.stage < 2 { 0.06 } else { STARTUP_TARGET };
+    let slow = period > 0.0 && period < 150.0;
+    if n < goal && !slow && !sim.core.rods.moving() && !sim.scrammed {
+        for _ in 0..N_RODS {
+            let i = d.order[d.ptr % N_RODS];
+            let bank = ((d.ptr / N_RODS) as f64 + 1.0) * 8.0;
+            d.ptr += 1;
+            let p = sim.core.rods.pos[i];
+            if p < bank.min(ROD_FULL_OUT) {
+                sim.apply(Command::RodSetTarget { indices: vec![i], target: p + 2.0 });
+                break;
+            }
+        }
+    }
+    if d.stage == 0 && n > 0.035 && sim.vessel.eos.p > 6.9e6 {
+        sim.apply(Command::ResetTurbine);
+        sim.apply(Command::SetSpeedSetpoint { rpm: RATED_RPM });
+        d.stage = 1;
+    }
+    if d.stage == 1 && (sim.turbine.speed_rpm - RATED_RPM).abs() < 5.0 && sim.turbine.phase_deg.abs() < 5.0 {
+        sim.apply(Command::CloseBreaker);
+        if sim.turbine.breaker_closed {
+            sim.apply(Command::SetModeSwitch { mode: ModeSwitch::Run });
+            d.stage = 2;
+            d.sync_s = Some(sim.time);
+        }
+    }
+    if d.stage == 2 && n > 0.2 && sim.fw.running_pumps() < 2 {
+        sim.apply(Command::SetCondensatePump { index: 1, on: true });
+        sim.apply(Command::SetFeedPump { index: 1, on: true });
+        sim.apply(Command::SetLevelControl { mode: LevelControlMode::ThreeElement });
+    }
+}
+
+/// Startup outcome: critical, synchronised and still online, no scram, power ascended.
+fn startup_accept(_: &Case, o: &Outcome) -> Vec<String> {
+    let mut f = Vec::new();
+    let (Some(crit), Some(sync)) = (o.drive.critical_s, o.drive.sync_s) else {
+        f.push(format!("startup milestones missing: critical {:?}, synchronised {:?}", o.drive.critical_s, o.drive.sync_s));
+        return f;
+    };
+    if crit >= sync {
+        f.push(format!("synchronised at {sync:.0} s before criticality at {crit:.0} s"));
+    }
+    if let Some(t) = o.scram_s {
+        f.push(format!("scram at {t:.1} s"));
+    }
+    if !o.gen_online_at_end {
+        f.push("generator not online at the end of the run".into());
+    }
+    let p_end = o.samples.last().map_or(0.0, |r| r[1]);
+    if p_end < 0.5 * STARTUP_TARGET {
+        f.push(format!("power {p_end:.3} at the end, ascension target {STARTUP_TARGET}"));
+    }
+    f
+}
+
+/// IC endurance acceptance, for `case.ic_in_service` trains after MSIV closure.
+/// No safety/relief valves are modelled, so the ICs are the only pressure
+/// relief: peak pressure must stay below the vessel design pressure. Over the
+/// last `IC_REMOVAL_WINDOW_S` the trains must remove the decay heat (mean IC
+/// duty at least the mean core heat) and the vessel must not be pressurising.
+fn ic_endurance_accept(_: &Case, o: &Outcome) -> Vec<String> {
+    let mut f = Vec::new();
+    if o.peak_p_mpa * 1e6 >= VESSEL_DESIGN_PRESSURE {
+        f.push(format!("peak pressure {:.3} MPa reaches design {:.2} MPa", o.peak_p_mpa, VESSEL_DESIGN_PRESSURE / 1e6));
+    }
+    let t_end = o.samples.last().map_or(0.0, |r| r[0]);
+    let window: Vec<_> = o.samples.iter().filter(|r| r[0] >= t_end - IC_REMOVAL_WINDOW_S).collect();
+    let mean = |c: usize| window.iter().map(|r| r[c]).sum::<f64>() / window.len().max(1) as f64;
+    let (ic_mw, core_mw) = (mean(COL_IC_MW), mean(COL_Q_CORE_MW));
+    if ic_mw < core_mw {
+        f.push(format!("last {IC_REMOVAL_WINDOW_S} s: IC duty {ic_mw:.2} MW below core heat {core_mw:.2} MW"));
+    }
+    let (p_start, p_end) = (window.first().map_or(0.0, |r| r[COL_P_MPA]), window.last().map_or(0.0, |r| r[COL_P_MPA]));
+    if p_end > p_start + 1e-4 {
+        f.push(format!("pressurising over the last {IC_REMOVAL_WINDOW_S} s: {p_start:.4} -> {p_end:.4} MPa"));
+    }
+    f
 }
 
 /// Steps once and returns the (mass, energy) the connected systems report having
@@ -84,7 +250,8 @@ fn cases() -> Vec<Case> {
 /// Mirrors `port_balance_step` in tests/plant.rs.
 fn port_balance_step(sim: &mut Sim, dt: f64) -> (f64, f64) {
     let t0 = sim.vessel.eos.t;
-    let sat0 = sim.vessel.sat();
+    // IC steam leaves at the start-of-step port enthalpy the trains requested with.
+    let h_ic_steam = sim.vessel.steam_port_enthalpy();
     let heat_loss = vessel_heat_loss(t0);
     sim.step(dt);
     let ic_in: f64 = sim.ic.iter().map(|t| t.last.w_steam_in).sum();
@@ -96,8 +263,8 @@ fn port_balance_step(sim: &mut Sim, dt: f64) -> (f64, f64) {
     let de = sim.q_core - heat_loss + w_feed * sim.fw.h_feed() + ic_ret_e
         - w_steam * sim.steam.h_steam
         - f.w_vent * f.h_vent
-        - ic_in * sat0.h_g
-        - w_rwcu * sat0.h_f;
+        - ic_in * h_ic_steam
+        - w_rwcu * f.h_liquid;
     (dm * dt, de * dt)
 }
 
@@ -118,12 +285,12 @@ fn plant_inventory(sim: &Sim) -> (f64, f64) {
 }
 
 /// Cumulative boundary exchanges the subsystems count themselves (kg, J):
-/// CST makeup/reject/overflow, shell relief, condenser domain residual, IC boil-off.
+/// CST makeup/reject/overflow, shell relief, IC boil-off. Physical exchanges only.
 fn plant_counters(sim: &Sim) -> (f64, f64) {
     let c = &sim.cond;
     let boiloff: f64 = sim.ic.iter().map(|t| t.boiloff_kg).sum();
     let mass = c.makeup_kg - c.reject_kg - c.overflow_kg - c.relief_kg - boiloff;
-    let energy = c.cst_energy_j - c.relief_energy_j - c.energy_residual_j;
+    let energy = c.cst_energy_j - c.relief_energy_j;
     (mass, energy)
 }
 
@@ -165,6 +332,12 @@ struct Outcome {
     plant_mass_res_kg: f64,
     plant_energy_res_rel: f64,
     plant: PlantFlows,
+    /// Largest per-step condenser |E - E_eq(T, M)|, J.
+    cond_eq_res_j: f64,
+    /// The CSV rows, one per sample.
+    samples: Vec<[f64; 16]>,
+    drive: DriveState,
+    gen_online_at_end: bool,
     failures: Vec<String>,
 }
 
@@ -189,6 +362,10 @@ fn run_case(case: &Case, dt: f64, out_dir: Option<&std::path::Path>) -> Outcome 
         plant_mass_res_kg: 0.0,
         plant_energy_res_rel: 0.0,
         plant: PlantFlows::default(),
+        cond_eq_res_j: 0.0,
+        samples: Vec::new(),
+        drive: DriveState::default(),
+        gen_online_at_end: false,
         failures: Vec::new(),
     };
     let mut events = case.events.clone();
@@ -198,6 +375,14 @@ fn run_case(case: &Case, dt: f64, out_dir: Option<&std::path::Path>) -> Outcome 
     for i in 0..=steps {
         while events.first().is_some_and(|(t, _)| *t <= sim.time + 1e-9) {
             sim.apply(events.remove(0).1);
+        }
+        if let Some(drive) = case.driver {
+            drive(&mut sim, &mut o.drive);
+        }
+        for index in case.ic_in_service..N_IC_TRAINS {
+            if sim.ic[index].cmd_open {
+                sim.apply(Command::SetIcTrain { index, open: false });
+            }
         }
         let s = sim.snapshot();
         let m_res = (sim.vessel.mass - m0) - m_ports;
@@ -231,6 +416,7 @@ fn run_case(case: &Case, dt: f64, out_dir: Option<&std::path::Path>) -> Outcome 
             let cells: Vec<String> = row.iter().map(|x| format!("{x:.6e}")).collect();
             csv.push('\n');
             csv.push_str(&cells.join(","));
+            o.samples.push(row);
             next_sample += SAMPLE_EVERY_S;
         }
         if i == steps {
@@ -242,6 +428,12 @@ fn run_case(case: &Case, dt: f64, out_dir: Option<&std::path::Path>) -> Outcome 
         e_ports += de;
         q_core_j += sim.q_core * dt;
         o.plant.add_step(&sim, t0, dt);
+        let eq_res = sim.cond.equilibrium_residual_j().abs();
+        o.cond_eq_res_j = o.cond_eq_res_j.max(eq_res);
+        if eq_res > COND_EQ_TOL_J {
+            o.failures.push(format!("condenser |E - E_eq(T,M)| {eq_res:.3e} J at t={:.2} s", sim.time));
+            break;
+        }
         if sim.cond.w_out_shortfall > 0.0 {
             o.failures.push(format!("hotwell withdrawal shortfall {:.3e} kg/s at t={:.2} s", sim.cond.w_out_shortfall, sim.time));
             break;
@@ -264,6 +456,11 @@ fn run_case(case: &Case, dt: f64, out_dir: Option<&std::path::Path>) -> Outcome 
     if o.plant_energy_res_rel > PLANT_ENERGY_TOL_REL {
         o.failures.push(format!("plant energy residual {:.3e} of core heat exceeds {PLANT_ENERGY_TOL_REL:.0e}", o.plant_energy_res_rel));
     }
+    o.gen_online_at_end = sim.turbine.breaker_closed && !sim.turbine.tripped;
+    if let Some(accept) = case.accept {
+        let extra = accept(case, &o);
+        o.failures.extend(extra);
+    }
     if let Some(dir) = out_dir {
         let path = dir.join(format!("{}.csv", case.name));
         if let Err(e) = std::fs::write(&path, csv) {
@@ -284,6 +481,7 @@ fn main() {
     );
     let mut failed = false;
     let mut reference = None;
+    let mut ic_end_p = Vec::new();
     for case in cases() {
         let o = run_case(&case, DT, Some(&out_dir));
         let scram = o.scram_s.map_or("-".to_string(), |t| format!("{t:.2}"));
@@ -295,9 +493,24 @@ fn main() {
         );
         let gj = |j: f64| j / 1e9;
         println!(
-            "{:<24} core {:.1} GJ, CW {:.1} GJ, shaft {:.1} GJ, electrical {:.1} GJ",
-            "", gj(o.plant.core_j), gj(o.plant.cw_j), gj(o.plant.shaft_j), gj(o.plant.elec_j)
+            "{:<24} core {:.1} GJ, CW {:.1} GJ, shaft {:.1} GJ, electrical {:.1} GJ, max condenser |E-E_eq| {:.1e} J",
+            "", gj(o.plant.core_j), gj(o.plant.cw_j), gj(o.plant.shaft_j), gj(o.plant.elec_j), o.cond_eq_res_j
         );
+        let last = o.samples.last().copied().unwrap_or([0.0; 16]);
+        if case.driver.is_some() {
+            let at = |t: Option<f64>| t.map_or("never".to_string(), |t| format!("{t:.0} s"));
+            println!(
+                "{:<24} critical at {}, synchronised at {}, end power {:.3}, generator online {}",
+                "", at(o.drive.critical_s), at(o.drive.sync_s), last[1], o.gen_online_at_end
+            );
+        }
+        if case.accept.is_some() && case.driver.is_none() {
+            println!(
+                "{:<24} {} IC train(s): end pressure {:.3} MPa, IC {:.2} MW vs core {:.2} MW at {:.0} s",
+                "", case.ic_in_service, last[COL_P_MPA], last[COL_IC_MW], last[COL_Q_CORE_MW], last[0]
+            );
+            ic_end_p.push((case.ic_in_service, last[COL_P_MPA], o.peak_p_mpa));
+        }
         failed |= !o.failures.is_empty();
         if case.name == REFINE_CASE {
             reference = Some((o.peak_p_mpa, o.min_level_cm));
@@ -318,8 +531,92 @@ fn main() {
         if ok { "PASS".to_string() } else { format!("FAIL {}", fine.failures.join("; ")) }
     );
     failed |= !ok;
+
+    // More IC trains in service must not leave the vessel at a higher pressure.
+    ic_end_p.sort_by_key(|e| e.0);
+    let monotonic = ic_end_p.windows(2).all(|w| w[1].1 <= w[0].1 + 1e-4 && w[1].2 <= w[0].2 + 1e-4);
+    println!(
+        "IC train count (trains, end MPa, peak MPa): {:?}  {}",
+        ic_end_p.iter().map(|e| (e.0, (e.1 * 1e3).round() / 1e3, (e.2 * 1e3).round() / 1e3)).collect::<Vec<_>>(),
+        if monotonic { "PASS" } else { "FAIL: more trains gave a higher pressure" }
+    );
+    failed |= !monotonic;
+
+    let (line, ok) = cold_condenser_check();
+    println!("{line}");
+    failed |= !ok;
     println!("traces: {}", out_dir.canonicalize().unwrap_or(out_dir).display());
     if failed {
         std::process::exit(1);
     }
+}
+
+/// Condenser end temperature (degC), plant energy residual (J) and largest
+/// condenser |E - E_eq| (J) over one minute of cold shutdown with both CW
+/// pumps and the condenser started at 35 degC, stepped at `dt` through the
+/// public API; Err on a rejected step or a model error.
+fn cold_condenser_minute(dt: f64) -> Result<(f64, f64, f64), String> {
+    let mut sim = Sim::new(ScenarioName::ColdShutdown);
+    for index in 0..N_CW_PUMPS {
+        sim.apply(Command::SetCwPump { index, on: true });
+    }
+    sim.cond.set_temperature(35.0);
+    let ((pm0, pe0), (cm0, ce0)) = (plant_inventory(&sim), plant_counters(&sim));
+    let mut flows = PlantFlows::default();
+    let mut max_eq = 0.0f64;
+    for _ in 0..(60.0 / dt).round() as usize {
+        let t0 = sim.vessel.eos.t;
+        if !sim.step(dt) {
+            return Err(format!("dt {dt} s step rejected: {:?}", sim.model_error));
+        }
+        flows.add_step(&sim, t0, dt);
+        max_eq = max_eq.max(sim.cond.equilibrium_residual_j().abs());
+    }
+    let ((pm, pe), (cm, ce)) = (plant_inventory(&sim), plant_counters(&sim));
+    let pm_res = (pm - pm0) - (cm - cm0) - flows.mass_kg;
+    if pm_res.abs() > PLANT_MASS_TOL_KG {
+        return Err(format!("dt {dt} s plant mass residual {pm_res:.3e} kg"));
+    }
+    Ok((sim.cond.t_sat, (pe - pe0) - (ce - ce0) - flows.energy_j, max_eq))
+}
+
+/// Gate 5. The one-step response must stay above the CW inlet, conserve plant
+/// energy to the gate-2 tolerance (relative to the heat the CW removed) and
+/// agree with the refined steps; the exact solution of the lumped node is
+/// 20 + 15 exp(-60 / ~13 s) degC.
+fn cold_condenser_check() -> (String, bool) {
+    const T_TOL_C: f64 = 0.05;
+    let runs: Vec<_> = [60.0, 1.0, DT].iter().map(|&dt| (dt, cold_condenser_minute(dt))).collect();
+    let mut fails = Vec::new();
+    let mut ends = Vec::new();
+    for (dt, r) in &runs {
+        match r {
+            Err(e) => fails.push(e.clone()),
+            Ok((t, pe_res, eq)) => {
+                // CW removes about 15 K x 4.8e8 J/K from the node.
+                let scale = 7.0e9;
+                if *t <= CW_INLET_C {
+                    fails.push(format!("dt {dt} s cooled to {t:.3} degC, below the {CW_INLET_C} degC CW inlet"));
+                }
+                if pe_res.abs() > PLANT_ENERGY_TOL_REL * scale {
+                    fails.push(format!("dt {dt} s plant energy residual {pe_res:.3e} J"));
+                }
+                if *eq > COND_EQ_TOL_J {
+                    fails.push(format!("dt {dt} s condenser |E - E_eq| {eq:.3e} J"));
+                }
+                ends.push((*dt, *t));
+            }
+        }
+    }
+    if let Some(&(_, t_ref)) = ends.last() {
+        for (dt, t) in &ends {
+            if (t - t_ref).abs() > T_TOL_C {
+                fails.push(format!("dt {dt} s ends at {t:.4} degC vs {t_ref:.4} degC at dt {DT} s"));
+            }
+        }
+    }
+    let ends_txt: Vec<String> = ends.iter().map(|(dt, t)| format!("dt {dt} s -> {t:.4} degC")).collect();
+    let ok = fails.is_empty();
+    let verdict = if ok { "PASS".to_string() } else { format!("FAIL: {}", fails.join("; ")) };
+    (format!("cold condenser 60 s, 35 degC, 2 CW pumps: {}  {verdict}", ends_txt.join(", ")), ok)
 }

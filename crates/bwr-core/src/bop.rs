@@ -357,6 +357,55 @@ fn condenser_temperature(energy: f64, m: f64) -> f64 {
     0.5 * (lo + hi)
 }
 
+/// Node temperature path over one step: a constant heating rate `rate` (K/s,
+/// every source but cooling water), CW exchange `a (T - t_cw)` (1/s) that only
+/// removes heat, and the node held at `t_cap` (the relief temperature) while
+/// the heating exceeds the CW removal there. Exact piecewise solution (linear
+/// below the CW inlet, exponential approach above it, constant at the cap), so
+/// no step length overshoots the CW inlet temperature. Returns the end
+/// temperature (before relief) and the integral of max(T - t_cw, 0), K s.
+fn cw_trajectory(t0: f64, rate: f64, a: f64, dt: f64, t_cw: f64, t_cap: f64) -> (f64, f64) {
+    let (mut t, mut left, mut integral) = (t0, dt, 0.0);
+    for _ in 0..4 {
+        if left <= 0.0 {
+            break;
+        }
+        if t < t_cw || (t <= t_cw && rate <= 0.0) {
+            // No CW exchange at or below its inlet temperature.
+            if rate <= 0.0 || t + rate * left <= t_cw {
+                return (t + rate * left, integral);
+            }
+            left -= (t_cw - t) / rate;
+            t = t_cw;
+            continue;
+        }
+        let t_inf = t_cw + rate / a;
+        if t >= t_cap && t_inf >= t_cap {
+            return (t, integral + (t - t_cw) * left);
+        }
+        // Exponential approach to t_inf, interrupted on reaching the cap
+        // (rising) or the CW inlet (falling past it).
+        let stop = if t_inf > t && t < t_cap {
+            Some(t_cap)
+        } else if t_inf < t_cw {
+            Some(t_cw)
+        } else {
+            None
+        };
+        let hit = stop.and_then(|b| {
+            let ratio = (b - t_inf) / (t - t_inf);
+            let seg = -ratio.ln() / a;
+            (ratio > 0.0 && ratio < 1.0 && seg < left).then_some((b, seg))
+        });
+        let seg = hit.map_or(left, |(_, seg)| seg);
+        let decay = (-a * seg).exp();
+        integral += (t_inf - t_cw) * seg + (t - t_inf) * (1.0 - decay) / a;
+        left -= seg;
+        t = hit.map_or(t_inf + (t - t_inf) * decay, |(b, _)| b);
+    }
+    (t, integral)
+}
+
 /// Condenser shell and hotwell as one equilibrium two-phase node: shell vapour
 /// (`vapour_mass`) and hotwell liquid (`hotwell_mass`) share one saturation
 /// temperature, so condensation and evaporation are the phase split of the
@@ -413,9 +462,6 @@ pub struct Condenser {
     pub relief_kg: f64,
     /// Cumulative enthalpy vented through the shell relief, J.
     pub relief_energy_j: f64,
-    /// Cumulative energy the node could not absorb within its temperature
-    /// domain (only non-zero outside 1..200 degC), J.
-    pub energy_residual_j: f64,
 }
 
 impl Condenser {
@@ -448,7 +494,6 @@ impl Condenser {
             withdrawal_deficit_kg: 0.0,
             relief_kg: 0.0,
             relief_energy_j: 0.0,
-            energy_residual_j: 0.0,
         };
         c.set_temperature(CW_INLET_C);
         c
@@ -489,13 +534,52 @@ impl Condenser {
     /// Heat the circulating water would remove from the node at temperature `t`, W:
     /// `m_cw cp eff (t - t_cw_in)` with the NTU effectiveness of the tube bundle.
     pub fn cw_rejection(&self, t: f64) -> f64 {
+        (self.cw_conductance() * (t - CW_INLET_C)).max(0.0)
+    }
+
+    /// `m_cw cp eff`, W/K.
+    fn cw_conductance(&self) -> f64 {
         let m_cw = self.cw_flow();
         if m_cw <= 0.0 {
             return 0.0;
         }
         let mcp = m_cw * CP_WATER;
-        let eff = 1.0 - (-CONDENSER_UA / mcp).exp();
-        (mcp * eff * (t - CW_INLET_C)).max(0.0)
+        mcp * (1.0 - (-CONDENSER_UA / mcp).exp())
+    }
+
+    /// Stored energy minus the equilibrium energy of the reported temperature
+    /// and inventory, J: zero up to the temperature solve's roundoff for every
+    /// accepted state.
+    pub fn equilibrium_residual_j(&self) -> f64 {
+        self.energy_j - condenser_energy(self.t_sat, self.inventory_kg())
+    }
+
+    /// Heat the circulating water removes over a step, J, from start
+    /// temperature `t0` to the node holding `mass` and, before CW, `energy`.
+    /// The non-CW heating is spread uniformly over the step and the path is
+    /// integrated exactly (`cw_trajectory`) with the node heat capacity taken as
+    /// the secant over the temperature change actually made, so the CW duty and
+    /// end temperature agree for any step length.
+    fn cw_heat_over_step(&self, dt: f64, t0: f64, energy: f64, mass: f64, t_cap: f64) -> f64 {
+        let k = self.cw_conductance();
+        if k <= 0.0 {
+            return 0.0;
+        }
+        let e0 = condenser_energy(t0, mass);
+        let mut cap = condenser_energy(t0 + 1.0, mass) - e0;
+        let mut q = 0.0;
+        for _ in 0..30 {
+            let (t_end, integral) = cw_trajectory(t0, (energy - e0) / (cap * dt), k / cap, dt, CW_INLET_C, t_cap);
+            let q_new = k * integral;
+            let converged = (q_new - q).abs() <= 1e-13 * q_new.abs() + 1e-6;
+            q = q_new;
+            let t_end = t_end.clamp(CONDENSER_T_MIN, CONDENSER_T_MAX);
+            if converged || (t_end - t0).abs() < 1e-9 {
+                break;
+            }
+            cap = (condenser_energy(t_end, mass) - e0) / (t_end - t0);
+        }
+        q
     }
 
     /// Makeup rate the level controller runs this step, kg/s.
@@ -523,9 +607,9 @@ impl Condenser {
     /// returned mass, `w_in` water returned to the hotwell and `w_out` condensate
     /// pumped out, kg/s. Kept for callers that already subtract `w_in * h(hotwell)`;
     /// `step_energy` takes the gross enthalpy flow instead.
-    pub fn step(&mut self, dt: f64, q: f64, w_in: f64, w_out: f64) {
+    pub fn step(&mut self, dt: f64, q: f64, w_in: f64, w_out: f64) -> Result<(), String> {
         let q_in = q + w_in * steam::h_liquid(self.t_sat);
-        self.step_energy(dt, q_in, w_in, w_out);
+        self.step_energy(dt, q_in, w_in, w_out)
     }
 
     /// Advance the node: `q_in_w` is the enthalpy flow carried into the shell by
@@ -539,8 +623,22 @@ impl Condenser {
     /// relief vents saturated steam if the shell is above its set pressure; level
     /// reject and overflow finally remove liquid at the end temperature, which
     /// leaves that temperature unchanged.
-    pub fn step_energy(&mut self, dt: f64, q_in_w: f64, w_in: f64, w_out: f64) {
-        let h_hw0 = steam::h_liquid(self.t_sat);
+    ///
+    /// The step is transactional. It returns an error and leaves the node
+    /// unchanged when the end state is one the wet equilibrium node cannot
+    /// represent: a shell with too little water to fill it with saturated vapour
+    /// (including relief that would vent more than the liquid can evaporate) or
+    /// a temperature outside 1..200 degC. The caller must roll its step back.
+    pub fn step_energy(&mut self, dt: f64, q_in_w: f64, w_in: f64, w_out: f64) -> Result<(), String> {
+        let mut next = self.clone();
+        next.advance(dt, q_in_w, w_in, w_out)?;
+        *self = next;
+        Ok(())
+    }
+
+    fn advance(&mut self, dt: f64, q_in_w: f64, w_in: f64, w_out: f64) -> Result<(), String> {
+        let t0 = self.t_sat;
+        let h_hw0 = steam::h_liquid(t0);
         let h_cst = steam::h_liquid(CST_TEMP_C);
         let frac0 = self.hotwell_mass / HOTWELL_CAPACITY;
 
@@ -554,38 +652,48 @@ impl Condenser {
 
         self.q_in_w = q_in_w;
         self.heat_load = q_in_w;
-        self.q_cw_w = self.cw_rejection(self.t_sat);
-        let mut energy = self.energy_j
-            + (q_in_w - self.q_cw_w + self.w_makeup * h_cst - self.w_out_accepted * h_hw0) * dt;
-
-        // Phase equilibrium of the conserved mass and energy.
-        let mut t = condenser_temperature(energy, mass);
+        let mut energy = self.energy_j + (q_in_w + self.w_makeup * h_cst - self.w_out_accepted * h_hw0) * dt;
+        let t_relief = sat_p(CONDENSER_RELIEF_P).t;
+        let q_cw_j = self.cw_heat_over_step(dt, t0, energy, mass, t_relief);
+        self.q_cw_w = q_cw_j / dt;
+        energy -= q_cw_j;
 
         // Shell relief: vent saturated steam until the node is back at the relief
-        // temperature. With h_fg the latent heat there, the vented mass follows
-        // exactly from E - m h_g = E_eq(M - m, T_r) = E_eq(M, T_r) - m h_f.
-        let t_relief = sat_p(CONDENSER_RELIEF_P).t;
+        // temperature. While liquid remains at T_r, removing m kg changes the
+        // equilibrium energy by m h_f, so E - m h_g = E_eq(M, T_r) - m h_f gives
+        // the vented mass. That identity needs liquid left after the vent: relief
+        // that would evaporate more than the liquid present boils the shell dry.
         self.w_relief = 0.0;
         self.q_relief_w = 0.0;
-        if t > t_relief {
+        let e_relief = condenser_energy(t_relief, mass);
+        if energy > e_relief {
             let sat_r = sat_t(t_relief);
-            let m_relief = ((energy - condenser_energy(t_relief, mass)) / sat_r.h_fg()).clamp(0.0, mass);
+            let m_relief = (energy - e_relief) / sat_r.h_fg();
+            let liquid_r = mass - sat_r.rho_g * CONDENSER_VOLUME;
+            if m_relief > liquid_r {
+                return Err(format!(
+                    "condenser shell boils dry under relief: {m_relief:.1} kg to vent, {:.1} kg of liquid",
+                    liquid_r.max(0.0)
+                ));
+            }
             self.w_relief = m_relief / dt;
             self.q_relief_w = self.w_relief * sat_r.h_g;
             mass -= m_relief;
             energy -= m_relief * sat_r.h_g;
-            t = t_relief;
         }
         self.relief_kg += self.w_relief * dt;
         self.relief_energy_j += self.q_relief_w * dt;
 
-        // Only the 1..200 degC domain bounds can leave a residual.
+        // Re-solve the equilibrium of what is left and reject unrepresentable states.
+        let t = condenser_temperature(energy, mass);
         if t <= CONDENSER_T_MIN || t >= CONDENSER_T_MAX {
-            let e_t = condenser_energy(t, mass);
-            self.energy_residual_j += energy - e_t;
-            energy = e_t;
+            return Err(format!("condenser temperature outside its {CONDENSER_T_MIN}..{CONDENSER_T_MAX} degC domain"));
         }
-        self.vapour_mass = condenser_vapour_mass(t, mass);
+        let m_vsat = sat_t(t).rho_g * CONDENSER_VOLUME;
+        if mass < m_vsat * (1.0 - 1e-9) {
+            return Err(format!("condenser shell dry: {mass:.1} kg of water, {m_vsat:.1} kg needed to fill it at {t:.2} degC"));
+        }
+        self.vapour_mass = m_vsat.min(mass);
         let mut liquid = mass - self.vapour_mass;
 
         // Level control and overflow to the CST: liquid leaves at h_f(t), which
@@ -615,6 +723,7 @@ impl Condenser {
         // Air cannot exceed atmospheric partial pressure (relief to atmosphere).
         let max_air = (P_ATM - self.p_steam).max(0.0) * CONDENSER_VOLUME / (287.0 * 303.0);
         self.m_air = self.m_air.min(max_air.max(0.0));
+        Ok(())
     }
 
     pub fn available_for_bypass(&self) -> bool {
@@ -998,7 +1107,7 @@ mod tests {
         let (q, w_in) = (100.0e6, 40.0);
         let mut supplied = 0.0;
         for _ in 0..200 {
-            c.step_energy(DT, q, w_in, 0.0);
+            c.step_energy(DT, q, w_in, 0.0).unwrap();
             supplied += q * DT;
             assert_eq!(c.q_cw_w, 0.0);
             assert_eq!(c.q_relief_w, 0.0);
@@ -1016,7 +1125,7 @@ mod tests {
         let (q, w) = (548.0e6, STEAM_FLOW_RATED);
         for _ in 0..(600.0 / DT) as usize {
             let q_in = q + w * steam::h_liquid(c.t_sat);
-            c.step_energy(DT, q_in, w, w);
+            c.step_energy(DT, q_in, w, w).unwrap();
         }
         assert!((c.q_cw_w - q).abs() < 0.01 * q, "cw {} vs {}", c.q_cw_w, q);
         assert!((c.t_sat - 34.8).abs() < 1.0, "t {}", c.t_sat);
@@ -1031,7 +1140,7 @@ mod tests {
         let mut vented = 0.0;
         for _ in 0..(300.0 / DT) as usize {
             let q_in = 548.0e6 + STEAM_FLOW_RATED * steam::h_liquid(c.t_sat);
-            c.step_energy(DT, q_in, STEAM_FLOW_RATED, STEAM_FLOW_RATED);
+            c.step_energy(DT, q_in, STEAM_FLOW_RATED, STEAM_FLOW_RATED).unwrap();
             vented += c.q_relief_w * DT;
         }
         assert!(c.pressure() >= P_ATM, "pressure {}", c.pressure());
@@ -1044,7 +1153,7 @@ mod tests {
         c.hotwell_mass = HOTWELL_CAPACITY - 1.0;
         c.set_temperature(35.0);
         let m0 = c.inventory_kg();
-        c.step(1.0, 1.0e6, 100.0, 0.0);
+        c.step(1.0, 1.0e6, 100.0, 0.0).unwrap();
         assert_eq!(c.hotwell_mass, HOTWELL_CAPACITY);
         // CW cools the node, so some shell vapour condenses: count the whole inventory.
         let accounted = (c.inventory_kg() - m0) + c.reject_kg + c.overflow_kg;
@@ -1057,7 +1166,7 @@ mod tests {
         let mut c = Condenser::new(true);
         c.hotwell_mass = 10.0;
         c.set_temperature(35.0);
-        c.step(1.0, 0.0, 0.0, 100.0);
+        c.step(1.0, 0.0, 0.0, 100.0).unwrap();
         assert!(c.hotwell_mass >= 0.0);
         assert!((c.w_out_accepted + c.w_out_shortfall - 100.0).abs() < 1e-9);
         assert!(c.withdrawal_deficit_kg > 0.0, "deficit must be recorded");
@@ -1123,7 +1232,7 @@ mod tests {
     /// boundary flows, (kg, J).
     fn condenser_step_residuals(c: &mut Condenser, dt: f64, q_in: f64, w_in: f64, w_out: f64) -> (f64, f64) {
         let (m0, e0, h_hw0) = (c.inventory_kg(), c.energy_j, steam::h_liquid(c.t_sat));
-        c.step_energy(dt, q_in, w_in, w_out);
+        c.step_energy(dt, q_in, w_in, w_out).unwrap();
         let dm = (w_in + c.w_makeup - c.w_out_accepted - c.w_reject - c.w_overflow - c.w_relief) * dt;
         let de = (q_in - c.q_cw_w - c.w_out_accepted * h_hw0 + c.q_cst_w - c.q_relief_w) * dt;
         (c.inventory_kg() - m0 - dm, c.energy_j - e0 - de)
@@ -1137,7 +1246,9 @@ mod tests {
         let (v0, p0) = (c.vapour_mass, c.p_steam);
         let (mut max_dm, mut max_de) = (0.0f64, 0.0f64);
         let mut saw_vapour_rise = false;
-        for _ in 0..400 {
+        // 300 s: relief from about 70 s, ending before the boil-off (~215 kg/s net
+        // of makeup) empties the hotwell, which the node rejects as dryout.
+        for _ in 0..300 {
             let q_in = 548.0e6 + w * steam::h_liquid(c.t_sat);
             let (dm, de) = condenser_step_residuals(&mut c, dt, q_in, w, w);
             max_dm = max_dm.max(dm.abs());
@@ -1151,7 +1262,6 @@ mod tests {
         assert!(saw_vapour_rise, "shell vapour must accumulate before relief");
         assert!(c.p_steam > 10.0 * p0, "pressure {} from {}", c.p_steam, p0);
         assert!(c.relief_kg > 0.0, "relief must export steam mass");
-        assert_eq!(c.energy_residual_j, 0.0);
     }
 
     #[test]
@@ -1170,6 +1280,94 @@ mod tests {
         assert!(c.pressure() <= CONDENSER_RELIEF_P);
     }
 
+    /// Isolated relief depletion (no CW, 1 GW into a node at the relief
+    /// temperature, no returns or withdrawal, automatic makeup) at timestep `dt`.
+    /// Every accepted state must reconstruct from its own T and M (energy,
+    /// saturated vapour filling the shell, saturation pressure) and close its
+    /// port balance; the step that would boil the shell dry must be rejected
+    /// without changing the node. Returns the time of that rejection, s.
+    fn relief_depletion_time(dt: f64) -> f64 {
+        let mut c = Condenser::new(false);
+        c.set_temperature(sat_p(CONDENSER_RELIEF_P).t);
+        let q_in = 1.0e9;
+        let mut time = 0.0;
+        loop {
+            let before = c.clone();
+            if let Err(e) = c.step_energy(dt, q_in, 0.0, 0.0) {
+                assert!(e.contains("dry"), "{e}");
+                assert_eq!((c.energy_j, c.inventory_kg(), c.relief_kg), (before.energy_j, before.inventory_kg(), before.relief_kg));
+                return time;
+            }
+            time += dt;
+            let dm = c.inventory_kg() - before.inventory_kg() - (c.w_makeup - c.w_relief) * dt;
+            let de = c.energy_j - before.energy_j - (q_in + c.q_cst_w - c.q_relief_w) * dt;
+            assert!(dm.abs() < 1e-6 && de.abs() < 1e-2, "port residuals {dm} kg {de} J at {time} s");
+            assert!(c.equilibrium_residual_j().abs() < 1e-3, "E - E(T,M) = {} J at {time} s", c.equilibrium_residual_j());
+            let sat = sat_t(c.t_sat);
+            assert!((c.vapour_mass - sat.rho_g * CONDENSER_VOLUME).abs() < 1e-9 * c.vapour_mass);
+            assert!(c.hotwell_mass >= 0.0 && c.p_steam == sat.p && c.pressure() <= CONDENSER_RELIEF_P);
+            assert!(time < 1000.0, "the shell must boil dry");
+        }
+    }
+
+    #[test]
+    fn relief_depletion_is_rejected_at_dryout_with_a_closed_state() {
+        let (coarse, production, fine) = (relief_depletion_time(1.0), relief_depletion_time(DT), relief_depletion_time(0.01));
+        eprintln!("relief dryout at {coarse} s (dt 1), {production} s (dt {DT}), {fine} s (dt 0.01)");
+        // About 70 t of liquid boiled off by 1 GW at ~446 kg/s, less 30 kg/s makeup once low.
+        assert!(production > 150.0 && production < 200.0, "dryout at {production} s");
+        assert!((production - fine).abs() <= 2.0 * DT && (coarse - fine).abs() <= 2.0, "{coarse} {production} {fine}");
+    }
+
+    #[test]
+    fn relief_with_no_liquid_is_rejected() {
+        let mut c = Condenser::new(false);
+        c.hotwell_mass = 0.0;
+        c.set_temperature(sat_p(CONDENSER_RELIEF_P).t);
+        let before = c.clone();
+        let e = c.step_energy(DT, 100.0e6, 0.0, 0.0).unwrap_err();
+        assert!(e.contains("dry"), "{e}");
+        assert_eq!((c.energy_j, c.inventory_kg()), (before.energy_j, before.inventory_kg()));
+    }
+
+    #[test]
+    fn cw_cooling_is_stable_and_converged_for_large_steps() {
+        // Both CW pumps, no load, from 35 degC: one 60 s step must not cool past
+        // the CW inlet and must agree with the refined response.
+        let end_t = |dt: f64| {
+            let mut c = Condenser::new(true);
+            c.set_temperature(35.0);
+            for _ in 0..(60.0 / dt).round() as usize {
+                let e0 = c.energy_j;
+                c.step_energy(dt, 0.0, 0.0, 0.0).unwrap();
+                assert!(c.t_sat > CW_INLET_C, "cooled to {} below the {CW_INLET_C} degC inlet", c.t_sat);
+                assert!((c.energy_j - e0 + c.q_cw_w * dt).abs() < 1e-3, "CW duty must be the whole energy change");
+                assert!(c.equilibrium_residual_j().abs() < 1e-3);
+            }
+            c.t_sat
+        };
+        let (coarse, mid, fine) = (end_t(60.0), end_t(1.0), end_t(DT));
+        eprintln!("CW cooling 35 degC + 60 s: {coarse:.6} (dt 60), {mid:.6} (dt 1), {fine:.6} (dt {DT})");
+        assert!(fine < 21.0, "cooling time constant ~13 s, end {fine}");
+        assert!((coarse - fine).abs() < 0.01 && (mid - fine).abs() < 0.01, "{coarse} {mid} {fine}");
+    }
+
+    #[test]
+    fn cw_trajectory_matches_closed_forms() {
+        let a = 0.1;
+        // Pure decay from 30 to the 20 degC inlet.
+        let (t, i) = cw_trajectory(30.0, 0.0, a, 5.0, 20.0, 100.0);
+        assert!((t - (20.0 + 10.0 * (-0.5f64).exp())).abs() < 1e-12);
+        assert!((i - 10.0 * (1.0 - (-0.5f64).exp()) / a).abs() < 1e-12);
+        // Heating below the inlet is linear, then exponential above it.
+        let (t, _) = cw_trajectory(10.0, 2.0, a, 10.0, 20.0, 100.0);
+        assert!((t - (40.0 - 20.0 * (-0.5f64).exp())).abs() < 1e-12, "t {t}");
+        // Strong heating reaches the cap and holds there.
+        let (t, i) = cw_trajectory(90.0, 100.0, a, 10.0, 20.0, 100.0);
+        assert_eq!(t, 100.0);
+        assert!(i > 70.0 * 9.0 && i < 80.0 * 10.0, "integral {i}");
+    }
+
     #[test]
     fn bounded_feed_demand_is_fully_accepted_by_the_hotwell() {
         let mut c = Condenser::new(true);
@@ -1178,7 +1376,7 @@ mod tests {
         let dt = 20.0;
         let w_feed = 989.0f64.min(c.withdrawal_limit(dt));
         assert!(w_feed < 989.0, "the limit must bind in this case");
-        c.step_energy(dt, 50.0 * steam::h_liquid(35.0), 50.0, w_feed);
+        c.step_energy(dt, 50.0 * steam::h_liquid(35.0), 50.0, w_feed).unwrap();
         assert_eq!(c.w_out_accepted, w_feed);
         assert_eq!(c.w_out_shortfall, 0.0);
         assert!(c.hotwell_mass >= 0.0);

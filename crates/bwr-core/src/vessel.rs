@@ -597,13 +597,38 @@ impl Vessel {
         self.level_z = level_from_volume(v_l, self.alpha_core, self.alpha_ch);
     }
 
-    /// Saturation properties at the current vessel pressure (at the vessel
-    /// temperature when water-solid, where pressure is set by compression).
+    /// Water-vapour saturation properties of the equilibrium inventory: at the
+    /// vessel temperature, where vapour sits at its own saturation (partial)
+    /// pressure. Total pressure (`eos.p`, including trapped noncondensables)
+    /// is the mechanical quantity for relief setpoints, line flow and display;
+    /// it never sets a port enthalpy. Core boiling uses `core_sat`.
     pub fn sat(&self) -> Sat {
+        sat_t(self.eos.t)
+    }
+
+    /// Enthalpy (J/kg) of vapour leaving through any steam port (main steam,
+    /// head vent, IC). IC requests at `eos.t` receive exactly this value.
+    pub fn steam_port_enthalpy(&self) -> f64 {
+        self.sat().h_g
+    }
+
+    /// Enthalpy (J/kg) of liquid leaving the vessel: the compressed state the
+    /// EOS stores when water-solid, saturated liquid at `eos.t` otherwise.
+    pub fn liquid_port_enthalpy(&self) -> f64 {
         if self.eos.solid {
-            sat_t(self.eos.t)
+            steam::compressed_liquid_h(self.eos.t, self.eos.p)
         } else {
-            sat_p(self.eos.p)
+            self.sat().h_f
+        }
+    }
+
+    /// Enthalpy (J/kg) the main steam lines carry: displaced liquid when the
+    /// vessel is water-solid, vapour otherwise.
+    pub fn steam_line_enthalpy(&self) -> f64 {
+        if self.eos.solid {
+            self.liquid_port_enthalpy()
+        } else {
+            self.steam_port_enthalpy()
         }
     }
 
@@ -638,12 +663,11 @@ impl Vessel {
     /// is reported in `flows`. If the resulting state leaves the EOS domain the
     /// step is rejected: `last_error` is set and nothing changes.
     pub fn step_with_ic(&mut self, dt: f64, inp: &VesselInputs, ic: &IcPorts) {
-        let s0 = self.sat();
         let t_before = self.eos.t;
         let (subcooled, solid, x) = (self.eos.subcooled, self.eos.solid, self.eos.x);
 
-        let h_steam = s0.h_g;
-        let h_liq = if subcooled { steam::h_liquid(self.eos.t) } else { s0.h_f };
+        let h_steam = self.steam_port_enthalpy();
+        let h_liq = self.liquid_port_enthalpy();
         let heat_loss = HEAT_LOSS_HOT * ((self.eos.t - 20.0) / 268.0).max(0.0);
 
         // Head vent: steam escapes while above atmospheric; a water-solid
@@ -734,14 +758,21 @@ impl Vessel {
         self.vent_flow = flows.w_vent;
         self.exhausted = flows.shortfall > 0.0;
         self.shortfall_kg += flows.shortfall * dt;
-        let s = self.sat_for_core();
+        let s = self.core_sat();
 
-        // Core inlet enthalpy: separated liquid mixed with feedwater in the downcomer.
+        // Core inlet enthalpy: separated liquid mixed in the downcomer with the
+        // accepted cold inflows (feedwater and IC condensate return).
         let w = self.core_flow.max(W_MIN);
-        let w_fw = inp.w_feed.min(w);
+        let w_cold = flows.w_feed + flows.w_ic_return;
+        let h_cold = if w_cold > 0.0 {
+            (flows.w_feed * inp.h_feed + flows.w_ic_return * flows.h_ic_return) / w_cold
+        } else {
+            0.0
+        };
+        let w_cold = w_cold.min(w);
         // Separated / recirculating liquid is at the bulk vessel temperature.
         let h_ret = steam::h_liquid(self.eos.t).min(s.h_f);
-        let h_in_target = ((w - w_fw) * h_ret + w_fw * inp.h_feed) / w;
+        let h_in_target = ((w - w_cold) * h_ret + w_cold * h_cold) / w;
         let tau_dc = (V_DOWNCOMER * 750.0 / w).clamp(2.0, 600.0);
         self.h_in += (h_in_target - self.h_in) * (dt / tau_dc).min(1.0);
         self.h_in = self.h_in.min(s.h_f);
@@ -764,8 +795,9 @@ impl Vessel {
         self.heatup_rate += (rate - self.heatup_rate) * (dt / 30.0).min(1.0);
     }
 
-    /// Saturation state used by the core: actual pressure, or atmospheric when subcooled.
-    fn sat_for_core(&self) -> Sat {
+    /// Saturation state for core boiling: bubbles nucleate against the total
+    /// (mechanical) pressure, including trapped gas; atmospheric when subcooled.
+    pub fn core_sat(&self) -> Sat {
         if self.eos.subcooled {
             sat_p(P_ATM)
         } else {
@@ -1137,6 +1169,93 @@ mod tests {
         assert!((m1 - m0).abs() < 1e-6, "mass created {}", m1 - m0);
         // Combined primary energy falls by exactly the pool duty and ambient loss.
         assert!((e1 - e0 + q_pool * 0.05 + loss).abs() < 1.0e3, "energy residual {}", e1 - e0 + q_pool * 0.05 + loss);
+    }
+
+    /// R1: with trapped head gas the vessel and the IC trains exchange one
+    /// steam enthalpy. Sealed 150 degC inventory, 50 kg air, core heat on, all
+    /// ICs open: vessel + IC primary energy changes by exactly core heat minus
+    /// pool duty and ambient loss, summed independently each step.
+    #[test]
+    fn gas_bearing_heatup_with_ic_closes_primary_energy() {
+        let mut v = vessel_at(150.0, 180_000.0);
+        v.head_vent_open = false;
+        v.gas_mass = 50.0;
+        v.eos = solve_eos_with(v.mass, v.energy, HeadSpace::Sealed { gas_mass: 50.0 }).unwrap();
+        assert!(v.eos.p_gas > 5.0e4 && sat_p(v.eos.p).t > v.eos.t + 5.0, "{:?}", v.eos);
+        let mut trains = open_trains();
+        let (dt, q_core) = (0.05, 20.0e6);
+        let (m0, e0) = primary_inventory(&v, &trains);
+        let mut external = 0.0;
+        for _ in 0..20 {
+            let t0 = v.eos.t;
+            let h_port = v.steam_port_enthalpy();
+            let reqs: Vec<_> = trains.iter().map(|t| t.request(dt, t0, !v.eos.subcooled)).collect();
+            assert!(reqs.iter().all(|r| r.w_steam_in == 0.0 || r.h_steam_in == h_port));
+            let mut ports = IcPorts::default();
+            let mut h_sum = 0.0;
+            for r in &reqs {
+                ports.w_steam += r.w_steam_in;
+                ports.w_return += r.w_cond_return;
+                h_sum += r.w_cond_return * r.h_return;
+            }
+            ports.h_return = if ports.w_return > 0.0 { h_sum / ports.w_return } else { 0.0 };
+            let inp = VesselInputs { q_core, q_ic: 0.0, w_feed: 0.0, h_feed: 0.0, w_steam: 0.0, w_liquid_out: 0.0 };
+            v.step_with_ic(dt, &inp, &ports);
+            assert!(v.last_error.is_none(), "{:?}", v.last_error);
+            let ratio = v.flows.ic_ratio;
+            let q_pool: f64 = trains.iter_mut().zip(reqs).map(|(t, r)| t.commit(dt, r.scaled(ratio)).q_pool).sum();
+            let loss = HEAT_LOSS_HOT * ((t0 - 20.0) / 268.0).max(0.0);
+            external += (q_core - q_pool - loss) * dt;
+        }
+        assert!(v.flows.w_ic_steam > 1.0, "IC idle: {:?}", v.flows);
+        let (m1, e1) = primary_inventory(&v, &trains);
+        assert!((m1 - m0).abs() < 1e-6, "mass created {}", m1 - m0);
+        assert!((e1 - e0 - external).abs() < 10.0, "energy residual {} J", e1 - e0 - external);
+    }
+
+    /// R3: liquid withdrawn from a water-solid vessel carries the compressed
+    /// state's enthalpy. Independent IF97 Region 1 at the reviewers' fixture
+    /// (M = 1.002 V rho_f(40 C): 40 C, 4.562267 MPa) is 171573.418 J/kg.
+    #[test]
+    fn compressed_liquid_withdrawal_uses_pressure_dependent_enthalpy() {
+        let mut v = vessel_at(40.0, 1.002 * V_VESSEL_FLUID * sat_t(40.0).rho_f);
+        assert!(v.eos.solid && (v.eos.p - 4.562267e6).abs() < 2.0e4, "{:?}", v.eos);
+        let (m0, e0, dt) = (v.mass, v.energy, 0.05);
+        let inp = VesselInputs { q_core: 0.0, q_ic: 0.0, w_feed: 0.0, h_feed: 0.0, w_steam: 0.0, w_liquid_out: 10.0 };
+        v.step(dt, &inp);
+        assert!(v.last_error.is_none(), "{:?}", v.last_error);
+        assert!((v.flows.h_liquid - 171_573.418).abs() < 50.0, "h_liquid {}", v.flows.h_liquid);
+        let loss = HEAT_LOSS_HOT * ((40.0 - 20.0) / 268.0) * dt;
+        assert!((v.mass - m0 + 10.0 * dt).abs() < 1e-9);
+        assert!((v.energy - e0 + 10.0 * dt * v.flows.h_liquid + loss).abs() < 1e-3);
+
+        // Hot water-solid vessel: displaced liquid on the steam lines and RWCU
+        // both carry the compressed enthalpy, above saturated h_f(T).
+        let mut v = vessel_at(200.0, 1.002 * V_VESSEL_FLUID * sat_t(200.0).rho_f);
+        assert!(v.eos.solid);
+        let h_c = steam::compressed_liquid_h(v.eos.t, v.eos.p);
+        assert_eq!(v.steam_line_enthalpy(), h_c);
+        assert!(h_c - sat_t(v.eos.t).h_f > 500.0, "dh {}", h_c - sat_t(v.eos.t).h_f);
+        let inp = VesselInputs { w_steam: 5.0, ..inp };
+        v.step(dt, &inp);
+        assert!(v.last_error.is_none(), "{:?}", v.last_error);
+        assert_eq!((v.flows.h_steam, v.flows.h_liquid), (h_c, h_c));
+        assert!(v.flows.w_steam == 5.0 && v.flows.w_liquid == 10.0);
+    }
+
+    /// Astra 19: accepted IC condensate return mixes into the downcomer with
+    /// feedwater, so its temperature reaches the core inlet.
+    #[test]
+    fn ic_return_mixes_into_core_inlet() {
+        let inlet = |t_ret: f64| {
+            let mut v = Vessel::new(sat_p(P_RATED).t, Z_NWL, RATED_POWER_W, STEAM_FLOW_RATED, T_FW_RATED, false);
+            let inp = VesselInputs { q_core: 0.0, q_ic: 0.0, w_feed: 0.0, h_feed: 0.0, w_steam: 0.0, w_liquid_out: 0.0 };
+            v.step_with_ic(1.0, &inp, &IcPorts { w_steam: 0.0, w_return: 100.0, h_return: steam::h_liquid(t_ret) });
+            assert!(v.last_error.is_none() && v.flows.w_ic_return == 100.0);
+            v.h_in
+        };
+        let (cold, warm) = (inlet(40.0), inlet(150.0));
+        assert!(warm - cold > 1.0e3, "inlet {cold} vs {warm}");
     }
 
     #[test]

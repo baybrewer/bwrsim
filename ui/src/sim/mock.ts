@@ -40,7 +40,17 @@ const H_FG_IC = 1500; // kJ/kg, primary steam condensed in the IC tubes (~7 MPa)
 const FEED_CP = 4.19; // kJ/kg/K
 const COLD_FEED_C = 40;
 const HEAD_SPACE_M3 = 100; // mock head-space volume for the trapped-gas readout
-const R_AIR_KJ = 0.287; // kJ/kg/K
+const R_AIR_KJ = 0.287; // kJ/kg/K (R_AIR in crates/bwr-core/src/vessel.rs)
+const P_ATM_MPA = 0.101325;
+const WATER_RHO = 750; // kg/m3, converts inventory level change into head-space volume
+const HEAD_SPACE_MIN_M3 = 5; // floor so a high level cannot compress the gas to zero volume
+// Feed heating: extraction enthalpy per kg of turbine throttle steam, sized so rated
+// steam (475 kg/s) delivers the ~380 MW that lifts rated feed from 40 to ~230 C.
+const EXTRACTION_KJ_PER_KG = 800;
+const EXTRACTION_STEAM_CAP_KGS = 520; // bounds the extraction budget above rated flow
+const FEED_TEMP_MAX_C = 230; // top heater outlet limit
+const HEATER_TAU_S = 120; // heater shell/tube storage time constant
+const EFFECTIVE_SPEED_TAU_S = 1; // smoothing of the achieved-speed readout
 
 /** 57 rods on a 9x9 grid: drop a 3+2+1 triangle from every corner. */
 function buildLayout(): [number, number][] {
@@ -67,6 +77,11 @@ const approach = (v: number, target: number, rate: number, dt: number) =>
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 /** Feed pump ASD speed demand: idle at 25 % when running, rising with valve demand. */
 const pumpSpeedDemand = (running: boolean, fcvPos: number) => (running ? 25 + 75 * fcvPos : 0);
+/** Ideal-gas mass of air at partial pressure pMpa (kPa * m3 / (kJ/kg/K * K) = kg). */
+const gasKg = (pMpa: number, tC: number, volM3: number) => (pMpa * 1e3 * volM3) / (R_AIR_KJ * (tC + 273.15));
+const gasPressureMpa = (kg: number, tC: number, volM3: number) => (kg * R_AIR_KJ * (tC + 273.15)) / (volM3 * 1e3);
+/** Air partial pressure of a vented head space: tops vapour up to atmospheric. */
+const ventedGasMpa = (tC: number) => Math.max(0, P_ATM_MPA - psat(tC));
 
 interface Hidden {
   precursor: number; // normalized so equilibrium precursor == power
@@ -84,6 +99,8 @@ function blankSnapshot(): Snapshot {
   return {
     timeS: 0,
     speed: 1,
+    effectiveSpeed: 0,
+    clockBacklogS: 0,
     paused: false,
     modeSwitch: "shutdown",
     scrammed: false,
@@ -204,6 +221,8 @@ export class MockSim {
     prevPower: 0,
     omega: 0,
   };
+  // Wall-clock time of the previous timer tick, for the achieved-speed readout.
+  private lastWallMs: number | null = null;
   private listeners = new Set<(s: Snapshot) => void>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private phase = 0;
@@ -220,6 +239,7 @@ export class MockSim {
   stop() {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    this.lastWallMs = null;
   }
 
   subscribe(cb: (s: Snapshot) => void): () => void {
@@ -388,10 +408,11 @@ export class MockSim {
 
   // --------------------------------------------------------------- scenarios
   private loadScenario(name: ScenarioName) {
-    const { speed: keepSpeed, paused: keepPaused } = this.s;
+    const { speed: keepSpeed, paused: keepPaused, effectiveSpeed: keepEffective } = this.s;
     const s = blankSnapshot();
     s.speed = keepSpeed;
     s.paused = keepPaused;
+    s.effectiveSpeed = keepEffective;
     this.s = s;
     this.h.alarmState.clear();
     this.h.pressInt = 0;
@@ -467,6 +488,9 @@ export class MockSim {
     }
     // Loaded plant starts at its steady pump speed rather than ramping from zero.
     for (const p of s.feedwater.pumps) p.speedPct = pumpSpeedDemand(p.running, s.feedwater.fcvPos);
+    // Head-space gas starts at the vented equilibrium (none above the atmospheric boiling point).
+    s.vessel.headGasKg = gasKg(ventedGasMpa(s.vessel.coolantTempC), s.vessel.coolantTempC, this.headSpaceM3());
+    this.updateHeadSpace();
     this.h.precursor = s.neutronics.powerFrac;
     this.h.prevPower = s.neutronics.powerFrac;
     this.h.omega = 0;
@@ -477,6 +501,7 @@ export class MockSim {
   // ----------------------------------------------------------------- physics
   private tick(realDt: number) {
     const s = this.s;
+    const t0 = s.timeS;
     if (!s.paused) {
       let remaining = realDt * s.speed;
       while (remaining > 1e-9) {
@@ -486,6 +511,16 @@ export class MockSim {
         if (s.paused) break; // a model-domain error pauses mid-tick
       }
     }
+    // The mock steps each tick's time synchronously and drops late timer time rather
+    // than carrying it, so it has no backlog; a throttled timer shows as low achieved speed.
+    s.clockBacklogS = 0;
+    const wallNow = performance.now();
+    const wallDt = this.lastWallMs === null ? realDt : Math.max((wallNow - this.lastWallMs) / 1000, 1e-3);
+    this.lastWallMs = wallNow;
+    const rate = (s.timeS - t0) / wallDt;
+    // The first sample after start or resume seeds the filter instead of ramping from zero.
+    const alpha = s.effectiveSpeed === 0 ? 1 : Math.min(1, wallDt / EFFECTIVE_SPEED_TAU_S);
+    s.effectiveSpeed = s.paused ? 0 : s.effectiveSpeed + (rate - s.effectiveSpeed) * alpha;
     this.updateAlarms();
     this.emit();
   }
@@ -508,7 +543,7 @@ export class MockSim {
   private updateVoids(dt?: number) {
     const v = this.s.vessel;
     const q = this.s.neutronics.thermalPowerMw / RATED_MWT;
-    const sat = v.coolantTempC >= tsat(v.pressureMpa) - 0.5 && v.pressureMpa > 0.15;
+    const sat = v.coolantTempC >= tsat(v.pressureMpa - v.headGasPressureMpa) - 0.5 && v.pressureMpa > 0.15;
     const pScale = clamp(7.2 / Math.max(v.pressureMpa, 0.5), 1, 4);
     const target = sat ? clamp(0.38 * Math.sqrt(Math.max(q, 0)) * Math.sqrt(pScale), 0, 0.75) : 0;
     v.coreAvgVoid = dt === undefined ? target : v.coreAvgVoid + (target - v.coreAvgVoid) * Math.min(1, dt / 1.5);
@@ -669,9 +704,13 @@ export class MockSim {
       p.flowKgs = p.running && nFeed > 0 ? totalFeed / nFeed : 0;
       p.speedPct = approach(p.speedPct, pumpSpeedDemand(p.running, fw.fcvPos), PUMP_RAMP_PCT_S, dt);
     }
-    const fracSteam = clamp(v.steamFlowKgs / 475, 0, 1.1);
-    fw.feedTempC = approach(fw.feedTempC, fw.heatersInService ? 40 + 190 * fracSteam : 40, 1, dt);
-    fw.extractionHeatMw = fw.heatersInService ? (v.feedFlowKgs * FEED_CP * Math.max(0, fw.feedTempC - COLD_FEED_C)) / 1000 : 0;
+    // Extraction heat comes only from current turbine steam (zero after a trip); heater
+    // storage then lags the feed outlet temperature toward what that heat can support.
+    const extractionSteamKgs = fw.heatersInService ? Math.min(st.steamToTurbineKgs, EXTRACTION_STEAM_CAP_KGS) : 0;
+    fw.extractionHeatMw = (extractionSteamKgs * EXTRACTION_KJ_PER_KG) / 1000;
+    const feedRiseC = fw.extractionHeatMw > 0 ? (fw.extractionHeatMw * 1000) / (Math.max(v.feedFlowKgs, 1) * FEED_CP) : 0;
+    const feedTempTarget = Math.min(COLD_FEED_C + feedRiseC, FEED_TEMP_MAX_C);
+    fw.feedTempC += (feedTempTarget - fw.feedTempC) * Math.min(1, dt / HEATER_TAU_S);
 
     // Hotwell
     const hotwellRaw =
@@ -688,7 +727,8 @@ export class MockSim {
     const hSteam = 2770;
     const hFeed = 4.19 * fw.feedTempC;
     const hLiquid = 4.19 * v.coolantTempC * 1.1;
-    const tSat = tsat(v.pressureMpa);
+    // Boiling is set by the vapour partial pressure; trapped gas raises only the total.
+    const tSat = tsat(v.pressureMpa - v.headGasPressureMpa);
     const boiling = v.coolantTempC >= tSat - 0.5 && v.coolantTempC > 100;
     const qSteam = boiling ? (v.steamFlowKgs * (hSteam - hLiquid)) / 1000 : 0;
     const qFeed = (v.feedFlowKgs * (hLiquid - hFeed)) / 1000;
@@ -700,14 +740,8 @@ export class MockSim {
     v.coolantTempC = clamp(coolantRaw, 15, COOLANT_MAX_C);
     if (v.headVentOpen && v.coolantTempC > 100 && v.pressureMpa < 0.2) v.coolantTempC = 100;
     v.heatupRateCph = v.heatupRateCph + (((v.coolantTempC - prevT) / dt) * 3600 - v.heatupRateCph) * Math.min(1, dt / 30);
-    v.pressureMpa = v.coolantTempC > 100 ? Math.max(psat(v.coolantTempC), 0.101) : 0.101;
-    if (v.headVentOpen) v.pressureMpa = Math.min(v.pressureMpa, 0.12);
-    // Head-space air follows the atmosphere while vented and stays trapped once sealed.
-    if (v.headVentOpen) {
-      v.headGasPressureMpa = Math.max(0, 0.101325 - (v.coolantTempC < 100 ? psat(v.coolantTempC) : 0.101325));
-      v.headGasKg = (v.headGasPressureMpa * 1e3 * HEAD_SPACE_M3) / (R_AIR_KJ * (v.coolantTempC + 273.15));
-    }
-    v.coreInletSubcoolingKjKg = Math.max(0, 4.19 * (tsat(v.pressureMpa) - (v.coolantTempC * 0.9 + fw.feedTempC * 0.1)));
+    this.updateHeadSpace();
+    v.coreInletSubcoolingKjKg = Math.max(0, 4.19 * (tSat - (v.coolantTempC * 0.9 + fw.feedTempC * 0.1)));
 
     // Inventory: 8900 kg per metre of level, plus void swell
     const boilOff = boiling ? v.steamFlowKgs : 0;
@@ -800,6 +834,29 @@ export class MockSim {
       }
     }
     s.alarms = [...st.values()].map((a) => ({ ...a }));
+  }
+
+  /** Head-space volume above the inventory, shrinking as the level rises. */
+  private headSpaceM3() {
+    const rise = ((this.h.massLevelM - NWL_ABOVE_TAF_M) * VESSEL_KG_PER_M) / WATER_RHO;
+    return Math.max(HEAD_SPACE_MIN_M3, HEAD_SPACE_M3 - rise);
+  }
+
+  /** Total pressure = vapour (saturation at coolant temperature) + head-space gas (Dalton). */
+  private updateHeadSpace() {
+    const v = this.s.vessel;
+    const pVap = psat(v.coolantTempC);
+    const vol = this.headSpaceM3();
+    if (v.headVentOpen) {
+      // Vented: air exchanges with the atmosphere, so mass and pressure re-equilibrate.
+      v.headGasPressureMpa = ventedGasMpa(v.coolantTempC);
+      v.headGasKg = gasKg(v.headGasPressureMpa, v.coolantTempC, vol);
+      v.pressureMpa = Math.min(Math.max(pVap, P_ATM_MPA), 0.12);
+    } else {
+      // Sealed: trapped mass is fixed; its partial pressure follows temperature and volume.
+      v.headGasPressureMpa = gasPressureMpa(v.headGasKg, v.coolantTempC, vol);
+      v.pressureMpa = pVap + v.headGasPressureMpa;
+    }
   }
 
   private derive() {

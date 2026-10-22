@@ -190,7 +190,15 @@ pub struct Alarm {
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub time_s: f64,
+    /// Requested sim-speed multiplier (simulated s per wall-clock s).
     pub speed: f64,
+    /// Achieved simulated s per wall-clock s, smoothed; 0 while paused. The
+    /// engine reports the nominal value; the host overwrites it with the
+    /// measured rate.
+    pub effective_speed: f64,
+    /// Simulated seconds owed to the clock but not yet stepped: the engine
+    /// accumulator plus (set by the host) its unadvanced wall time x speed.
+    pub clock_backlog_s: f64,
     pub paused: bool,
     pub mode_switch: ModeSwitch,
     pub scrammed: bool,

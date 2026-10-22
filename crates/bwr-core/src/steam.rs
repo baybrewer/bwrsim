@@ -188,7 +188,26 @@ pub fn compressed_liquid(t: f64, v: f64, p_max: f64) -> Result<(f64, f64), f64> 
         }
         liq = region1(t, p);
     }
-    Ok((p, s.u_f() + (liq.u - at_sat.u)))
+    Ok((p, anchored(&s, &at_sat, &liq).1))
+}
+
+/// (v, u) of compressed liquid: Region 1 increments from the saturated state
+/// added to the table's saturated liquid (the anchoring `compressed_liquid` uses).
+fn anchored(s: &Sat, at_sat: &Liquid, liq: &Liquid) -> (f64, f64) {
+    (s.v_f() * liq.v / at_sat.v, s.u_f() + (liq.u - at_sat.u))
+}
+
+/// Specific enthalpy (J/kg) of liquid at temperature `t` (degC) and pressure
+/// `p` (Pa), with the same saturation anchoring as `compressed_liquid`, so a
+/// port drawing liquid from a compressed vessel carries u + p*v of the very
+/// state the EOS stores. Saturated liquid at or below p_sat(t).
+pub fn compressed_liquid_h(t: f64, p: f64) -> f64 {
+    let s = sat_t(t);
+    if !(p > s.p) {
+        return s.h_f;
+    }
+    let (v, u) = anchored(&s, &region1(t, s.p), &region1(t, p));
+    u + p * v
 }
 
 #[cfg(test)]
@@ -226,5 +245,20 @@ mod tests {
         let (p, _) = compressed_liquid(200.0, s.v_f() * 0.99, 100.0e6).unwrap();
         assert!(p > 12.0e6 && p < 14.0e6, "p {p}");
         assert!(compressed_liquid(200.0, s.v_f() * 0.9, 100.0e6).is_err());
+    }
+
+    /// R3: compressed-liquid port enthalpy against independent IAPWS-IF97
+    /// Region 1 h(T, P) (Python iapws 1.5.5, quoted in the round-2 reviews).
+    #[test]
+    fn compressed_liquid_enthalpy_matches_if97_at_pressure() {
+        for &(t, p, h_ref) in &[(40.0, 4.562267e6, 171_573.418), (200.0, 50.000049e6, 875_311.210)] {
+            let h = compressed_liquid_h(t, p);
+            assert!((h - h_ref).abs() < 50.0, "h({t} C, {p} Pa) = {h} vs IF97 {h_ref}");
+            assert!(h - h_liquid(t) > 900.0, "pressure term missing at {t} C");
+        }
+        // Continuous with saturated liquid at the phase boundary.
+        let s = sat_t(200.0);
+        assert_eq!(compressed_liquid_h(200.0, s.p), s.h_f);
+        assert!((compressed_liquid_h(200.0, s.p * (1.0 + 1e-9)) - s.h_f).abs() < 1e-3);
     }
 }

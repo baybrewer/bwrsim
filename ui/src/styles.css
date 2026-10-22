@@ -223,6 +223,12 @@ select {
   font-weight: 700;
   white-space: nowrap;
 }
+.sim-rate {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--label);
+  white-space: nowrap;
+}
 .tb-spacer {
   flex: 1;
 }
