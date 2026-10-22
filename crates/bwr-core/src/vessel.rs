@@ -237,7 +237,10 @@ pub struct Eos {
     pub p: f64,
     /// Static steam quality of the vessel inventory (steam mass / total).
     pub x: f64,
-    /// Below the atmospheric boiling point: no net steam production.
+    /// Below the atmospheric boiling point (T < 100 degC). A plant-mode
+    /// (cold) indicator for annunciators and mode-dependent logic only: it is
+    /// never a physics gate. Core boiling follows total pressure (`core_sat`),
+    /// port selection follows phase inventory (`vapour_available`).
     pub subcooled: bool,
     /// True if the vessel is water-solid (no steam space).
     pub solid: bool,
@@ -525,7 +528,9 @@ impl Vessel {
             exhausted: false,
             shortfall_kg: 0.0,
         };
-        // Iterate flow, voids and inventory to a consistent state.
+        // Iterate flow, voids and inventory to a consistent state. Core boiling
+        // uses the initial total pressure (`core_sat`): 1 atm below 100 degC,
+        // where air fills the head space, the vapour pressure above it.
         let s = if t < 100.0 { sat_p(P_ATM) } else { sat_t(t) };
         let h_fw = steam::h_liquid(t_feed);
         for _ in 0..200 {
@@ -592,7 +597,8 @@ impl Vessel {
     }
 
     fn update_level(&mut self) {
-        let rho_l = if self.eos.subcooled { steam::rho_liquid(self.eos.t) } else { sat_t(self.eos.t).rho_f };
+        // Same liquid density the EOS lever rule uses, at every temperature.
+        let rho_l = sat_t(self.eos.t).rho_f;
         let v_l = self.mass * (1.0 - self.eos.x) / rho_l;
         self.level_z = level_from_volume(v_l, self.alpha_core, self.alpha_ch);
     }
@@ -664,22 +670,24 @@ impl Vessel {
     /// step is rejected: `last_error` is set and nothing changes.
     pub fn step_with_ic(&mut self, dt: f64, inp: &VesselInputs, ic: &IcPorts) {
         let t_before = self.eos.t;
-        let (subcooled, solid, x) = (self.eos.subcooled, self.eos.solid, self.eos.x);
+        let (solid, x) = (self.eos.solid, self.eos.x);
 
         let h_steam = self.steam_port_enthalpy();
         let h_liq = self.liquid_port_enthalpy();
         let heat_loss = HEAT_LOSS_HOT * ((self.eos.t - 20.0) / 268.0).max(0.0);
 
         // Head vent: steam escapes while above atmospheric; a water-solid
-        // vessel relieves liquid through it instead.
-        let vent_req = if self.head_vent_open && (!subcooled || solid) {
-            (C_HEAD_VENT * (self.eos.p - P_ATM)).max(0.0)
-                + if subcooled { 0.0 } else { 0.02 * (self.eos.t - 100.0).max(0.0) }
+        // vessel relieves liquid through it instead. Both terms follow the
+        // mechanical state (zero at or below 1 atm / 100 degC), not a mode flag.
+        let vent_req = if self.head_vent_open {
+            (C_HEAD_VENT * (self.eos.p - P_ATM)).max(0.0) + 0.02 * (self.eos.t - 100.0).max(0.0)
         } else {
             0.0
         };
-        // Steam lines carry steam when a steam space exists, displaced liquid when solid.
-        let steam_req = if subcooled { 0.0 } else { inp.w_steam };
+        // Steam lines carry vapour when a steam space exists, displaced liquid
+        // when solid; the line hydraulics already set the request from total
+        // pressure, and the phase-inventory bound below limits what leaves (R2).
+        let steam_req = inp.w_steam;
         let (h_steam_port, h_vent_port) = if solid { (h_liq, h_liq) } else { (h_steam, h_steam) };
         let ic_steam_req = if solid { 0.0 } else { ic.w_steam };
 
@@ -796,12 +804,28 @@ impl Vessel {
     }
 
     /// Saturation state for core boiling: bubbles nucleate against the total
-    /// (mechanical) pressure, including trapped gas; atmospheric when subcooled.
+    /// (mechanical) pressure, including trapped gas, throughout the EOS domain.
+    /// A vented vessel sits at 1 atm (so boils at 100 degC); a sealed one with
+    /// trapped air boils above its bulk temperature; a gas-free one at its own
+    /// vapour pressure (R2).
     pub fn core_sat(&self) -> Sat {
-        if self.eos.subcooled {
-            sat_p(P_ATM)
+        sat_p(self.eos.p)
+    }
+
+    /// Vapour the steam ports (main steam, IC) can draw: present at any
+    /// temperature in the equilibrium EOS, absent when water-solid.
+    pub fn vapour_available(&self) -> bool {
+        !self.eos.solid && self.eos.x > 0.0
+    }
+
+    /// Density (kg/m3) of the fluid entering the main steam lines, from the
+    /// same phase `steam_line_enthalpy` selects: the vessel's own compressed
+    /// liquid (it fills the vessel) when water-solid, the dome vapour otherwise.
+    pub fn steam_line_density(&self) -> f64 {
+        if self.eos.solid {
+            self.mass / V_VESSEL_FLUID
         } else {
-            sat_p(self.eos.p)
+            self.sat().rho_g
         }
     }
 }
@@ -1089,7 +1113,9 @@ mod tests {
     /// vessel + IC inventory is conserved.
     fn ic_round_trip(v: &mut Vessel, trains: &mut [crate::ic::IcTrain], dt: f64) -> (f64, f64) {
         let t_sat = v.eos.t;
-        let reqs: Vec<_> = trains.iter().map(|t| t.request(dt, t_sat, !v.eos.subcooled)).collect();
+        // Ask as if vapour were available: these tests check that the vessel's
+        // phase-inventory acceptance, not the caller's gate, refuses the draw.
+        let reqs: Vec<_> = trains.iter().map(|t| t.request(dt, t_sat, true)).collect();
         let mut ports = IcPorts::default();
         let mut h_sum = 0.0;
         for r in &reqs {
@@ -1189,7 +1215,7 @@ mod tests {
         for _ in 0..20 {
             let t0 = v.eos.t;
             let h_port = v.steam_port_enthalpy();
-            let reqs: Vec<_> = trains.iter().map(|t| t.request(dt, t0, !v.eos.subcooled)).collect();
+            let reqs: Vec<_> = trains.iter().map(|t| t.request(dt, t0, v.vapour_available())).collect();
             assert!(reqs.iter().all(|r| r.w_steam_in == 0.0 || r.h_steam_in == h_port));
             let mut ports = IcPorts::default();
             let mut h_sum = 0.0;
@@ -1265,5 +1291,100 @@ mod tests {
         v.step_with_ic(0.05, &inp, &IcPorts { w_steam: 0.0, w_return: 50.0, h_return: 1.0e5 });
         assert_eq!(v.flows.ic_ratio, 1.0);
         assert_eq!((v.flows.w_ic_return, v.flows.h_ic_return), (50.0, 1.0e5));
+    }
+
+    /// Sealed vessel at `t` holding `mass` of water and `gas` kg of trapped air.
+    fn sealed_at(t: f64, mass: f64, gas: f64) -> Vessel {
+        let mut v = vessel_at(t, mass);
+        v.head_vent_open = false;
+        v.gas_mass = gas;
+        v.eos = solve_eos_with(mass, v.energy, HeadSpace::Sealed { gas_mass: gas }).unwrap();
+        v.update_level();
+        v
+    }
+
+    /// R2 (Sol R3 fixture): sealed 90 degC, 180 t, 100 kg air. Total pressure
+    /// 229956 Pa boils at ~124.68 degC (IF97), so 30 MW into 500 kg/s of 90 degC
+    /// inlet water makes no void; the old atmospheric shortcut made ~22.7 %.
+    #[test]
+    fn sealed_cold_gas_bearing_core_boils_at_total_pressure() {
+        let mut v = sealed_at(90.0, 180_000.0, 100.0);
+        assert!(v.eos.subcooled && !v.eos.solid);
+        assert!((v.eos.p - 229_956.46).abs() < 1.0e-3 * 229_956.46, "p {}", v.eos.p);
+        assert!((v.core_sat().t - 124.681).abs() < 0.3, "core T_sat {}", v.core_sat().t);
+        let h_in = steam::h_liquid(90.0);
+        assert!(core_th(&sat_p(P_ATM), 500.0, 30.0e6, h_in).alpha_avg > 0.2, "fixture must discriminate");
+        v.core_flow = 500.0;
+        v.h_in = h_in;
+        let inp = VesselInputs { q_core: 30.0e6, q_ic: 0.0, w_feed: 0.0, h_feed: 0.0, w_steam: 0.0, w_liquid_out: 0.0 };
+        v.step(0.05, &inp);
+        assert!(v.last_error.is_none(), "{:?}", v.last_error);
+        assert_eq!((v.core.alpha_avg, v.core.x_exit), (0.0, 0.0), "{:?}", v.core);
+    }
+
+    /// R2: an open-vent vessel sits at 1 atm and still boils at ~100 degC on
+    /// both sides of it (cold heatup and the startup path are unchanged).
+    #[test]
+    fn vented_vessel_core_boils_at_atmospheric_saturation() {
+        let below = vessel_at(99.5, 180_000.0);
+        assert!(below.head_vent_open || below.gas_mass > 0.0);
+        let mut vented = below.clone();
+        vented.head_vent_open = true;
+        vented.eos = solve_eos(vented.mass, vented.energy).unwrap();
+        assert_eq!(vented.eos.p, P_ATM);
+        assert!((vented.core_sat().t - 100.0).abs() < 0.05, "{}", vented.core_sat().t);
+        let above = vessel_at(100.5, 180_000.0);
+        assert!((above.core_sat().t - 100.5).abs() < 0.05, "{}", above.core_sat().t);
+    }
+
+    /// R2: cold compressed liquid (water-solid 40 degC, several MPa) is far
+    /// from boiling, and an open main line discharges its liquid at the
+    /// pressure-driven rate instead of being suppressed below 100 degC.
+    #[test]
+    fn cold_compressed_liquid_does_not_boil_and_discharges_liquid() {
+        let m = V_VESSEL_FLUID * sat_t(40.0).rho_f * 1.001;
+        let mut v = sealed_at(40.0, m, 0.0);
+        assert!(v.eos.solid && v.eos.subcooled && v.eos.p > 1.0e6, "{:?}", v.eos);
+        assert!(v.core_sat().t > 150.0, "core T_sat {}", v.core_sat().t);
+        assert_eq!(core_th(&v.core_sat(), 500.0, 30.0e6, steam::h_liquid(40.0)).alpha_avg, 0.0);
+        assert!((v.steam_line_density() - m / V_VESSEL_FLUID).abs() < 1e-9);
+        let mut line = crate::bop::SteamSystem::new(true);
+        line.tcv_pos = 0.05;
+        line.compute_flows_from(v.eos.p, v.steam_line_enthalpy(), v.steam_line_density(), true);
+        let w = line.total_flow();
+        assert!(w > 1.0 && line.p_chest > P_ATM, "w {w}, chest {}", line.p_chest);
+        let inp = VesselInputs { q_core: 0.0, q_ic: 0.0, w_feed: 0.0, h_feed: 0.0, w_steam: w, w_liquid_out: 0.0 };
+        v.step(0.01, &inp);
+        assert!(v.last_error.is_none(), "{:?}", v.last_error);
+        assert!((v.flows.w_steam - w).abs() < 1e-9 * w, "delivered {} of {w}", v.flows.w_steam);
+        assert!(v.flows.h_steam < sat_t(100.0).h_f, "liquid enthalpy {}", v.flows.h_steam);
+    }
+
+    /// R2: sealed, gas-bearing pressure/temperature sweep across 100 degC.
+    /// Total pressure, core boiling temperature, core void and the main-line
+    /// request all move continuously (no 100 degC switch).
+    #[test]
+    fn sealed_sweep_across_100c_is_continuous() {
+        let (mass, gas, q, w_core) = (180_000.0, 100.0, 8.7e6, 500.0);
+        let mut prev: Option<[f64; 4]> = None;
+        let mut t = 98.0;
+        while t <= 102.0 + 1e-9 {
+            let v = sealed_at(t, mass, gas);
+            let s = v.core_sat();
+            let void = core_th(&s, w_core, q, steam::h_liquid(t).min(s.h_f)).alpha_avg;
+            let mut line = crate::bop::SteamSystem::new(true);
+            line.tcv_pos = 0.1;
+            line.compute_flows_from(v.eos.p, v.steam_line_enthalpy(), v.steam_line_density(), true);
+            let now = [v.eos.p, s.t, void, line.total_flow()];
+            assert!(now[3] > 0.0, "pressurized line must flow at {t} degC");
+            if let Some(p) = prev {
+                assert!((now[0] - p[0]).abs() < 2.0e-3 * p[0], "{t}: p {} -> {}", p[0], now[0]);
+                assert!((now[1] - p[1]).abs() < 0.1, "{t}: T_sat {} -> {}", p[1], now[1]);
+                assert!((now[2] - p[2]).abs() < 1e-3, "{t}: void {} -> {}", p[2], now[2]);
+                assert!((now[3] - p[3]).abs() < 0.02 * p[3], "{t}: line {} -> {}", p[3], now[3]);
+            }
+            prev = Some(now);
+            t += 0.02;
+        }
     }
 }

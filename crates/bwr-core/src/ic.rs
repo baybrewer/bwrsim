@@ -155,7 +155,13 @@ impl IcTrain {
         let dt_drive = if steam_available { (t_sat - self.pool_t).max(0.0) } else { 0.0 };
         let target_q = ua() * dt_drive * valve_pos.sqrt() * coverage;
         // Tubes drain and fill with steam over ~20 s; no steam means no duty at all.
-        let q_lag = if steam_available { self.heat + (target_q - self.heat) * (dt / 20.0).min(1.0) } else { 0.0 };
+        // The exchanger is algebraic (no tube-metal energy store), so the lagged
+        // duty is condensation of current primary steam and may never exceed what
+        // the instantaneous primary-to-pool drive can pass through the full tube
+        // area: it falls continuously to zero as the primary cools to the pool
+        // temperature and never moves heat uphill into a hotter pool (R1).
+        let q_drive_max = ua() * dt_drive;
+        let q_lag = if steam_available { (self.heat + (target_q - self.heat) * (dt / 20.0).min(1.0)).min(q_drive_max) } else { 0.0 };
         // Stored condensate drains through the return valve (standby inventory
         // first); condensation stops once the primary side is flooded.
         let w_return = (valve_pos * self.tube_mass / IC_DRAIN_TAU).min(self.tube_mass / dt);
@@ -361,6 +367,61 @@ mod tests {
             assert!((dm_half - 0.5 * dm_full).abs() < 1e-9, "{dm_half} vs {dm_full}");
             // Steam in less condensate stored equals the pool duty, at any ratio.
             assert!((rh.w_steam_in * (rh.h_steam_in - req.h_condensate) - rh.q_pool).abs() < 1e-6 * rh.q_pool);
+        }
+    }
+
+    /// R1 (both round-4 reviews): with no tube-metal energy store, primary
+    /// steam no hotter than the pool condenses nothing, whatever the preceding
+    /// duty, under timestep refinement.
+    #[test]
+    fn no_duty_into_an_equal_or_hotter_pool() {
+        for dt in [0.05, 0.01] {
+            for (t_primary, pool_t) in [(100.0, 100.0), (90.0, 100.0), (99.99, 100.0), (60.0, 80.0)] {
+                let mut t = open_train();
+                t.heat = 5.0e6;
+                t.pool_t = pool_t;
+                let req = t.request(dt, t_primary, true);
+                assert_eq!((req.q_pool, req.w_steam_in, req.q_rejected), (0.0, 0.0, 0.0), "dt {dt} {t_primary}/{pool_t}: {req:?}");
+                let r = t.step_full(dt, t_primary, true);
+                assert_eq!(r.q_pool, 0.0);
+                assert!(t.pool_t <= pool_t && t.boiloff_kg == 0.0, "pool heated by colder primary");
+            }
+        }
+    }
+
+    /// R1: a cooldown through a 100 degC boiling pool. The duty never exceeds
+    /// the instantaneous drive, falls continuously to zero as the primary
+    /// reaches the pool temperature and stays zero below it.
+    #[test]
+    fn cooldown_crossing_pool_temperature_takes_duty_continuously_to_zero() {
+        for dt in [0.05, 0.01] {
+            let mut t = open_train();
+            t.pool_t = 100.0;
+            // Lagged duty well above what the shrinking drive can pass.
+            t.heat = 5.0e6;
+            let (t_start, rate) = (101.0, -0.01);
+            let mut prev_q: Option<f64> = None;
+            let mut max_jump: f64 = 0.0;
+            for i in 0..(200.0 / dt) as usize {
+                let t_primary = t_start + rate * i as f64 * dt;
+                let drive_max = ua() * (t_primary - t.pool_t).max(0.0);
+                let q = t.step_full(dt, t_primary, true).q_pool;
+                assert!(q <= drive_max * (1.0 + 1e-12), "dt {dt} T {t_primary}: q {q} > {drive_max}");
+                if t_primary <= t.pool_t {
+                    assert_eq!(q, 0.0, "dt {dt}: duty {q} W into a pool at {} from {t_primary}", t.pool_t);
+                }
+                if let Some(p) = prev_q {
+                    // After the first step clips the lag to the drive, the duty
+                    // follows the drive: no step jumps by more than the drive's own change.
+                    if i > 1 {
+                        max_jump = max_jump.max((q - p).abs());
+                    }
+                }
+                prev_q = Some(q);
+            }
+            let drive_step = ua() * rate.abs() * dt;
+            assert!(max_jump <= drive_step * (1.0 + 1e-9), "dt {dt}: jump {max_jump} W > drive change {drive_step} W");
+            assert_eq!(t.heat, 0.0);
         }
     }
 }

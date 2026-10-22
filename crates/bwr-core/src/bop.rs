@@ -63,17 +63,28 @@ impl SteamSystem {
     /// Steam flows for the current valve positions at dome pressure `p`, taking the
     /// vessel outlet as saturated vapour at `p`.
     pub fn compute_flows(&mut self, p: f64, tsv_open: bool) {
-        self.compute_flows_from(p, sat_p(p.max(P_ATM)).h_g, tsv_open);
+        let s = sat_p(p.max(P_ATM));
+        self.compute_flows_from(p, s.h_g, s.rho_g, tsv_open);
     }
 
     /// Steam flows for the current valve positions at dome pressure `p` with vessel
-    /// outlet enthalpy `h_in`. No heat or work is exchanged in the line or the
-    /// throttles, so the delivered enthalpy equals `h_in`.
-    pub fn compute_flows_from(&mut self, p: f64, h_in: f64, tsv_open: bool) {
+    /// outlet enthalpy `h_in` and inlet density `rho_in` (homogeneous density for
+    /// a mixture). No heat or work is exchanged in the line or the throttles, so
+    /// the delivered enthalpy equals `h_in`.
+    ///
+    /// Both resistances are steam calibrations, corrected for the inlet density
+    /// at equal mass flow (R3): the line is Darcy friction, dp = K w^2 / rho, with
+    /// K fixed by the rated-steam calibration, so its coefficient scales by
+    /// rho_rated / rho_in. The valves' pressure-linear law is the choked-vapour
+    /// law, whose density (proportional to inlet pressure) is already built in;
+    /// its resistance therefore scales by rho_vapour(p) / rho_in, which is 1 for
+    /// saturated vapour at every pressure. At rated steam both factors are 1.
+    pub fn compute_flows_from(&mut self, p: f64, h_in: f64, rho_in: f64, tsv_open: bool) {
         self.h_steam = h_in;
         let m = self.msiv_open_fraction();
-        let a_tcv = if tsv_open { C_TCV * self.tcv_pos } else { 0.0 };
-        let a_byp = C_BYPASS * self.bypass_pos;
+        let (line_factor, valve_factor) = Self::density_factors(p, rho_in);
+        let a_tcv = if tsv_open { C_TCV * self.tcv_pos * valve_factor } else { 0.0 };
+        let a_byp = C_BYPASS * self.bypass_pos * valve_factor;
         let a = a_tcv + a_byp;
         let p_eff = (p - P_ATM).max(0.0);
         self.p_line_inlet = p;
@@ -84,12 +95,23 @@ impl SteamSystem {
             self.p_chest = if m < 1e-4 { 0.0 } else { p };
             return;
         }
-        let k = STEAM_LINE_DP / (STEAM_FLOW_RATED * STEAM_FLOW_RATED) / (m * m);
+        let k = STEAM_LINE_DP / (STEAM_FLOW_RATED * STEAM_FLOW_RATED) / (m * m) * line_factor;
         let w = (-1.0 + (1.0 + 4.0 * a * a * k * p_eff).sqrt()) / (2.0 * a * k);
         self.k_line = k;
         self.p_chest = p - k * w * w;
         self.w_tcv = a_tcv * (self.p_chest - P_ATM).max(0.0);
         self.w_bypass = a_byp * (self.p_chest - P_ATM).max(0.0);
+    }
+
+    /// (line resistance multiplier, valve conductance multiplier) for an inlet
+    /// of density `rho_in` at pressure `p`; see `compute_flows_from`.
+    fn density_factors(p: f64, rho_in: f64) -> (f64, f64) {
+        if !(rho_in.is_finite() && rho_in > 0.0) {
+            return (1.0, 1.0);
+        }
+        let rho_rated = sat_p(P_RATED).rho_g;
+        let rho_vapour = sat_p(p.max(P_ATM)).rho_g;
+        (rho_rated / rho_in, rho_in / rho_vapour)
     }
 
     pub fn total_flow(&self) -> f64 {
@@ -1161,6 +1183,57 @@ mod tests {
         assert!((s.h_steam - h_in).abs() < 1.0, "delivered {} vs inlet {}", s.h_steam, h_in);
         // The old model resaturated at chest pressure, which differs by > 1 kJ/kg.
         assert!((sat_p(s.p_chest).h_g - h_in).abs() > 1.0e3);
+    }
+
+    /// R3: rated saturated steam sees exactly the old steam calibration.
+    #[test]
+    fn rated_steam_hydraulics_are_unchanged_by_density_scaling() {
+        let mut s = SteamSystem::new(true);
+        s.tcv_pos = 0.85;
+        s.bypass_pos = 0.1;
+        s.compute_flows(P_RATED, true);
+        // The pre-R3 solve, written out independently.
+        let a = C_TCV * 0.85 + C_BYPASS * 0.1;
+        let k = STEAM_LINE_DP / (STEAM_FLOW_RATED * STEAM_FLOW_RATED);
+        let w = (-1.0 + (1.0 + 4.0 * a * a * k * (P_RATED - P_ATM)).sqrt()) / (2.0 * a * k);
+        let p_chest = P_RATED - k * w * w;
+        assert!((s.total_flow() - w).abs() <= 1e-9 * w, "{} vs {w}", s.total_flow());
+        assert!((s.p_chest - p_chest).abs() <= 1e-9 * p_chest, "{} vs {p_chest}", s.p_chest);
+    }
+
+    /// R3 (both reviews' 200 degC water-solid fixture): liquid at 3.834878 MPa,
+    /// 866.4 kg/m3, solved against an independent density-scaled calculation.
+    /// At the reviewers' 242.48 kg/s the line loss falls from the steam-
+    /// calibrated 53.23 kPa to ~2.316 kPa (factor rho_rated/rho_liquid ~ 22.98).
+    #[test]
+    fn liquid_line_and_valve_resistance_scale_with_inlet_density() {
+        let (p, rho) = (3.834878e6, 866.396863);
+        let (tcv, byp) = (0.3, 0.2);
+        let mut s = SteamSystem::new(true);
+        s.tcv_pos = tcv;
+        s.bypass_pos = byp;
+        s.compute_flows_from(p, steam::h_liquid(200.0), rho, true);
+        let rho_rated = sat_p(P_RATED).rho_g;
+        assert!((rho_rated - 37.696617).abs() < 0.02 * 37.696617, "table rho_g(rated) {rho_rated}");
+        let k = STEAM_LINE_DP / (STEAM_FLOW_RATED * STEAM_FLOW_RATED) * rho_rated / rho;
+        assert!((k * 242.481409f64.powi(2) - 2316.2).abs() < 0.02 * 2316.2, "line loss {}", k * 242.481409f64.powi(2));
+        let a = (C_TCV * tcv + C_BYPASS * byp) * rho / sat_p(p).rho_g;
+        // Independent bisection of k w^2 + w / a = p - P_ATM.
+        let (mut lo, mut hi) = (0.0, 1.0e5);
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if k * mid * mid + mid / a < p - P_ATM { lo = mid } else { hi = mid }
+        }
+        let w = lo;
+        assert!((s.total_flow() - w).abs() <= 1e-9 * w, "{} vs {w}", s.total_flow());
+        assert!((s.p_chest - (p - k * w * w)).abs() <= 1e-6 * p, "chest {}", s.p_chest);
+        assert!((s.k_line - k).abs() <= 1e-12 * k);
+        // A supply-limited commit stays on the same density-scaled relations.
+        s.limit_to_delivered(0.5 * w);
+        let wd = s.total_flow();
+        assert!((wd - 0.5 * w).abs() < 1e-9 * w);
+        assert!((wd - a * (s.p_chest - P_ATM)).abs() < 1e-9 * w, "valve law off at delivered flow");
+        assert!((s.p_line_inlet - (s.p_chest + k * wd * wd)).abs() < 1e-6, "line law off at delivered flow");
     }
 
     #[test]

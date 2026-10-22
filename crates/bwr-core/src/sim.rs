@@ -8,7 +8,7 @@ use crate::bop::{Condenser, Feedwater, LevelControlMode, SteamSystem, Turbine, T
 use crate::ic::IcTrain;
 use crate::params::*;
 use crate::reactor::{Core, DecayHeat, Xenon, ROD_GRID};
-use crate::steam::{sat_p, P_ATM};
+use crate::steam::sat_p;
 use crate::vessel::{IcPorts, Vessel, VesselInputs};
 
 /// Fixed physics time step, s.
@@ -437,9 +437,11 @@ impl Sim {
         // The flow transmitter reads what last left the vessel (committed below),
         // not this step's hydraulic request, which the vessel may not supply (R6).
         let w_steam_measured = self.steam.total_flow();
-        let p_line = if self.vessel.eos.subcooled { P_ATM } else { p };
-        // The line carries what the vessel debits: displaced liquid when water-solid.
-        self.steam.compute_flows_from(p_line, self.vessel.steam_line_enthalpy(), !self.turbine.tripped);
+        // The line carries what the vessel debits (displaced liquid when
+        // water-solid) at that fluid's density, driven by total mechanical
+        // pressure at any temperature (R2/R3).
+        let (h_line, rho_line) = (self.vessel.steam_line_enthalpy(), self.vessel.steam_line_density());
+        self.steam.compute_flows_from(p, h_line, rho_line, !self.turbine.tripped);
 
         // --- isolation condensers: requests only; nothing is committed until
         // the vessel has decided how much IC steam it can supply. `t_cool` (not
@@ -447,7 +449,7 @@ impl Sim {
         // Availability is the vapour phase itself (present at any temperature in
         // the equilibrium EOS), not the 100 C core-boiling shortcut; the vessel
         // still bounds the accepted draw by its vapour mass (R4).
-        let steam_avail = !self.vessel.eos.solid && self.vessel.eos.x > 0.0;
+        let steam_avail = self.vessel.vapour_available();
         let ic_req: Vec<_> = self.ic.iter().map(|t| t.request(dt, t_cool, steam_avail)).collect();
         debug_assert!(ic_req.iter().all(|r| r.w_steam_in == 0.0 || r.h_steam_in == self.vessel.steam_port_enthalpy()));
         let mut ic_ports = IcPorts::default();
@@ -535,6 +537,7 @@ impl Sim {
             self.event("isolation", format!("MSIV isolation: {}", iso[0]));
         }
         let msiv_open = self.msivs_open();
+        // Plant-mode criterion (not in cold shutdown), not a physics gate.
         let isolated_at_power = self.prev_msiv_open && !msiv_open && !self.vessel.eos.subcooled
             && self.steam.msiv_pos.iter().all(|&p| p < 0.1);
         if self.steam.msiv_pos.iter().all(|&p| p < 0.1) || msiv_open {
@@ -851,6 +854,7 @@ impl Sim {
         if self.vessel.eos.solid {
             add("solid", "REACTOR VESSEL WATER SOLID".into(), Severity::Alarm);
         }
+        // Plant-mode alarm: MSIVs are normally shut in cold shutdown.
         if !self.msivs_open() && !self.vessel.eos.subcooled {
             add("msiv", "MAIN STEAM ISOLATED".into(), Severity::Alarm);
         }
@@ -866,7 +870,9 @@ impl Sim {
         if self.cond.pressure() > 15.0e3 && !self.turbine.tripped {
             add("vac", "CONDENSER VACUUM LOW".into(), Severity::Alarm);
         }
-        if !self.cond.available_for_bypass() && !self.vessel.eos.subcooled && p > 1.0e6 {
+        // Mechanical criterion: a pressurized vessel can discharge to the
+        // condenser at any temperature (water-solid included).
+        if !self.cond.available_for_bypass() && p > 1.0e6 {
             add("byp_unavail", "TURBINE BYPASS UNAVAILABLE".into(), Severity::Warning);
         }
         if self.fw.t_feed < 150.0 && n > 0.3 {

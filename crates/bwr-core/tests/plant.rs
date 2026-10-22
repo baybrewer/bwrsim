@@ -1300,3 +1300,36 @@ fn gas_bearing_heatup_with_ic_closes_primary_energy_at_plant_level() {
     assert!((m1 - m0).abs() < 1e-6, "mass created {} kg", m1 - m0);
     assert!((e1 - e0 - external).abs() < 10.0, "energy residual {} J", e1 - e0 - external);
 }
+
+/// R1 (both round-4 reviews): sealed, gas-free 90 degC vessel with all ICs
+/// open into 100 degC pools after 5 MW/train of preceding duty. No primary
+/// steam condenses and no pool heat is accepted, at either timestep.
+#[test]
+fn cold_primary_moves_no_heat_into_hotter_ic_pools() {
+    for dt in [0.05, 0.01] {
+        let mut sim = Sim::new(ScenarioName::ColdShutdown);
+        sim.vessel.head_vent_open = false;
+        sim.vessel.gas_mass = 0.0;
+        let m = sim.vessel.mass;
+        sim.vessel.energy = bwr_core::vessel::energy_for(m, 90.0).unwrap();
+        sim.vessel.eos =
+            bwr_core::vessel::solve_eos_with(m, sim.vessel.energy, bwr_core::vessel::HeadSpace::Sealed { gas_mass: 0.0 }).unwrap();
+        assert!(sim.vessel.vapour_available(), "{:?}", sim.vessel.eos);
+        sim.steam.msiv_cmd = [false; N_STEAM_LINES];
+        sim.steam.msiv_pos = [0.0; N_STEAM_LINES];
+        for t in sim.ic.iter_mut() {
+            t.cmd_open = true;
+            t.valve_pos = 1.0;
+            t.tube_mass = 500.0;
+            t.pool_t = 100.0;
+            t.heat = 5.0e6;
+        }
+        let mut accepted = 0.0;
+        for _ in 0..(1.0 / dt) as usize {
+            assert!(sim.step(dt), "{:?}", sim.model_error);
+            accepted += sim.ic.iter().map(|t| t.last.q_pool * dt).sum::<f64>();
+        }
+        assert_eq!(accepted, 0.0, "dt {dt}: {accepted} J into hotter pools");
+        assert_eq!(sim.vessel.flows.w_ic_steam, 0.0);
+    }
+}
