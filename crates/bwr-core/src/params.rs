@@ -82,16 +82,25 @@ pub const FUEL_RESISTANCE: f64 = 264.0 / (RATED_POWER_W * (1.0 - DIRECT_COOLANT_
 // ---------------------------------------------------------------- vessel
 /// Nominal reactor pressure at rated power, Pa. CONFIRMED (7.2 MPa).
 pub const P_RATED: f64 = 7.2e6;
-/// Vessel inner diameter, m. CONFIRMED (~4 m).
-pub const VESSEL_ID: f64 = 4.0;
-/// Vessel inner height, m. CONFIRMED (~26-27 m).
-pub const VESSEL_HEIGHT: f64 = 26.7;
-/// Elevations above vessel bottom, m. ASSUMED.
-pub const Z_CORE_BOTTOM: f64 = 2.5;
+// Vessel geometry. CONFIRMED for design revision GE Hitachi 005N9751 Rev. J
+// (BWRX-300 General Description), section 3.1.1, printed p. 31:
+// inner diameter ~4.2 m, inner height ~27.36 m, bottom of active fuel ~5.12 m
+// above the vessel bottom. vessel.rs derives the free-volume/elevation model
+// (liquid_volume_below, level_from_volume, driving head) from these constants;
+// the internal layout below is ASSUMED and kept relative to Z_CORE_BOTTOM so
+// it moves with the fuel elevation.
+/// Vessel inner diameter, m. CONFIRMED (Rev. J).
+pub const VESSEL_ID: f64 = 4.2;
+/// Vessel inner height, m. CONFIRMED (Rev. J).
+pub const VESSEL_HEIGHT: f64 = 27.36;
+/// Bottom of active fuel above vessel bottom, m. CONFIRMED (Rev. J).
+pub const Z_CORE_BOTTOM: f64 = 5.12;
+/// Elevations above vessel bottom, m. ASSUMED (relative to the fuel).
 pub const Z_TAF: f64 = Z_CORE_BOTTOM + CORE_HEIGHT;
 pub const CHIMNEY_HEIGHT: f64 = 9.0;
 pub const Z_CHIMNEY_TOP: f64 = Z_TAF + CHIMNEY_HEIGHT;
-pub const Z_DRYER: f64 = 21.0;
+/// Dryer skirt elevation, m. ASSUMED (separator region 5.7 m above the chimney).
+pub const Z_DRYER: f64 = Z_CHIMNEY_TOP + 5.7;
 /// Normal water level elevation, m. ASSUMED.
 pub const Z_NWL: f64 = Z_CHIMNEY_TOP + 3.0;
 
@@ -100,8 +109,10 @@ pub const A_VESSEL: f64 = PI * VESSEL_ID * VESSEL_ID / 4.0;
 pub const A_CORE: f64 = 2.6;
 /// Chimney inner area, m2. ASSUMED.
 pub const A_CHIMNEY: f64 = 8.55;
-/// Downcomer annulus area, m2. ASSUMED.
-pub const A_DOWNCOMER: f64 = A_VESSEL - PI * 3.5 * 3.5 / 4.0;
+/// Shroud / chimney outer diameter, m. ASSUMED.
+pub const SHROUD_OD: f64 = 3.5;
+/// Downcomer annulus area, m2. Derived from the vessel ID and shroud OD.
+pub const A_DOWNCOMER: f64 = A_VESSEL - PI * SHROUD_OD * SHROUD_OD / 4.0;
 /// Free area for water level between chimney top and dryer skirt, m2. ASSUMED.
 pub const A_SEPARATOR_REGION: f64 = 9.0;
 /// Free area above the dryer skirt, m2. ASSUMED.
@@ -145,6 +156,17 @@ pub const C_TCV: f64 = 1.10 * STEAM_FLOW_RATED / 7.0e6;
 /// Turbine bypass capacity as fraction of rated steam flow. ASSUMED (to verify).
 pub const BYPASS_CAPACITY: f64 = 1.0;
 pub const C_BYPASS: f64 = BYPASS_CAPACITY * STEAM_FLOW_RATED / 7.0e6;
+/// Bypass fast-opening time on a turbine trip / load rejection signal, s.
+/// CONFIRMED: the bypass valves complete fast opening within 300 ms of the
+/// valid trip or load-rejection signal (GE Hitachi 005N9751 Rev. J, section
+/// 5.1.4, printed p. 56). Modelled as a linear full stroke, so the fast-open
+/// stroke rate is 1 / BYPASS_FAST_OPEN_TIME full strokes per second.
+pub const BYPASS_FAST_OPEN_TIME: f64 = 0.3;
+pub const BYPASS_FAST_OPEN_RATE: f64 = 1.0 / BYPASS_FAST_OPEN_TIME;
+/// Bypass stroke rate under ordinary pressure-regulating motion, strokes/s. ASSUMED.
+pub const BYPASS_REG_RATE: f64 = 2.0;
+/// Bypass stroke rate under manual control, strokes/s. ASSUMED.
+pub const BYPASS_MANUAL_RATE: f64 = 0.2;
 /// Pressure regulator: steam demand rises 100 % per this many Pa above setpoint.
 pub const PRESSURE_REG_SPAN: f64 = 0.25e6;
 /// Default pressure setpoint, Pa (gives 7.2 MPa dome pressure at rated steam flow).
@@ -153,15 +175,29 @@ pub const PRESSURE_SETPOINT_DEFAULT: f64 = 6.95e6;
 /// (gives ~315 MWe gross / ~300 MWe net).
 pub const TURBINE_DH_RATED: f64 = 0.703e6;
 pub const GENERATOR_EFF: f64 = 0.985;
-pub const RATED_RPM: f64 = 1800.0;
+// Turbine-generator: 3,000/3,600 rpm turbine with a direct-driven 50/60 Hz
+// generator. CONFIRMED (GE Hitachi 005N9751 Rev. J, section 5.1.2, printed
+// p. 55). The 60 Hz North American configuration is modelled: 3,600 rpm,
+// two-pole generator, electrical frequency f = rpm * poles / 120 = rpm / 60.
 pub const GRID_HZ: f64 = 60.0;
-/// Turbine-generator inertia, kg m2 (H ~ 4 s on 330 MVA). ASSUMED.
-pub const TG_INERTIA: f64 = 74_300.0;
+pub const GENERATOR_POLES: f64 = 2.0;
+pub const RATED_RPM: f64 = 120.0 * GRID_HZ / GENERATOR_POLES;
+/// Rated angular speed, rad/s.
+pub const OMEGA_RATED: f64 = RATED_RPM * 2.0 * PI / 60.0;
+/// Generator apparent power rating, VA. ASSUMED.
+pub const TG_MVA: f64 = 330.0e6;
+/// Turbine-generator inertia constant H, s. ASSUMED.
+pub const TG_H_S: f64 = 4.0;
+/// Turbine-generator inertia, kg m2, derived as J = 2 H S / omega_rated^2
+/// (~18,576 kg m2 for H = 4 s on 330 MVA at 3,600 rpm).
+pub const TG_INERTIA: f64 = 2.0 * TG_H_S * TG_MVA / (OMEGA_RATED * OMEGA_RATED);
 /// No-load windage and friction losses at rated speed, W. ASSUMED.
 pub const TG_LOSSES: f64 = 8.0e6;
-pub const OVERSPEED_TRIP_RPM: f64 = 1980.0;
+/// Mechanical overspeed trip ratio. ASSUMED (110 % of rated, 3,960 rpm).
+pub const OVERSPEED_TRIP_RATIO: f64 = 1.10;
+pub const OVERSPEED_TRIP_RPM: f64 = OVERSPEED_TRIP_RATIO * RATED_RPM;
 /// Speed reference ramp, rpm per second.
-pub const SPEED_RAMP: f64 = 5.0;
+pub const SPEED_RAMP: f64 = 10.0;
 
 // ---------------------------------------------------------------- condenser & feedwater
 pub const CW_INLET_C: f64 = 20.0;
@@ -178,15 +214,47 @@ pub const CONDENSER_TRIP_P: f64 = 25.0e3;
 /// Bypass valves are blocked above this condenser pressure, Pa.
 pub const CONDENSER_BYPASS_BLOCK_P: f64 = 30.0e3;
 pub const HOTWELL_CAPACITY: f64 = 120_000.0;
+/// Condenser shell, tube and structure heat capacity lumped with the hotwell
+/// water, J/K. ASSUMED (~400 t of steel/copper alloy).
+pub const CONDENSER_METAL_HEAT_CAP: f64 = 400.0e3 * 450.0;
+/// Specific heat of cooling water / condensate, J/(kg K).
+pub const CP_WATER: f64 = 4186.0;
+/// Condensate storage tank temperature (makeup water), degC. ASSUMED.
+pub const CST_TEMP_C: f64 = 30.0;
+/// Hotwell makeup / reject transfer rate to the condensate storage tank, kg/s. ASSUMED.
+pub const HOTWELL_TRANSFER_RATE: f64 = 30.0;
+/// Hotwell level band (fraction of capacity) outside which makeup / reject runs.
+pub const HOTWELL_MAKEUP_FRAC: f64 = 0.40;
+pub const HOTWELL_REJECT_FRAC: f64 = 0.85;
+/// Condenser shell relief pressure, Pa (rupture discs). ASSUMED.
+pub const CONDENSER_RELIEF_P: f64 = 1.2 * 101_325.0;
 
-pub const N_FEED_PUMPS: usize = 3;
+// Reactor feed pumps: two 100 % capacity pumps with adjustable-speed drives.
+// CONFIRMED (GE Hitachi 005N9751 Rev. J, section 5.1.6, printed p. 57; also
+// NEDO-34173 Rev. B, section 10.2.2). Pump curve coefficients are ASSUMED.
+pub const N_FEED_PUMPS: usize = 2;
 pub const N_COND_PUMPS: usize = 2;
-/// Feed pump shutoff differential pressure, Pa. ASSUMED.
+/// Feed pump shutoff differential pressure at full speed, Pa. ASSUMED.
 pub const FW_PUMP_SHUTOFF_DP: f64 = 9.5e6;
-/// Feed pump runout flow, kg/s. ASSUMED (3 x 50 % pumps).
-pub const FW_PUMP_RUNOUT: f64 = 400.0;
+/// Feed pump runout flow at full speed, kg/s. ASSUMED: one pump delivers
+/// rated feed flow against rated vessel pressure at ~96 % speed.
+pub const FW_PUMP_RUNOUT: f64 = 800.0;
+/// Adjustable-speed drive minimum speed, per unit of rated. ASSUMED.
+pub const FW_PUMP_MIN_SPEED: f64 = 0.80;
+/// Drive speed ramp rate, per unit per second. ASSUMED.
+pub const FW_PUMP_SPEED_RATE: f64 = 0.05;
+/// Coast-down rate of a stopped pump, per unit per second. ASSUMED.
+pub const FW_PUMP_COASTDOWN_RATE: f64 = 0.20;
 /// Condensate (booster) pressure at feed pump suction, Pa.
 pub const CONDENSATE_PRESSURE: f64 = 1.5e6;
+/// Feedwater heater train (shells, tubes, water) lumped heat capacity, J/K.
+/// ASSUMED: gives a ~180 s outlet-temperature time constant at rated flow.
+pub const FW_HEATER_HEAT_CAP: f64 = 3.5e8;
+/// Extraction heat available per kg of turbine steam, J/kg. ASSUMED: ~10 %
+/// above the rated feedwater heating demand (h_f(215 degC) - h_f(35 degC)).
+pub const FW_EXTRACTION_HEAT_PER_KG: f64 = 0.85e6;
+/// Feed pump temperature rise from pumping work, degC. ASSUMED.
+pub const FW_PUMP_TEMP_RISE: f64 = 2.0;
 /// Feedwater control valve coefficient at full open, kg/s per sqrt(Pa) (equal-percentage trim).
 pub const C_FCV: f64 = 1.75;
 
