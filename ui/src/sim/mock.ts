@@ -543,7 +543,8 @@ export class MockSim {
   private updateVoids(dt?: number) {
     const v = this.s.vessel;
     const q = this.s.neutronics.thermalPowerMw / RATED_MWT;
-    const sat = v.coolantTempC >= tsat(v.pressureMpa - v.headGasPressureMpa) - 0.5 && v.pressureMpa > 0.15;
+    // Bubbles inside the core liquid oppose total mechanical pressure (gas included), as in the engine's core_sat().
+    const sat = v.coolantTempC >= tsat(v.pressureMpa) - 0.5 && v.pressureMpa > 0.15;
     const pScale = clamp(7.2 / Math.max(v.pressureMpa, 0.5), 1, 4);
     const target = sat ? clamp(0.38 * Math.sqrt(Math.max(q, 0)) * Math.sqrt(pScale), 0, 0.75) : 0;
     v.coreAvgVoid = dt === undefined ? target : v.coreAvgVoid + (target - v.coreAvgVoid) * Math.min(1, dt / 1.5);
@@ -727,7 +728,7 @@ export class MockSim {
     const hSteam = 2770;
     const hFeed = 4.19 * fw.feedTempC;
     const hLiquid = 4.19 * v.coolantTempC * 1.1;
-    // Boiling is set by the vapour partial pressure; trapped gas raises only the total.
+    // Free-surface boil-off is set by the vapour partial pressure; trapped gas raises only the total.
     const tSat = tsat(v.pressureMpa - v.headGasPressureMpa);
     const boiling = v.coolantTempC >= tSat - 0.5 && v.coolantTempC > 100;
     const qSteam = boiling ? (v.steamFlowKgs * (hSteam - hLiquid)) / 1000 : 0;
@@ -741,7 +742,8 @@ export class MockSim {
     if (v.headVentOpen && v.coolantTempC > 100 && v.pressureMpa < 0.2) v.coolantTempC = 100;
     v.heatupRateCph = v.heatupRateCph + (((v.coolantTempC - prevT) / dt) * 3600 - v.heatupRateCph) * Math.min(1, dt / 30);
     this.updateHeadSpace();
-    v.coreInletSubcoolingKjKg = Math.max(0, 4.19 * (tSat - (v.coolantTempC * 0.9 + fw.feedTempC * 0.1)));
+    // Inlet subcooling is measured against core boiling, i.e. total pressure after the head-space update.
+    v.coreInletSubcoolingKjKg = Math.max(0, 4.19 * (tsat(v.pressureMpa) - (v.coolantTempC * 0.9 + fw.feedTempC * 0.1)));
 
     // Inventory: 8900 kg per metre of level, plus void swell
     const boilOff = boiling ? v.steamFlowKgs : 0;

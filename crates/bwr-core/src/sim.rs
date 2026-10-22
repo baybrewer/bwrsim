@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::api::{self, Command, ModeSwitch, ScenarioName, Severity, Snapshot};
-use crate::bop::{Condenser, Feedwater, LevelControlMode, SteamSystem, Turbine};
+use crate::bop::{Condenser, Feedwater, LevelControlMode, SteamSystem, Turbine, TurbineInlet};
 use crate::ic::IcTrain;
 use crate::params::*;
 use crate::reactor::{Core, DecayHeat, Xenon, ROD_GRID};
@@ -444,7 +444,10 @@ impl Sim {
         // --- isolation condensers: requests only; nothing is committed until
         // the vessel has decided how much IC steam it can supply. `t_cool` (not
         // sat_p(p)) is the condensing temperature: sealed gas raises total pressure.
-        let steam_avail = !self.vessel.eos.subcooled;
+        // Availability is the vapour phase itself (present at any temperature in
+        // the equilibrium EOS), not the 100 C core-boiling shortcut; the vessel
+        // still bounds the accepted draw by its vapour mass (R4).
+        let steam_avail = !self.vessel.eos.solid && self.vessel.eos.x > 0.0;
         let ic_req: Vec<_> = self.ic.iter().map(|t| t.request(dt, t_cool, steam_avail)).collect();
         debug_assert!(ic_req.iter().all(|r| r.w_steam_in == 0.0 || r.h_steam_in == self.vessel.steam_port_enthalpy()));
         let mut ic_ports = IcPorts::default();
@@ -491,17 +494,18 @@ impl Sim {
         // --- turbine, heaters and condenser, on the outflows the vessel actually
         // delivered (bounded by its phase inventory), not on the valve requests.
         let f = self.vessel.flows;
-        let steam_req = self.steam.total_flow();
-        let accepted = if steam_req > 0.0 { f.w_steam / steam_req } else { 0.0 };
         // Commit the delivered allocation over the hydraulic request: the snapshot,
         // protection and next step's level control must see flow that left (R6).
         // The request is rebuilt from valve positions every step, so nothing is lost.
-        self.steam.w_tcv *= accepted;
-        self.steam.w_bypass *= accepted;
+        // Chest pressure is re-solved with the flow so both stay one hydraulic state (R2).
+        self.steam.limit_to_delivered(f.w_steam);
         let (w_tcv, w_byp) = (self.steam.w_tcv, self.steam.w_bypass);
-        // Extraction is funded only by steam the turbine received (Sol N2).
-        self.fw.step_heater(dt, w_feed, w_tcv, self.cond.hotwell_t());
-        self.turbine.step(dt, w_tcv, self.steam.p_chest, self.cond.pressure());
+        // Work and extraction come only from the vapour the turbine received, out
+        // of one available-energy budget (Sol N2, R1).
+        let inlet = TurbineInlet::new(w_tcv, f.h_steam, self.steam.p_chest, self.cond.pressure());
+        self.turbine.step(dt, &inlet);
+        let q_budget = inlet.extraction_budget(self.turbine.p_mech);
+        self.fw.step_heater_capped(dt, w_feed, inlet.w_vapour, q_budget, self.cond.hotwell_t());
         // Gross enthalpy into the condenser shell, net of turbine work and of the
         // extraction heat the feedwater heaters actually took this step.
         let w_in = w_tcv + w_byp + f.w_liquid;

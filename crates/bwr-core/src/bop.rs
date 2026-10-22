@@ -19,6 +19,12 @@ pub struct SteamSystem {
     pub w_tcv: f64,
     pub w_bypass: f64,
     pub p_chest: f64,
+    /// Steam-line inlet pressure of the committed hydraulic state, Pa: dome
+    /// pressure while the vessel supplies the hydraulic request, lower when the
+    /// vessel's phase inventory limits delivery (see `limit_to_delivered`).
+    pub p_line_inlet: f64,
+    /// Line resistance of the last flow solution, Pa/(kg/s)^2.
+    pub k_line: f64,
     /// Specific enthalpy of the steam delivered to the turbine and bypass, J/kg.
     /// The steam line and valve throttling are isenthalpic: this is the vessel
     /// outlet enthalpy, not the saturated-vapour enthalpy at chest pressure.
@@ -43,6 +49,8 @@ impl SteamSystem {
             w_tcv: 0.0,
             w_bypass: 0.0,
             p_chest: 0.0,
+            p_line_inlet: 0.0,
+            k_line: 0.0,
             h_steam: sat_p(P_ATM).h_g,
             fast_open_latch: 0.0,
         }
@@ -68,6 +76,8 @@ impl SteamSystem {
         let a_byp = C_BYPASS * self.bypass_pos;
         let a = a_tcv + a_byp;
         let p_eff = (p - P_ATM).max(0.0);
+        self.p_line_inlet = p;
+        self.k_line = 0.0;
         if m < 1e-4 || a < 1e-12 || p_eff <= 0.0 {
             self.w_tcv = 0.0;
             self.w_bypass = 0.0;
@@ -76,6 +86,7 @@ impl SteamSystem {
         }
         let k = STEAM_LINE_DP / (STEAM_FLOW_RATED * STEAM_FLOW_RATED) / (m * m);
         let w = (-1.0 + (1.0 + 4.0 * a * a * k * p_eff).sqrt()) / (2.0 * a * k);
+        self.k_line = k;
         self.p_chest = p - k * w * w;
         self.w_tcv = a_tcv * (self.p_chest - P_ATM).max(0.0);
         self.w_bypass = a_byp * (self.p_chest - P_ATM).max(0.0);
@@ -83,6 +94,28 @@ impl SteamSystem {
 
     pub fn total_flow(&self) -> f64 {
         self.w_tcv + self.w_bypass
+    }
+
+    /// Commit the flow the vessel actually delivered (`w_delivered`, at most the
+    /// hydraulic request). Valve areas are fixed for the step, so a supply
+    /// shortfall cannot coexist with dome pressure at the line inlet: the
+    /// starved inlet is the explicit supply-limited boundary. The valves pass the
+    /// delivered flow at the chest pressure their own relation gives,
+    /// w = A (p_chest - P_ATM), and the line inlet sits at p_chest + k w^2, below
+    /// dome pressure. Both relations hold at the committed flow, so turbine work,
+    /// the next EHC scan and MSIV protection see one hydraulic state (R2).
+    pub fn limit_to_delivered(&mut self, w_delivered: f64) {
+        let w_req = self.total_flow();
+        if !(w_req > 0.0 && w_delivered < w_req) {
+            return;
+        }
+        let ratio = (w_delivered / w_req).max(0.0);
+        self.w_tcv *= ratio;
+        self.w_bypass *= ratio;
+        // Flow is linear in (p_chest - P_ATM) at fixed area.
+        self.p_chest = P_ATM + ratio * (self.p_chest - P_ATM);
+        let w = self.total_flow();
+        self.p_line_inlet = self.p_chest + self.k_line * w * w;
     }
 
     /// Pressure regulator: total steam flow demand to hold the pressure setpoint, kg/s.
@@ -253,14 +286,16 @@ impl Turbine {
         self.electrical_hz() - GRID_HZ
     }
 
-    /// Advance shaft dynamics given turbine steam flow and pressures.
-    pub fn step(&mut self, dt: f64, w_turbine: f64, p_chest: f64, p_cond: f64) {
+    /// Advance shaft dynamics given the accepted turbine inlet. Only its vapour
+    /// does work, never more per kg than the isentropic bound.
+    pub fn step(&mut self, dt: f64, inlet: &TurbineInlet) {
+        let (p_chest, p_cond) = (inlet.p_chest, inlet.p_cond);
         let pf = if p_chest > p_cond && p_cond > 0.0 {
             ((p_chest / p_cond).ln() / (7.0e6f64 / 5.6e3).ln()).clamp(0.0, 1.2)
         } else {
             0.0
         };
-        self.p_mech = w_turbine * TURBINE_DH_RATED * pf;
+        self.p_mech = inlet.w_vapour * (TURBINE_DH_RATED * pf).min(inlet.work_limit);
         let w_frac = self.speed_rpm / RATED_RPM;
         let losses = TG_LOSSES * w_frac * w_frac + 0.5e6 * w_frac.min(1.0) * (self.speed_rpm > 1.0) as i32 as f64;
 
@@ -311,6 +346,59 @@ impl Turbine {
         }
         self.breaker_closed = true;
         Ok(())
+    }
+}
+
+// ------------------------------------------------------------------ turbine inlet
+
+/// Phase split and energy budget of the flow the turbine accepted this step.
+/// Throttling to chest pressure is isenthalpic, so the inlet quality there
+/// follows from the delivered enthalpy. Only the vapour expands through the
+/// blading and feeds the extraction heaters; the liquid fraction (carryover or
+/// a water-solid discharge) drains to the condenser at its own enthalpy with
+/// no work (R1).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TurbineInlet {
+    /// Total accepted flow, kg/s, and its enthalpy, J/kg.
+    pub w: f64,
+    pub h: f64,
+    /// Vapour fraction, kg/s, and its enthalpy at chest pressure, J/kg.
+    pub w_vapour: f64,
+    pub h_vapour: f64,
+    /// Liquid fraction, kg/s, and its enthalpy, J/kg.
+    pub w_liquid: f64,
+    pub h_liquid: f64,
+    pub p_chest: f64,
+    pub p_cond: f64,
+    /// Shaft work bound per kg of vapour, J/kg: TURBINE_ETA_IS times the
+    /// isentropic drop from the vapour state at chest pressure to the condenser.
+    pub work_limit: f64,
+    /// Saturated-liquid enthalpy at condenser pressure, J/kg: the lowest state
+    /// the vapour's exhaust and extraction drains can reach in the condenser.
+    pub h_floor: f64,
+}
+
+impl TurbineInlet {
+    pub fn new(w: f64, h: f64, p_chest: f64, p_cond: f64) -> Self {
+        let w = w.max(0.0);
+        let h_floor = sat_p(p_cond.max(1.0)).h_f;
+        if !(w > 0.0 && p_chest > 0.0) {
+            return Self { w, h, h_vapour: h, h_liquid: h, w_liquid: w, p_chest, p_cond, h_floor, ..Self::default() };
+        }
+        let s = sat_p(p_chest);
+        let x = ((h - s.h_f) / s.h_fg()).clamp(0.0, 1.0);
+        let h_vapour = if x >= 1.0 { h } else { s.h_g };
+        let h_liquid = if x <= 0.0 { h } else { s.h_f };
+        let w_vapour = w * x;
+        let work_limit = if w_vapour > 0.0 { TURBINE_ETA_IS * steam::isentropic_drop(h_vapour, p_chest, p_cond) } else { 0.0 };
+        Self { w, h, w_vapour, h_vapour, w_liquid: w - w_vapour, h_liquid, p_chest, p_cond, work_limit, h_floor }
+    }
+
+    /// Extraction heat the vapour can still give up after `p_mech` of shaft
+    /// work, W: extraction and exhaust share one available-energy budget, so
+    /// neither can draw the condenser inlet below saturated liquid.
+    pub fn extraction_budget(&self, p_mech: f64) -> f64 {
+        (self.w_vapour * (self.h_vapour - self.h_floor) - p_mech).max(0.0)
     }
 }
 
@@ -1017,6 +1105,13 @@ impl Feedwater {
     /// is the only heat source; the stored energy drains into the feedwater once
     /// that steam is gone.
     pub fn step_heater(&mut self, dt: f64, w_feed: f64, turbine_flow: f64, hotwell_t: f64) {
+        self.step_heater_capped(dt, w_feed, turbine_flow, f64::INFINITY, hotwell_t);
+    }
+
+    /// As `step_heater`, with `turbine_flow` the vapour the turbine expanded and
+    /// extraction also bounded by `q_budget` (W), the energy that vapour has left
+    /// after shaft work (`TurbineInlet::extraction_budget`).
+    pub fn step_heater_capped(&mut self, dt: f64, w_feed: f64, turbine_flow: f64, q_budget: f64, hotwell_t: f64) {
         let w_feed = w_feed.clamp(0.0, self.flow);
         if self.flow > 0.0 {
             let scale = w_feed / self.flow;
@@ -1033,7 +1128,7 @@ impl Feedwater {
         let pumped: f64 = self.pump_flow.iter().sum();
         self.q_pump_w = pumped * CP_WATER * FW_PUMP_TEMP_RISE;
         self.q_loss_w = FW_HEATER_LOSS_UA * (self.t_feed - CST_TEMP_C).max(0.0);
-        self.q_extraction_avail_w = turbine_flow.max(0.0) * FW_EXTRACTION_HEAT_PER_KG * service;
+        self.q_extraction_avail_w = (turbine_flow.max(0.0) * FW_EXTRACTION_HEAT_PER_KG * service).min(q_budget.max(0.0));
         let q_needed = self.flow * (steam::h_liquid(t_des) - h_in) + FW_HEATER_HEAT_CAP * (t_des - self.t_feed) / 60.0
             - self.q_pump_w
             + self.q_loss_w;

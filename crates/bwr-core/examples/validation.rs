@@ -24,8 +24,9 @@
 //! 3. Timestep refinement: one case is rerun at dt = 0.025 s and its peak
 //!    pressure and minimum level must agree with the dt = 0.05 s run.
 //! 4. Outcomes: the startup case must reach criticality and synchronise the
-//!    generator without a scram; the isolation-condenser endurance cases (1, 2
-//!    and 3 trains in service after MSIV closure) must hold pressure below the
+//!    generator without a scram and end within 0.98-1.2 x its 40% power
+//!    target; the isolation-condenser endurance cases (1, 2 and 3 trains in
+//!    service after MSIV closure) must hold pressure below the
 //!    vessel design pressure and remove decay heat (see `ic_endurance_accept`).
 //! 5. Condenser limiting step: cold shutdown, both CW pumps, condenser at 35 degC,
 //!    one public 60 s step against 1 s and DT steps of the same minute.
@@ -126,6 +127,8 @@ fn cases() -> Vec<Case> {
 const STARTUP_S: f64 = 6600.0;
 /// Power the startup driver raises to after synchronisation, fraction of rated.
 const STARTUP_TARGET: f64 = 0.4;
+/// Accepted end power, multiples of `STARTUP_TARGET` (see `startup_accept`).
+const STARTUP_POWER_TOL: (f64, f64) = (0.98, 1.2);
 
 /// State of a closed-loop driver and the milestones it observed.
 #[derive(Default)]
@@ -215,8 +218,12 @@ fn startup_accept(_: &Case, o: &Outcome) -> Vec<String> {
         f.push("generator not online at the end of the run".into());
     }
     let p_end = o.samples.last().map_or(0.0, |r| r[1]);
-    if p_end < 0.5 * STARTUP_TARGET {
-        f.push(format!("power {p_end:.3} at the end, ascension target {STARTUP_TARGET}"));
+    // Lower bound is examples/startup.rs's own success test (98% of target). The
+    // driver only withdraws rods, so it settles ~15% above target (0.46 at
+    // 6600 s); the upper bound catches a runaway ascension without inserting rods.
+    let (lo, hi) = (STARTUP_POWER_TOL.0 * STARTUP_TARGET, STARTUP_POWER_TOL.1 * STARTUP_TARGET);
+    if !(lo..=hi).contains(&p_end) {
+        f.push(format!("power {p_end:.3} at the end, outside [{lo:.3}, {hi:.3}] for target {STARTUP_TARGET}"));
     }
     f
 }
@@ -258,7 +265,8 @@ fn port_balance_step(sim: &mut Sim, dt: f64) -> (f64, f64) {
     let ic_ret_m: f64 = sim.ic.iter().map(|t| t.last.w_cond_return).sum();
     let ic_ret_e: f64 = sim.ic.iter().map(|t| t.last.w_cond_return * t.last.h_return).sum();
     let f = sim.vessel.flows;
-    let (w_steam, w_feed, w_rwcu) = (sim.steam.total_flow(), sim.fw.flow, sim.fw.rwcu_reject);
+    // RWCU is the flow the vessel accepted (phase-limited), not the fw.rwcu_reject request.
+    let (w_steam, w_feed, w_rwcu) = (sim.steam.total_flow(), sim.fw.flow, f.w_liquid);
     let dm = w_feed + ic_ret_m - w_steam - w_rwcu - f.w_vent - ic_in;
     let de = sim.q_core - heat_loss + w_feed * sim.fw.h_feed() + ic_ret_e
         - w_steam * sim.steam.h_steam

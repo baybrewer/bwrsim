@@ -187,6 +187,11 @@ pub const PRESSURE_SETPOINT_DEFAULT: f64 = 6.95e6;
 /// Effective turbine enthalpy drop to shaft at rated conditions, J/kg. ASSUMED
 /// (gives ~315 MWe gross / ~300 MWe net).
 pub const TURBINE_DH_RATED: f64 = 0.703e6;
+/// Turbine isentropic efficiency bounding shaft work per kg of vapour. ASSUMED
+/// (typical LWR saturated-steam turbine, HP + LP with moisture losses); at
+/// rated conditions TURBINE_DH_RATED is ~0.71 of the isentropic drop, so the
+/// bound only acts at off-design states such as wet or low-pressure inlets.
+pub const TURBINE_ETA_IS: f64 = 0.85;
 pub const GENERATOR_EFF: f64 = 0.985;
 // Turbine-generator: 3,000/3,600 rpm turbine with a direct-driven 50/60 Hz
 // generator. CONFIRMED (GE Hitachi 005N9751 Rev. J, section 5.1.2, printed

@@ -932,7 +932,8 @@ fn port_balance_step(sim: &mut Sim) -> (f64, f64) {
     let ic_ret_m: f64 = sim.ic.iter().map(|t| t.last.w_cond_return).sum();
     let ic_ret_e: f64 = sim.ic.iter().map(|t| t.last.w_cond_return * t.last.h_return).sum();
     let f = sim.vessel.flows;
-    let (w_steam, w_feed, w_rwcu) = (sim.steam.total_flow(), sim.fw.flow, sim.fw.rwcu_reject);
+    // RWCU is the flow the vessel accepted (phase-limited), not the fw.rwcu_reject request.
+    let (w_steam, w_feed, w_rwcu) = (sim.steam.total_flow(), sim.fw.flow, f.w_liquid);
     let dm = w_feed + ic_ret_m - w_steam - w_rwcu - f.w_vent - ic_in;
     let de = sim.q_core - heat_loss + w_feed * sim.fw.h_feed() + ic_ret_e
         - w_steam * sim.steam.h_steam
@@ -968,6 +969,31 @@ fn energy_and_mass_close_across_a_turbine_trip() {
     assert!(m_res.abs() <= 1e-3, "mass residual {m_res:.3e} kg");
 }
 
+/// Sol R4 / Astra R5: near-minimum liquid inventory limits the accepted RWCU
+/// flow below the 15 kg/s request. The balance must close with the vessel's
+/// accepted `flows.w_liquid` (a request-based helper invented ~0.74 kg here).
+#[test]
+fn vessel_balance_closes_with_phase_limited_rwcu() {
+    let mut sim = Sim::new(ScenarioName::ColdShutdown);
+    let t = 150.0;
+    let m = 1.00101 * V_VESSEL_FLUID * bwr_core::steam::sat_t(t).rho_g;
+    sim.vessel.head_vent_open = false;
+    sim.vessel.gas_mass = 0.0;
+    sim.vessel.mass = m;
+    sim.vessel.energy = bwr_core::vessel::energy_for(m, t).unwrap();
+    sim.vessel.eos = bwr_core::vessel::solve_eos(m, sim.vessel.energy).expect("eos");
+    sim.apply(Command::SetRwcuReject { kgs: 15.0 });
+    let (m0, e0) = (sim.vessel.mass, sim.vessel.energy);
+    let (dm, de) = port_balance_step(&mut sim);
+    assert!(sim.model_error.is_none(), "{:?}", sim.model_error);
+    let accepted = sim.vessel.flows.w_liquid;
+    assert!(accepted > 0.0 && accepted < 1.0, "accepted RWCU {accepted} kg/s should be phase-limited");
+    let m_res = (sim.vessel.mass - m0) - dm;
+    let e_res = (sim.vessel.energy - e0) - de;
+    assert!(m_res.abs() <= 1e-6, "mass residual {m_res:.3e} kg");
+    assert!(e_res.abs() <= 1.0, "energy residual {e_res:.3e} J");
+}
+
 // ------------------------------------------------------------------ round 2 integration
 
 /// Sol 14 / Astra 14: generator load rejection (breaker opens, no turbine trip)
@@ -1001,7 +1027,7 @@ fn hotwell_exhaustion_does_not_create_vessel_water() {
     let f = sim.vessel.flows;
     let explicit = (sim.cond.makeup_kg - mk0) - (sim.cond.reject_kg - rj0) - (sim.cond.overflow_kg - ov0)
         - (sim.cond.relief_kg - rl0)
-        - 20.0 * (sim.fw.rwcu_reject + f.w_vent);
+        - 20.0 * (f.w_liquid + f.w_vent);
     let ic_in: f64 = sim.ic.iter().map(|t| t.last.w_steam_in - t.last.w_cond_return).sum::<f64>() * 20.0;
     let created = inv(&sim) - m0 - explicit + ic_in;
     assert!(created.abs() < 1.0, "created {created} kg");
@@ -1172,7 +1198,10 @@ fn condenser_rejection_rolls_back_the_plant_step() {
     sim.cond.set_temperature(bwr_core::steam::sat_p(CONDENSER_RELIEF_P).t);
     // Plant steam always brings its own liquid, so (like the vessel EOS fixtures)
     // the unrepresentable state is injected: relief must vent ~440 kg from a
-    // shell holding only this step's returns.
+    // shell holding only this step's returns. No supported sequence reaches it:
+    // loss of CW blocks the bypass and trips the turbine on low vacuum well
+    // below relief pressure, and makeup refills the hotwell (asserted by
+    // `loss_of_cw_with_low_hotwell_is_stopped_by_bypass_block_and_vacuum_trip`).
     sim.cond.energy_j += 1.0e9;
     for t in sim.ic.iter_mut() {
         t.cmd_open = true;
@@ -1182,6 +1211,38 @@ fn condenser_rejection_rolls_back_the_plant_step() {
     assert!(sim.model_error.as_deref().is_some_and(|e| e.contains("condenser")) && sim.paused, "{:?}", sim.model_error);
     assert!(has_alarm(&sim, "model_limit"));
     assert_eq!(transactional_state(&sim), before, "rejected step mutated plant state");
+}
+
+/// Sol R5: the reachable counterpart of the injected-fault test above. From an
+/// equilibrium-consistent full-power state with a nearly empty hotwell, loss
+/// of all CW (public commands) cannot drive the shell to relief dryout:
+/// no CW blocks the bypass, low vacuum trips the turbine, and makeup refills
+/// the hotwell. Every step is accepted, the vessel port balance closes on each,
+/// and the shell stays on its equilibrium.
+#[test]
+fn loss_of_cw_with_low_hotwell_is_stopped_by_bypass_block_and_vacuum_trip() {
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 1.0);
+    sim.cond.hotwell_mass = 0.02 * HOTWELL_CAPACITY;
+    let t_shell = sim.cond.t_sat;
+    sim.cond.set_temperature(t_shell);
+    for index in 0..N_CW_PUMPS {
+        sim.apply(Command::SetCwPump { index, on: false });
+    }
+    let (mut peak_p, mut q_core_j) = (0.0f64, 0.0);
+    for i in 0..(300.0 / DT) as usize {
+        let (m0, e0) = (sim.vessel.mass, sim.vessel.energy);
+        let (dm, de) = port_balance_step(&mut sim);
+        assert!(sim.model_error.is_none(), "step {i} rejected: {:?}", sim.model_error);
+        q_core_j += sim.q_core * DT;
+        assert!(((sim.vessel.mass - m0) - dm).abs() <= 1e-6, "step {i}: vessel mass residual");
+        assert!(((sim.vessel.energy - e0) - de).abs() <= 1e-6 * q_core_j.max(1.0), "step {i}: vessel energy residual");
+        assert!(sim.cond.equilibrium_residual_j().abs() <= 1.0, "step {i}: shell off equilibrium");
+        peak_p = peak_p.max(sim.cond.pressure());
+    }
+    assert!(sim.turbine.tripped, "low vacuum must trip the turbine");
+    assert!(!sim.cond.available_for_bypass() && sim.steam.bypass_pos == 0.0, "bypass must be blocked");
+    assert!(peak_p < CONDENSER_RELIEF_P, "shell reached relief: peak {peak_p:.0} Pa");
 }
 
 /// R3 condenser: one public 60 s step from a 35 degC shell with both CW pumps

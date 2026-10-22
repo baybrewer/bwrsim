@@ -38,6 +38,15 @@ impl Sat {
     pub fn v_g(&self) -> f64 {
         1.0 / self.rho_g
     }
+    /// Saturated-liquid specific entropy, J/kgK, from IF97 Region 1 at saturation.
+    pub fn s_f(&self) -> f64 {
+        region1(self.t, self.p).s
+    }
+    /// Saturated-vapour specific entropy, J/kgK: s_f + h_fg/T, so the latent
+    /// entropy is exactly consistent with the table's latent heat.
+    pub fn s_g(&self) -> f64 {
+        self.s_f() + self.h_fg() / (self.t + 273.15)
+    }
     /// Surface tension, N/m (IAPWS 2014 correlation).
     pub fn sigma(&self) -> f64 {
         let tau = 1.0 - (self.t + 273.15) / 647.096;
@@ -142,6 +151,8 @@ pub struct Liquid {
     pub kappa: f64,
     /// Cubic expansion coefficient, 1/K.
     pub beta: f64,
+    /// Specific entropy, J/kgK.
+    pub s: f64,
 }
 
 /// IAPWS-IF97 Region 1 at temperature `t` (degC) and pressure `p` (Pa).
@@ -151,9 +162,10 @@ pub fn region1(t: f64, p: f64) -> Liquid {
     let pi = p / 16.53e6;
     let tau = 1386.0 / tk;
     let (a, b) = (7.1 - pi, tau - 1.222);
-    let (mut g_p, mut g_pp, mut g_t, mut g_pt) = (0.0, 0.0, 0.0, 0.0);
+    let (mut g, mut g_p, mut g_pp, mut g_t, mut g_pt) = (0.0, 0.0, 0.0, 0.0, 0.0);
     for &(i, j, n) in R1_IJN.iter() {
         let (fi, fj) = (i as f64, j as f64);
+        g += n * a.powi(i) * b.powi(j);
         g_p -= n * fi * a.powi(i - 1) * b.powi(j);
         g_pp += n * fi * (fi - 1.0) * a.powi(i - 2) * b.powi(j);
         g_t += n * a.powi(i) * fj * b.powi(j - 1);
@@ -161,7 +173,8 @@ pub fn region1(t: f64, p: f64) -> Liquid {
     }
     let v = pi * g_p * R_WATER * tk / p;
     let h = tau * g_t * R_WATER * tk;
-    Liquid { v, h, u: h - p * v, kappa: -pi * g_pp / (g_p * p), beta: (1.0 - tau * g_pt / g_p) / tk }
+    let s = (tau * g_t - g) * R_WATER;
+    Liquid { v, h, u: h - p * v, kappa: -pi * g_pp / (g_p * p), beta: (1.0 - tau * g_pt / g_p) / tk, s }
 }
 
 /// Compressed liquid at temperature `t` squeezed to specific volume `v`
@@ -208,6 +221,60 @@ pub fn compressed_liquid_h(t: f64, p: f64) -> f64 {
     }
     let (v, u) = anchored(&s, &region1(t, s.p), &region1(t, p));
     u + p * v
+}
+
+/// Temperature (degC) of liquid at pressure `p` (Pa) with specific enthalpy
+/// `h` (J/kg), inverting `compressed_liquid_h` by bisection (monotonic in t).
+fn liquid_t_from_hp(h: f64, p: f64) -> f64 {
+    let (mut lo, mut hi) = (T0, sat_p(p).t);
+    for _ in 0..60 {
+        let mid = 0.5 * (lo + hi);
+        if compressed_liquid_h(mid, p) < h {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// Specific entropy (J/kgK) of water at enthalpy `h` (J/kg) and pressure `p`
+/// (Pa): Region 1 for liquid at or below saturated-liquid enthalpy, the lever
+/// rule (s_f + (h - h_f)/T_sat) inside the dome. Above h_g the state is taken
+/// as slightly superheated with ds = dh/T_sat, which overstates s (T > T_sat
+/// there) and so understates any isentropic drop computed from it.
+pub fn entropy_hp(h: f64, p: f64) -> f64 {
+    let s = sat_p(p);
+    let tk = s.t + 273.15;
+    if h <= s.h_f {
+        let t = liquid_t_from_hp(h, p);
+        region1(t, p.max(sat_t(t).p)).s
+    } else if h <= s.h_g {
+        s.s_f() + (h - s.h_f) / tk
+    } else {
+        s.s_g() + (h - s.h_g) / tk
+    }
+}
+
+/// Isentropic enthalpy drop (J/kg, >= 0) expanding water at (`h_in`, `p_in`)
+/// to `p_out`: the reversible work limit of any expansion between those states.
+/// The exit state at `p_out` is wet (lever rule on entropy), compressed liquid
+/// (drop = v_f dp, liquid is nearly incompressible) or slightly superheated.
+pub fn isentropic_drop(h_in: f64, p_in: f64, p_out: f64) -> f64 {
+    if !(p_in > p_out && p_out > 0.0) {
+        return 0.0;
+    }
+    let s_in = entropy_hp(h_in, p_in);
+    let o = sat_p(p_out);
+    let (s_f, s_g) = (o.s_f(), o.s_g());
+    let h_out = if s_in <= s_f {
+        return o.v_f() * (p_in - p_out);
+    } else if s_in <= s_g {
+        o.h_f + (s_in - s_f) / (s_g - s_f) * o.h_fg()
+    } else {
+        o.h_g + (s_in - s_g) * (o.t + 273.15)
+    };
+    (h_in - h_out).max(0.0)
 }
 
 #[cfg(test)]
@@ -260,5 +327,29 @@ mod tests {
         let s = sat_t(200.0);
         assert_eq!(compressed_liquid_h(200.0, s.p), s.h_f);
         assert!((compressed_liquid_h(200.0, s.p * (1.0 + 1e-9)) - s.h_f).abs() < 1e-3);
+    }
+
+    /// Entropy and isentropic drops against IAPWS-IF97 (Python iapws 1.5,
+    /// `IAPWS97(P=.., s=..)`): saturation entropies, a textbook Rankine
+    /// expansion and the two compressed-liquid main-line fixtures of the
+    /// 2026-10-22 reviews.
+    #[test]
+    fn entropy_and_isentropic_drop_match_iapws() {
+        let s = sat_t(100.0);
+        assert!((s.s_f() - 1307.014).abs() < 2.0, "s_f {}", s.s_f());
+        assert!((s.s_g() - 7354.077).abs() < 5.0, "s_g {}", s.s_g());
+        let g = sat_p(7.0e6);
+        assert!((entropy_hp(g.h_g, 7.0e6) - 5814.633).abs() < 5.0);
+        let cases = [
+            (g.h_g, 7.0e6, 10.0e3, 933_211.0),
+            (sat_p(1.0e6).h_g, 1.0e6, 5.6e3, 757_546.0),
+            (853_319.599, 3.834878e6, 5.609667e3, 145_330.790),
+            (464_246.619, 4.101863e6, 5.6e3, 37_216.458),
+        ];
+        for (h, p_in, p_out, ref_dh) in cases {
+            let dh = isentropic_drop(h, p_in, p_out);
+            assert!((dh - ref_dh).abs() < 1e-4 * ref_dh + 20.0, "({h}, {p_in}->{p_out}) {dh} vs {ref_dh}");
+        }
+        assert_eq!(isentropic_drop(g.h_g, 5.0e3, 7.0e6), 0.0);
     }
 }
