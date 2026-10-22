@@ -155,11 +155,14 @@ impl Kinetics {
         let h = dt / steps as f64;
         let mut n_dt = 0.0;
         for k in 0..steps {
-            let n0 = self.n;
             if let Err(e) = self.step(rho, s, h) {
                 return (n_dt + held(self.n, dt - k as f64 * h), Err(e));
             }
-            n_dt += 0.5 * (n0 + self.n) * h;
+            // End-point area, not a trapezoid: it is the integral backward Euler
+            // itself implies, so a decaying prompt mode integrates to exactly
+            // n0/a at any h (the trapezoid adds a*h/2: 7.5 % at the decay cap,
+            // Astra round 9). The growth cap bounds the opposite-sign error.
+            n_dt += self.n * h;
         }
         (n_dt, Ok(()))
     }

@@ -632,9 +632,15 @@ mod tests {
     /// calls no production kinetics, decay or fuel function.
     /// Returns (n, generated J, delivered-to-coolant J, fuel_t).
     fn reference_energy(n0: f64, rho: f64, t_end: f64, fuel_t0: f64, coolant_t: f64) -> (f64, f64, f64, f64) {
+        reference_energy_sched(n0, &|_| rho, t_end, fuel_t0, coolant_t)
+    }
+
+    /// As [`reference_energy`] with a time-dependent reactivity schedule.
+    fn reference_energy_sched(n0: f64, rho_at: &dyn Fn(f64) -> f64, t_end: f64, fuel_t0: f64, coolant_t: f64) -> (f64, f64, f64, f64) {
         const NY: usize = 1 + 6 + 9 + 3;
         let decay_sum: f64 = DECAY_GROUPS.iter().map(|g| g.0).sum();
-        let deriv = |y: &[f64; NY]| -> [f64; NY] {
+        let deriv = |y: &[f64; NY], t: f64| -> [f64; NY] {
+            let rho = rho_at(t);
             let mut dy = [0.0; NY];
             let n = y[0];
             dy[0] = (rho - BETA) / GEN_TIME * n + SOURCE;
@@ -672,11 +678,12 @@ mod tests {
             }
             o
         };
-        for _ in 0..steps {
-            let k1 = deriv(&y);
-            let k2 = deriv(&axpy(&y, &k1, 0.5 * h));
-            let k3 = deriv(&axpy(&y, &k2, 0.5 * h));
-            let k4 = deriv(&axpy(&y, &k3, h));
+        for step in 0..steps {
+            let t = step as f64 * h;
+            let k1 = deriv(&y, t);
+            let k2 = deriv(&axpy(&y, &k1, 0.5 * h), t + 0.5 * h);
+            let k3 = deriv(&axpy(&y, &k2, 0.5 * h), t + 0.5 * h);
+            let k4 = deriv(&axpy(&y, &k3, h), t + h);
             for i in 0..NY {
                 y[i] += h / 6.0 * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]);
             }
@@ -709,6 +716,34 @@ mod tests {
 
     fn rel(a: f64, b: f64) -> f64 {
         (a - b).abs() / b.abs()
+    }
+
+    /// Round9-astra R1: a drop that follows a rapid rise starts with precursors
+    /// far below equilibrium, so the prompt mode dominates. A trapezoidal
+    /// area over backward-Euler populations over-integrated it by up to 7.5 %
+    /// (2.3 % coolant excess at -0.020). Both stages, two drop depths.
+    #[test]
+    fn rise_then_drop_energy_matches_reference() {
+        let (n0, rho1, t1, t2, t0) = (1e-4, 0.010, 0.05, 0.05, 40.0);
+        for rho2 in [-0.020, -0.070] {
+            let sched = move |t: f64| if t < t1 { rho1 } else { rho2 };
+            let (n_ref, gen_ref, cool_ref, _) = reference_energy_sched(n0, &sched, t1 + t2, t0, t0);
+            for dt in [0.05, 0.025, 0.001] {
+                let mut c = fixed_rho_core(n0, rho1, t0);
+                let (mut e_gen, mut e_cool) = (0.0, 0.0);
+                for k in 0..((t1 + t2) / dt).round() as usize {
+                    if (k as f64 + 0.5) * dt > t1 {
+                        c.rho_doppler = rho2 - RHO_EXCESS_COLD - c.rods.reactivity();
+                    }
+                    e_cool += c.step(dt, t0, 1.0) * dt;
+                    e_gen += c.q_gen * dt;
+                    assert!(c.kin_error.is_none(), "{:?}", c.kin_error);
+                }
+                assert!(rel(e_gen, gen_ref) < 0.02, "rho2 {rho2} dt {dt}: generated {e_gen} vs {gen_ref}");
+                assert!(rel(e_cool, cool_ref) < 0.02, "rho2 {rho2} dt {dt}: coolant {e_cool} vs {cool_ref}");
+                assert!(rel(c.kin.n, n_ref) < 0.03, "rho2 {rho2} dt {dt}: n {} vs {n_ref}", c.kin.n);
+            }
+        }
     }
 
     /// Round8-astra R1: a fast power rise must deposit the integral of the
