@@ -12,8 +12,10 @@ pub const MAX_SUBSTEP: f64 = 1.0e-3;
 /// six-e-fold prompt excursion (and its integrated energy) to ~1.5 %.
 pub const PROMPT_GROWTH_PER_SUBSTEP: f64 = 0.005;
 /// Maximum prompt decay per substep, `(beta - rho) / Lambda * h`. Backward
-/// Euler over-integrates a decaying prompt mode's area by about half this, so
-/// a prompt drop's energy stays within ~1 % of the resolved history. At
+/// Euler shifts a decaying prompt mode's power later in time by up to about
+/// this fraction per substep; the end-point population integral in
+/// [`Kinetics::advance_integrating`] still gives the exact total area once
+/// the mode has decayed (an infinite-time limit, not a per-window bound). At
 /// critical this equals [`MAX_SUBSTEP`]; only negative reactivity refines.
 pub const PROMPT_DECAY_PER_SUBSTEP: f64 = 0.15;
 /// Populations at or below this cannot support a log-rate (period) estimate;
@@ -141,8 +143,11 @@ impl Kinetics {
     /// [`Self::advance`] that also returns the population time integral
     /// `int n dt` over `dt` (relative-power seconds), so callers can deposit
     /// the energy of the resolved history rather than an end-point rectangle.
-    /// Each accepted substep contributes a trapezoid; the substep bound keeps
-    /// prompt growth per substep small, so that is accurate to well under 1 %.
+    /// Each accepted substep contributes the backward-Euler end-point area
+    /// `n_{k+1} * h`. Accuracy is set by the substep caps and checked by the
+    /// reactor energy tests (rise, prompt drop, rise-then-drop vs an
+    /// independent RK4 reference, 2 % tolerance on whole-event energy); short
+    /// windows inside a fast transient are less accurate than whole events.
     /// After a fault the population is frozen at the last accepted substep, and
     /// the integral holds that value for the rest of `dt`, matching what the
     /// caller then reports.
