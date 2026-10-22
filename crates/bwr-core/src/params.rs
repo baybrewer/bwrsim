@@ -25,11 +25,15 @@ pub const CORE_HEIGHT: f64 = 3.81;
 pub const ROD_SPEED: f64 = 0.4;
 /// Time for a hydraulic scram to fully insert rods, s. ASSUMED.
 pub const SCRAM_TIME: f64 = 3.0;
-/// Full-stroke insertion time of a Select Rod Insert run-in, s. ASSUMED: an
-/// electric motor run-in at about twice FMCRD drive speed, not the hydraulic
-/// scram. With the four-rod SRI group this gives a coupled power reduction near
-/// the ~0.8 percentage point/s quoted for SCRRI in GE 005N9751 Rev J section 3.2.
-pub const SRI_INSERT_TIME: f64 = 60.0;
+/// Full-stroke insertion time of a Select Rod Insert run-in, s. CALIBRATED, not
+/// a drive specification: GE 005N9751 Rev J section 3.2 quotes an approximate
+/// 0.8 percentage point/s power reduction for SCRRI. With the four-rod SRI group,
+/// a FullPower turbine trip (5 s settle, then 10 s) averages 0.80 point/s of
+/// neutron power at 82 s (60 s gave 1.21; 80 s 0.83; 85 s 0.76). The first
+/// second is faster (about 1.1 point/s) because the vendor figure is an average,
+/// so it is matched over the 10 s window. Acceptance band: 0.8 +/- 0.3 point/s
+/// (tests/plant.rs `sri_power_reduction_rate_matches_vendor_basis`).
+pub const SRI_INSERT_TIME: f64 = 82.0;
 
 // Neutronics. ASSUMED (typical BWR, U-235 delayed neutron data from Keepin).
 pub const BETA: f64 = 0.0060;

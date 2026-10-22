@@ -112,6 +112,85 @@ pub fn rho_liquid(t: f64) -> f64 {
     sat_t(t).rho_f
 }
 
+/// IAPWS-IF97 Region 1 coefficients (I, J, n), Table 2 of IF97-Rev.
+const R1_IJN: [(i32, i32, f64); 34] = [
+    (0, -2, 0.14632971213167), (0, -1, -0.84548187169114), (0, 0, -0.37563603672040e1),
+    (0, 1, 0.33855169168385e1), (0, 2, -0.95791963387872), (0, 3, 0.15772038513228),
+    (0, 4, -0.16616417199501e-1), (0, 5, 0.81214629983568e-3), (1, -9, 0.28319080123804e-3),
+    (1, -7, -0.60706301565874e-3), (1, -1, -0.18990068218419e-1), (1, 0, -0.32529748770505e-1),
+    (1, 1, -0.21841717175414e-1), (1, 3, -0.52838357969930e-4), (2, -3, -0.47184321073267e-3),
+    (2, 0, -0.30001780793026e-3), (2, 1, 0.47661393906987e-4), (2, 3, -0.44141845330846e-5),
+    (2, 17, -0.72694996297594e-15), (3, -4, -0.31679644845054e-4), (3, 0, -0.28270797985312e-5),
+    (3, 6, -0.85205128120103e-9), (4, -5, -0.22425281908000e-5), (4, -2, -0.65171222895601e-6),
+    (4, 10, -0.14341729937924e-12), (5, -8, -0.40516996860117e-6), (8, -11, -0.12734301741641e-8),
+    (8, -6, -0.17424871230634e-9), (21, -29, -0.68762131295531e-18), (23, -31, 0.14478307828521e-19),
+    (29, -38, 0.26335781662795e-22), (30, -39, -0.11947622640071e-22), (31, -40, 0.18228094581404e-23),
+    (32, -41, -0.93537087292458e-25),
+];
+/// Specific gas constant of water in IF97, J/kgK.
+const R_WATER: f64 = 461.526;
+
+/// Compressed-liquid state from IF97 Region 1.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Liquid {
+    /// Specific volume, m3/kg.
+    pub v: f64,
+    /// Specific enthalpy and internal energy, J/kg.
+    pub h: f64,
+    pub u: f64,
+    /// Isothermal compressibility, 1/Pa.
+    pub kappa: f64,
+    /// Cubic expansion coefficient, 1/K.
+    pub beta: f64,
+}
+
+/// IAPWS-IF97 Region 1 at temperature `t` (degC) and pressure `p` (Pa).
+/// Valid for 0..350 degC and p_sat(t)..100 MPa.
+pub fn region1(t: f64, p: f64) -> Liquid {
+    let tk = t + 273.15;
+    let pi = p / 16.53e6;
+    let tau = 1386.0 / tk;
+    let (a, b) = (7.1 - pi, tau - 1.222);
+    let (mut g_p, mut g_pp, mut g_t, mut g_pt) = (0.0, 0.0, 0.0, 0.0);
+    for &(i, j, n) in R1_IJN.iter() {
+        let (fi, fj) = (i as f64, j as f64);
+        g_p -= n * fi * a.powi(i - 1) * b.powi(j);
+        g_pp += n * fi * (fi - 1.0) * a.powi(i - 2) * b.powi(j);
+        g_t += n * a.powi(i) * fj * b.powi(j - 1);
+        g_pt -= n * fi * a.powi(i - 1) * fj * b.powi(j - 1);
+    }
+    let v = pi * g_p * R_WATER * tk / p;
+    let h = tau * g_t * R_WATER * tk;
+    Liquid { v, h, u: h - p * v, kappa: -pi * g_pp / (g_p * p), beta: (1.0 - tau * g_pt / g_p) / tk }
+}
+
+/// Compressed liquid at temperature `t` squeezed to specific volume `v`
+/// (below the saturated-liquid volume). The Region 1 increments from the
+/// saturation state are added to the table's saturated liquid, so the state
+/// is continuous with `sat_t` at the phase boundary. Returns (p, u) or, when
+/// the required pressure exceeds `p_max`, `Err(p)` with the pressure reached.
+pub fn compressed_liquid(t: f64, v: f64, p_max: f64) -> Result<(f64, f64), f64> {
+    let s = sat_t(t);
+    let at_sat = region1(t, s.p);
+    // Volume ratio to the saturated state; v(p)/v_sat is convex and decreasing
+    // in p, so Newton from p_sat approaches the root monotonically from below.
+    let target = v / s.v_f();
+    let mut p = s.p;
+    let mut liq = at_sat;
+    for _ in 0..50 {
+        let f = liq.v / at_sat.v - target;
+        if f.abs() < 1e-14 {
+            break;
+        }
+        p += f / (liq.kappa * liq.v / at_sat.v);
+        if !(p <= p_max) {
+            return Err(p);
+        }
+        liq = region1(t, p);
+    }
+    Ok((p, s.u_f() + (liq.u - at_sat.u)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +203,28 @@ mod tests {
         let s = sat_t(100.0);
         assert!((s.p - 101_418.0).abs() < 200.0);
         assert!((t_from_h_liquid(h_liquid(215.0)) - 215.0).abs() < 1e-6);
+    }
+
+    /// IF97-Rev Table 5 verification values for Region 1.
+    #[test]
+    fn region1_matches_if97_verification_table() {
+        let close = |a: f64, b: f64| ((a - b) / b).abs() < 1e-8;
+        let r = region1(300.0 - 273.15, 3.0e6);
+        assert!(close(r.v, 0.100215168e-2) && close(r.h, 0.115331273e6) && close(r.u, 0.112324818e6), "{r:?}");
+        let r = region1(300.0 - 273.15, 80.0e6);
+        assert!(close(r.v, 0.971180894e-3) && close(r.h, 0.184142828e6) && close(r.u, 0.106448356e6), "{r:?}");
+        let r = region1(500.0 - 273.15, 3.0e6);
+        assert!(close(r.v, 0.120241800e-2) && close(r.h, 0.975542239e6) && close(r.u, 0.971934985e6), "{r:?}");
+        assert!(close(r.beta, 0.164118128e-2) && close(r.kappa, 0.112892188e-8), "{r:?}");
+    }
+
+    #[test]
+    fn compressed_liquid_is_continuous_with_saturation_and_bounded() {
+        let s = sat_t(200.0);
+        let (p, u) = compressed_liquid(200.0, s.v_f(), 100.0e6).unwrap();
+        assert!((p - s.p).abs() < 1.0 && (u - s.u_f()).abs() < 1e-6);
+        let (p, _) = compressed_liquid(200.0, s.v_f() * 0.99, 100.0e6).unwrap();
+        assert!(p > 12.0e6 && p < 14.0e6, "p {p}");
+        assert!(compressed_liquid(200.0, s.v_f() * 0.9, 100.0e6).is_err());
     }
 }

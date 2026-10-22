@@ -210,7 +210,10 @@ impl Sim {
         self.accumulator += real_dt * self.speed;
         let mut n = 0;
         while self.accumulator >= DT && n < MAX_STEPS_PER_ADVANCE && !self.paused {
-            self.step(DT);
+            // A rejected step pauses with nothing elapsed, so its DT stays owed (N3).
+            if !self.step(DT) {
+                break;
+            }
             self.accumulator -= DT;
             n += 1;
         }
@@ -344,17 +347,29 @@ impl Sim {
         None
     }
 
-    /// One physics step. A non-positive or non-finite `dt` is a no-op. The step
-    /// is transactional: if the vessel cannot represent the resulting state,
-    /// every subsystem is restored, time does not advance and the simulator
-    /// pauses with `model_error` set (a later step retries).
-    pub fn step(&mut self, dt: f64) {
+    /// One physics step; returns whether simulated time advanced. A non-positive
+    /// or non-finite `dt` is a no-op. The step is transactional: if the vessel
+    /// cannot represent the resulting state, every subsystem and controller
+    /// mutated before the vessel step (core, steam/EHC, turbine governor,
+    /// feedwater, operator events) is restored, time does not advance and the
+    /// simulator pauses with `model_error` set (a later step retries). The IC
+    /// trains and condenser are only committed after acceptance.
+    pub fn step(&mut self, dt: f64) -> bool {
         if !(dt.is_finite() && dt > 0.0) {
-            return;
+            return false;
         }
         let p = self.vessel.eos.p;
         let t_cool = self.vessel.eos.t;
-        let saved = (self.core.clone(), self.steam.clone(), self.ic.clone(), self.fw.clone(), self.q_core);
+        let saved = (
+            self.core.clone(),
+            self.steam.clone(),
+            self.turbine.clone(),
+            self.fw.clone(),
+            self.q_core,
+            self.kin_fault_active,
+            self.events.clone(),
+            self.acked.clone(),
+        );
 
         // --- reactor core
         self.core.update_reactivity(self.vessel.alpha_core, t_cool);
@@ -381,70 +396,78 @@ impl Sim {
         let p_line = if self.vessel.eos.subcooled { P_ATM } else { p };
         self.steam.compute_flows_from(p_line, self.vessel.sat().h_g, !self.turbine.tripped);
 
-        // --- isolation condensers: primary-side mass ports on the vessel
+        // --- isolation condensers: requests only; nothing is committed until
+        // the vessel has decided how much IC steam it can supply. `t_cool` (not
+        // sat_p(p)) is the condensing temperature: sealed gas raises total pressure.
         let steam_avail = !self.vessel.eos.subcooled;
+        let ic_req: Vec<_> = self.ic.iter().map(|t| t.request(dt, t_cool, steam_avail)).collect();
         let mut ic_ports = IcPorts::default();
         let mut h_return_sum = 0.0;
-        for t in self.ic.iter_mut() {
-            let r = t.step_full(dt, t_cool, steam_avail);
+        for r in &ic_req {
             ic_ports.w_steam += r.w_steam_in;
             ic_ports.w_return += r.w_cond_return;
             h_return_sum += r.w_cond_return * r.h_return;
         }
         ic_ports.h_return = if ic_ports.w_return > 0.0 { h_return_sum / ic_ports.w_return } else { 0.0 };
 
-        // --- feedwater (level setpoint setdown after a scram)
+        // --- feedwater: level control and pump hydraulics. The hotwell bounds the
+        // feed actually delivered before the vessel integrates it (Sol N4 / Astra N2),
+        // and the vessel receives the same enthalpy the heater balance debits (N6).
         self.fw.setdown_cm = if self.scrammed { -100.0 } else { 0.0 };
         let hotwell_ok = self.cond.hotwell_mass > 0.05 * HOTWELL_CAPACITY;
-        let msg = self.fw.step(
-            dt,
-            p,
-            self.level_cm(),
-            self.steam.total_flow(),
-            self.steam.w_tcv,
-            hotwell_ok,
-            self.cond.hotwell_t(),
-        );
+        let msg = self.fw.step_hydraulics(dt, p, self.level_cm(), self.steam.total_flow(), hotwell_ok);
         if let Some(m) = msg {
             self.event("fw_trip", m);
         }
+        let w_feed = self.fw.flow.min(self.cond.withdrawal_limit(dt));
 
         // --- vessel (IC duty enters through the mass ports, so q_ic is zero)
         let inputs = VesselInputs {
             q_core: self.q_core,
             q_ic: 0.0,
-            w_feed: self.fw.flow,
-            h_feed: self.fw.h_feed(),
+            w_feed,
+            h_feed: self.fw.h_feed_delivered,
             w_steam: self.steam.total_flow(),
             w_liquid_out: self.fw.rwcu_reject,
         };
         self.vessel.step_with_ic(dt, &inputs, &ic_ports);
         if let Some(err) = self.vessel.last_error.clone() {
             let msg = format!("Physics model limit: {err}");
-            (self.core, self.steam, self.ic, self.fw, self.q_core) = saved;
+            (self.core, self.steam, self.turbine, self.fw, self.q_core, self.kin_fault_active, self.events, self.acked) = saved;
             self.model_error = Some(msg.clone());
             self.paused = true;
             self.event("model_limit", msg);
-            return;
+            return false;
         }
         self.model_error = None;
 
-        // --- turbine and condenser, on the outflows the vessel actually delivered
-        // (bounded by its phase inventory), not on the valve requests.
+        // Commit exactly the IC transfers the vessel accepted: steam draw,
+        // condensate return and pool duty all scale by one ratio.
+        let ic_ratio = self.vessel.flows.ic_ratio;
+        for (t, r) in self.ic.iter_mut().zip(ic_req) {
+            t.commit(dt, r.scaled(ic_ratio));
+        }
+
+        // --- turbine, heaters and condenser, on the outflows the vessel actually
+        // delivered (bounded by its phase inventory), not on the valve requests.
         let f = self.vessel.flows;
         let steam_req = self.steam.total_flow();
         let accepted = if steam_req > 0.0 { f.w_steam / steam_req } else { 0.0 };
         let w_tcv = self.steam.w_tcv * accepted;
         let w_byp = self.steam.w_bypass * accepted;
+        // Extraction is funded only by steam the turbine received (Sol N2).
+        self.fw.step_heater(dt, w_feed, w_tcv, self.cond.hotwell_t());
         self.turbine.step(dt, w_tcv, self.steam.p_chest, self.cond.pressure());
         // Gross enthalpy into the condenser shell, net of turbine work and of the
         // extraction heat the feedwater heaters actually took this step.
         let w_in = w_tcv + w_byp + f.w_liquid;
         let q_in = (w_tcv + w_byp) * f.h_steam - self.turbine.p_mech + f.w_liquid * f.h_liquid - self.fw.q_extraction_w;
-        self.cond.step_energy(dt, q_in, w_in, self.fw.flow);
+        self.cond.step_energy(dt, q_in, w_in, w_feed);
+        debug_assert!((self.cond.w_out_accepted - w_feed).abs() <= 1e-9 * w_feed.max(1.0));
 
         self.time += dt;
         self.protection();
+        true
     }
 
     fn protection(&mut self) {
@@ -877,6 +900,8 @@ impl Sim {
                 head_vent_open: v.head_vent_open,
                 heatup_rate_cph: v.heatup_rate,
                 inventory_shortfall_kg: v.shortfall_kg,
+                head_gas_kg: v.gas_mass,
+                head_gas_pressure_mpa: v.eos.p_gas / 1e6,
             },
             steam: api::Steam {
                 msiv_pos: self.steam.msiv_pos.to_vec(),

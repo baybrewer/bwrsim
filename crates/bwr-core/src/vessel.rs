@@ -148,17 +148,15 @@ fn level_from_volume(v_l: f64, a_core: f64, a_ch: f64) -> f64 {
     0.5 * (lo + hi)
 }
 
-/// Isothermal compressibility of liquid water, 1/Pa. ASSUMED: IF97 gives
-/// ~4.6e-10 at 20 degC rising to ~1e-9 at 250 degC; a single mid-range value
-/// is used for the water-solid branch. (Candidate for params.rs.)
-pub const LIQUID_COMPRESSIBILITY: f64 = 7.0e-10;
-/// Largest fractional over-fill (M*v_f - V)/V the linear compressibility model
-/// accepts before the state is reported as outside the EOS domain (~28 MPa).
-pub const MAX_LIQUID_COMPRESSION: f64 = 0.02;
+/// Highest pressure the compressed-liquid closure accepts, Pa (upper bound
+/// of IAPWS-IF97 Region 1).
+pub const EOS_P_MAX: f64 = 100.0e6;
 /// Lowest temperature the EOS solves for, degC (first saturation-table row).
 pub const EOS_T_MIN: f64 = 1.0;
 /// Highest temperature the EOS solves for, degC (below the table's 350 degC end).
 pub const EOS_T_MAX: f64 = 349.5;
+/// Specific gas constant of the noncondensable head-space gas (air), J/kgK.
+pub const R_AIR: f64 = 287.05;
 
 /// Phase domain the vessel inventory occupies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,8 +164,20 @@ pub enum EosRegime {
     /// Liquid fills the whole vessel; pressure comes from liquid compression.
     CompressedLiquid,
     /// Saturated liquid and vapour in equilibrium (vapour at its saturation
-    /// partial pressure below 100 degC, where the head space is at atmospheric).
+    /// partial pressure; noncondensable gas adds its own partial pressure).
     TwoPhase,
+}
+
+/// Gas boundary of the head space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HeadSpace {
+    /// Head vent open: below the atmospheric boiling point air fills the
+    /// head space to atmospheric total pressure.
+    Vented,
+    /// Head vent shut: a fixed mass (kg) of noncondensable gas shares the
+    /// head space with the vapour (Dalton). Its heat capacity (~1e-4 of the
+    /// inventory's) is neglected in the energy balance.
+    Sealed { gas_mass: f64 },
 }
 
 /// Reasons the EOS cannot represent a (mass, energy) pair.
@@ -181,9 +191,11 @@ pub enum EosError {
     AboveDomain { energy: f64, max_energy: f64 },
     /// Vessel volume exceeds the saturated-vapour volume of the inventory.
     Superheated { t: f64, quality: f64 },
-    /// Saturated-liquid volume exceeds the vessel by more than the
-    /// compressibility model supports.
+    /// Liquid compression needs more than `EOS_P_MAX`.
     OverCompressed { t: f64, over_fill: f64 },
+    /// Sealed noncondensable gas has no room left (water-solid, or its partial
+    /// pressure would exceed `EOS_P_MAX`).
+    GasSpaceCollapsed { t: f64, gas_mass: f64 },
     /// Bisection did not reproduce the requested energy.
     NoConvergence { residual: f64 },
 }
@@ -201,8 +213,14 @@ impl std::fmt::Display for EosError {
             Self::Superheated { t, quality } => {
                 write!(f, "vessel inventory superheated at {t:.1} degC (quality {quality:.4} > 1)")
             }
-            Self::OverCompressed { t, over_fill } => {
-                write!(f, "vessel over-filled by {:.2} % at {t:.1} degC, beyond the compressibility model", over_fill * 100.0)
+            Self::OverCompressed { t, over_fill } => write!(
+                f,
+                "vessel over-filled by {:.2} % at {t:.1} degC, compression beyond {} MPa",
+                over_fill * 100.0,
+                EOS_P_MAX / 1e6
+            ),
+            Self::GasSpaceCollapsed { t, gas_mass } => {
+                write!(f, "sealed head-space gas ({gas_mass:.1} kg) compressed to no volume at {t:.1} degC")
             }
             Self::NoConvergence { residual } => write!(f, "EOS solve residual {residual:.3e} J"),
         }
@@ -215,17 +233,19 @@ impl std::error::Error for EosError {}
 #[derive(Clone, Copy, Debug)]
 pub struct Eos {
     pub t: f64,
+    /// Total head-space (or liquid, when water-solid) pressure, Pa.
     pub p: f64,
     /// Static steam quality of the vessel inventory (steam mass / total).
     pub x: f64,
-    /// Below the atmospheric boiling point: no net steam production, head
-    /// space at atmospheric pressure.
+    /// Below the atmospheric boiling point: no net steam production.
     pub subcooled: bool,
     /// True if the vessel is water-solid (no steam space).
     pub solid: bool,
     pub regime: EosRegime,
     /// Fractional over-fill (M*v_f - V)/V in the compressed-liquid regime, else 0.
     pub over_fill: f64,
+    /// Noncondensable partial pressure in the head space, Pa.
+    pub p_gas: f64,
 }
 
 /// Specific volume of the inventory, m3/kg.
@@ -239,80 +259,149 @@ fn quality_at(s: &Sat, mass: f64) -> f64 {
     (specific_volume(mass) - s.v_f()) / (s.v_g() - s.v_f())
 }
 
-/// Total energy (fluid + metal) at temperature `t`, and the clamped quality.
-/// Continuous through 100 degC: below it the head space holds equilibrium
-/// vapour at its saturation partial pressure, above it the same lever rule
-/// applies at full saturation pressure.
-fn energy_at(t: f64, mass: f64) -> (f64, f64) {
-    let s = sat_t(t);
-    let x = quality_at(&s, mass).clamp(0.0, 1.0);
-    (mass * (s.u_f() + x * (s.u_g() - s.u_f())) + METAL_HEAT_CAP * t, x)
+/// Fluid state of the inventory at one temperature, before the gas boundary.
+struct Phase {
+    /// Total energy (fluid + metal), J.
+    energy: f64,
+    x: f64,
+    /// Vapour (two-phase) or compressed-liquid pressure, Pa.
+    p_fluid: f64,
+    regime: EosRegime,
+    over_fill: f64,
 }
 
-/// Pressure and regime for the inventory at temperature `t`.
-fn pressure_at(t: f64, mass: f64) -> Result<(f64, EosRegime, f64), EosError> {
+/// Fluid state at temperature `t`. Continuous through 100 degC (the vapour
+/// is at its saturation partial pressure below it) and through the
+/// two-phase / water-solid boundary (compressed liquid is IF97 Region 1
+/// anchored on the saturated state). States outside the domain are errors,
+/// never clamped.
+fn phase_at(t: f64, mass: f64) -> Result<Phase, EosError> {
     let s = sat_t(t);
-    // The head space never falls below atmospheric (vented, or air-filled when sealed cold).
-    let p_base = s.p.max(P_ATM);
     let x = quality_at(&s, mass);
-    if x < 0.0 {
-        let over_fill = (mass * s.v_f() - V_VESSEL_FLUID) / V_VESSEL_FLUID;
-        if over_fill > MAX_LIQUID_COMPRESSION {
-            return Err(EosError::OverCompressed { t, over_fill });
-        }
-        return Ok((p_base + over_fill / LIQUID_COMPRESSIBILITY, EosRegime::CompressedLiquid, over_fill));
-    }
     if x > 1.0 + 1e-9 {
         return Err(EosError::Superheated { t, quality: x });
     }
-    Ok((p_base, EosRegime::TwoPhase, 0.0))
+    if x >= 0.0 {
+        let x = x.min(1.0);
+        let energy = mass * (s.u_f() + x * (s.u_g() - s.u_f())) + METAL_HEAT_CAP * t;
+        return Ok(Phase { energy, x, p_fluid: s.p, regime: EosRegime::TwoPhase, over_fill: 0.0 });
+    }
+    let over_fill = (mass * s.v_f() - V_VESSEL_FLUID) / V_VESSEL_FLUID;
+    let (p, u) = steam::compressed_liquid(t, specific_volume(mass), EOS_P_MAX)
+        .map_err(|_| EosError::OverCompressed { t, over_fill })?;
+    let energy = mass * u + METAL_HEAT_CAP * t;
+    Ok(Phase { energy, x: 0.0, p_fluid: p, regime: EosRegime::CompressedLiquid, over_fill })
 }
 
-/// Solve for temperature/pressure from total fluid mass and energy (incl. metal).
-/// Errors when the pair lies outside the saturated/compressed-liquid domain;
-/// callers must keep their previous state in that case.
+/// Total pressure and noncondensable partial pressure for a fluid state.
+fn head_pressure(t: f64, mass: f64, ph: &Phase, head: HeadSpace) -> Result<(f64, f64), EosError> {
+    match (ph.regime, head) {
+        // A vented water-solid vessel cannot sit below atmospheric.
+        (EosRegime::CompressedLiquid, HeadSpace::Vented) => Ok((ph.p_fluid.max(P_ATM), 0.0)),
+        (EosRegime::CompressedLiquid, HeadSpace::Sealed { gas_mass }) => {
+            if gas_mass > 0.0 {
+                Err(EosError::GasSpaceCollapsed { t, gas_mass })
+            } else {
+                Ok((ph.p_fluid, 0.0))
+            }
+        }
+        (EosRegime::TwoPhase, HeadSpace::Vented) => {
+            let p_gas = (P_ATM - ph.p_fluid).max(0.0);
+            Ok((ph.p_fluid + p_gas, p_gas))
+        }
+        (EosRegime::TwoPhase, HeadSpace::Sealed { gas_mass }) => {
+            if gas_mass <= 0.0 {
+                return Ok((ph.p_fluid, 0.0));
+            }
+            let v_space = head_space_volume(t, mass, ph.x);
+            let p_gas = gas_mass * R_AIR * (t + 273.15) / v_space;
+            if !(v_space > 0.0) || !(ph.p_fluid + p_gas <= EOS_P_MAX) {
+                return Err(EosError::GasSpaceCollapsed { t, gas_mass });
+            }
+            Ok((ph.p_fluid + p_gas, p_gas))
+        }
+    }
+}
+
+/// Volume not occupied by liquid (shared by vapour and noncondensables), m3.
+fn head_space_volume(t: f64, mass: f64, x: f64) -> f64 {
+    V_VESSEL_FLUID - mass * (1.0 - x) * sat_t(t).v_f()
+}
+
+/// Noncondensable mass that fills the head space to atmospheric total
+/// pressure when vented (zero at or above the atmospheric boiling point,
+/// where vapour purges the air).
+pub fn vented_gas_mass(eos: &Eos, mass: f64) -> f64 {
+    if eos.solid {
+        return 0.0;
+    }
+    let p_gas = (P_ATM - sat_t(eos.t).p).max(0.0);
+    p_gas * head_space_volume(eos.t, mass, eos.x).max(0.0) / (R_AIR * (eos.t + 273.15))
+}
+
+/// Solve for temperature/pressure from total fluid mass and energy (incl.
+/// metal) with the head space vented. See `solve_eos_with`.
 pub fn solve_eos(mass: f64, energy: f64) -> Result<Eos, EosError> {
+    solve_eos_with(mass, energy, HeadSpace::Vented)
+}
+
+/// Solve for temperature/pressure from total fluid mass and energy (incl.
+/// metal) and the head-space gas boundary. Errors when the pair lies outside
+/// the saturated/compressed-liquid domain; callers must keep their previous
+/// state in that case.
+pub fn solve_eos_with(mass: f64, energy: f64, head: HeadSpace) -> Result<Eos, EosError> {
     if !(mass > 0.0) || !mass.is_finite() || !energy.is_finite() {
         return Err(EosError::NonFinite);
     }
-    let (mut lo, mut hi) = (EOS_T_MIN, EOS_T_MAX);
-    let min_energy = energy_at(lo, mass).0;
-    let max_energy = energy_at(hi, mass).0;
+    // Inadmissible states (superheat, over-compression) lie at the hot end
+    // for a fixed mass, so the lower bracket end must be admissible.
+    let min_energy = phase_at(EOS_T_MIN, mass)?.energy;
     if energy < min_energy {
         return Err(EosError::BelowDomain { energy, min_energy });
     }
-    if energy > max_energy {
-        return Err(EosError::AboveDomain { energy, max_energy });
-    }
-    for _ in 0..60 {
-        let mid = 0.5 * (lo + hi);
-        if energy_at(mid, mass).0 < energy {
-            lo = mid;
-        } else {
-            hi = mid;
+    let top = phase_at(EOS_T_MAX, mass);
+    if let Ok(ph) = &top {
+        if energy > ph.energy {
+            return Err(EosError::AboveDomain { energy, max_energy: ph.energy });
         }
     }
-    let t = 0.5 * (lo + hi);
-    let (e_t, x) = energy_at(t, mass);
-    let residual = e_t - energy;
-    if residual.abs() > 1e-6 * energy.abs() + 1.0 {
-        return Err(EosError::NoConvergence { residual });
+    // Bisect on temperature; an inadmissible midpoint counts as too hot and
+    // its error is reported if the energy lies beyond the admissible states.
+    let mut beyond = top.err();
+    let (mut lo, mut hi) = (EOS_T_MIN, EOS_T_MAX);
+    for _ in 0..80 {
+        let mid = 0.5 * (lo + hi);
+        match phase_at(mid, mass) {
+            Ok(ph) if ph.energy < energy => lo = mid,
+            Ok(_) => hi = mid,
+            Err(e) => {
+                hi = mid;
+                beyond = Some(e);
+            }
+        }
     }
-    let (p, regime, over_fill) = pressure_at(t, mass)?;
+    let ph = phase_at(lo, mass)?;
+    let residual = ph.energy - energy;
+    if residual.abs() > 1e-6 * energy.abs() + 1.0 {
+        return Err(beyond.unwrap_or(EosError::NoConvergence { residual }));
+    }
+    let (p, p_gas) = head_pressure(lo, mass, &ph, head)?;
+    let regime = ph.regime;
     Ok(Eos {
-        t,
+        t: lo,
         p,
-        x,
-        subcooled: t < 100.0,
+        x: ph.x,
+        subcooled: lo < 100.0,
         solid: regime == EosRegime::CompressedLiquid,
         regime,
-        over_fill,
+        over_fill: ph.over_fill,
+        p_gas,
     })
 }
 
-/// Total energy for a fluid mass at temperature t.
-pub fn energy_for(mass: f64, t: f64) -> f64 {
-    energy_at(t, mass).0
+/// Total energy (fluid + metal) for a fluid mass at temperature t.
+pub fn energy_for(mass: f64, t: f64) -> Result<f64, EosError> {
+    phase_at(t, mass).map(|ph| ph.energy)
 }
 
 #[derive(Clone, Debug)]
@@ -355,8 +444,17 @@ pub struct VesselFlows {
     /// Head vent flow and enthalpy.
     pub w_vent: f64,
     pub h_vent: f64,
+    /// Accepted isolation-condenser steam draw and condensate return, kg/s,
+    /// and the return enthalpy, J/kg.
     pub w_ic_steam: f64,
     pub w_ic_return: f64,
+    pub h_ic_return: f64,
+    /// Accepted / requested IC transfer (1.0 when nothing was requested).
+    /// Both IC ports are scaled by it; the trains must commit with it.
+    pub ic_ratio: f64,
+    /// Noncondensable gas expelled through the open head vent, kg/s
+    /// (negative when air is drawn in).
+    pub w_vent_gas: f64,
     /// Requested outflow the inventory could not supply, kg/s.
     pub shortfall: f64,
 }
@@ -374,6 +472,9 @@ pub struct Vessel {
     /// Level elevation above vessel bottom, m.
     pub level_z: f64,
     pub head_vent_open: bool,
+    /// Noncondensable gas in the head space, kg. Tracks the atmosphere while
+    /// the head vent is open and is trapped when it shuts.
+    pub gas_mass: f64,
     pub vent_flow: f64,
     pub heatup_rate: f64,
     /// Friction coefficient, calibrated so rated flow is CORE_FLOW_RATED.
@@ -397,7 +498,16 @@ impl Vessel {
         let mut v = Self {
             mass: 0.0,
             energy: 0.0,
-            eos: Eos { t, p: P_ATM, x: 0.0, subcooled: true, solid: false, regime: EosRegime::TwoPhase, over_fill: 0.0 },
+            eos: Eos {
+                t,
+                p: P_ATM,
+                x: 0.0,
+                subcooled: true,
+                solid: false,
+                regime: EosRegime::TwoPhase,
+                over_fill: 0.0,
+                p_gas: 0.0,
+            },
             core_flow: CORE_FLOW_RATED,
             h_in: steam::h_liquid(t),
             alpha_core: 0.0,
@@ -405,6 +515,7 @@ impl Vessel {
             core: CoreTh::default(),
             level_z,
             head_vent_open: vent_open,
+            gas_mass: 0.0,
             vent_flow: 0.0,
             heatup_rate: 0.0,
             k_fric: Self::calibrate_friction(),
@@ -442,8 +553,11 @@ impl Vessel {
         // pressure below 100 degC), matching the EOS closure.
         let m_g = v_g * sat_t(t).rho_g;
         v.mass = v_l * rho_l + m_g;
-        v.energy = energy_for(v.mass, t);
+        v.energy = energy_for(v.mass, t).expect("initial vessel state must be inside the EOS domain");
+        // The head space starts at atmospheric total pressure below 100 degC,
+        // vented or sealed; above it the vapour has purged the air.
         v.eos = solve_eos(v.mass, v.energy).expect("initial vessel state must be inside the EOS domain");
+        v.gas_mass = vented_gas_mass(&v.eos, v.mass);
         v.update_level();
         v
     }
@@ -557,12 +671,18 @@ impl Vessel {
         let scale = |req: f64, avail: f64| if req * dt > avail { (avail / (req * dt)).max(0.0) } else { 1.0 };
         let f_vap = scale(vap_req, m_vap);
         let f_liq = scale(liq_req, m_liq);
-        let inflow = inp.w_feed + ic.w_return;
         let out_phase = vap_req * f_vap + liq_req * f_liq;
-        let avail_total = (self.mass + inflow * dt - 1.001 * self.min_mass()).max(0.0);
+        // The IC return is left out of the available total: it is itself
+        // scaled by the IC acceptance below (no steam drawn, no drain).
+        let avail_total = (self.mass + inp.w_feed * dt - 1.001 * self.min_mass()).max(0.0);
         let f_tot = scale(out_phase, avail_total);
         let (f_v, f_l) = (f_vap * f_tot, f_liq * f_tot);
         let (f_steam, f_vent) = if solid { (f_l, f_l) } else { (f_v, f_v) };
+        // IC acceptance: the condenser loop runs only as fast as the vessel
+        // supplies its steam (none when water-solid), and the condensate
+        // return is scaled with it so the trains can commit one ratio.
+        let ic_ratio = if ic.w_steam > 0.0 { ic_steam_req * f_v / ic.w_steam } else { 1.0 };
+        let w_ic_return = ic.w_return * ic_ratio;
         let flows = VesselFlows {
             w_feed: inp.w_feed,
             w_steam: steam_req * f_steam,
@@ -571,27 +691,37 @@ impl Vessel {
             h_liquid: h_liq,
             w_vent: vent_req * f_vent,
             h_vent: h_vent_port,
-            w_ic_steam: ic_steam_req * f_v,
-            w_ic_return: ic.w_return,
+            w_ic_steam: ic.w_steam * ic_ratio,
+            w_ic_return,
+            h_ic_return: ic.h_return,
+            ic_ratio,
+            w_vent_gas: 0.0,
             shortfall: (steam_req + vent_req + ic_steam_req + inp.w_liquid_out) - out_phase * f_tot,
         };
 
-        let dm = inflow - flows.w_steam - flows.w_liquid - flows.w_vent - flows.w_ic_steam;
+        let dm = inp.w_feed + flows.w_ic_return - flows.w_steam - flows.w_liquid - flows.w_vent - flows.w_ic_steam;
         let de = inp.q_core - inp.q_ic - heat_loss
             + inp.w_feed * inp.h_feed
-            + ic.w_return * ic.h_return
+            + flows.w_ic_return * flows.h_ic_return
             - flows.w_steam * flows.h_steam
             - flows.w_vent * flows.h_vent
             - flows.w_ic_steam * h_steam
             - flows.w_liquid * flows.h_liquid;
         let mass = self.mass + dm * dt;
         let energy = self.energy + de * dt;
-        match solve_eos(mass, energy) {
+        let head = if self.head_vent_open { HeadSpace::Vented } else { HeadSpace::Sealed { gas_mass: self.gas_mass } };
+        let mut flows = flows;
+        match solve_eos_with(mass, energy, head) {
             Ok(eos) => {
                 self.mass = mass;
                 self.energy = energy;
                 self.eos = eos;
                 self.last_error = None;
+                if self.head_vent_open {
+                    let gas = vented_gas_mass(&eos, mass);
+                    flows.w_vent_gas = (self.gas_mass - gas) / dt;
+                    self.gas_mass = gas;
+                }
             }
             Err(e) => {
                 self.last_error = Some(e);
@@ -651,8 +781,10 @@ mod tests {
     fn vessel_at(t: f64, mass: f64) -> Vessel {
         let mut v = Vessel::new(t.min(99.0), Z_NWL, 0.0, 0.0, 40.0, false);
         v.mass = mass;
-        v.energy = energy_for(mass, t);
+        v.energy = energy_for(mass, t).unwrap();
         v.eos = solve_eos(mass, v.energy).unwrap();
+        // Head-space gas as if vented at the new state (none above 100 degC).
+        v.gas_mass = vented_gas_mass(&v.eos, mass);
         v.update_level();
         v
     }
@@ -661,22 +793,31 @@ mod tests {
     fn eos_roundtrip() {
         // Physically admissible two-phase fixtures: v_f < V/M < v_g at each temperature.
         for &(t, m) in &[(40.0, 200_000.0), (150.0, 200_000.0), (287.0, 150_000.0)] {
-            let e = energy_for(m, t);
+            let e = energy_for(m, t).unwrap();
             let eos = solve_eos(m, e).unwrap();
             assert!((eos.t - t).abs() < 1e-3, "t {t} -> {}", eos.t);
             assert_eq!(eos.regime, EosRegime::TwoPhase);
             let s = sat_t(eos.t);
             let occupied = m * ((1.0 - eos.x) * s.v_f() + eos.x * s.v_g());
             assert!((occupied - V_VESSEL_FLUID).abs() < 1e-6 * V_VESSEL_FLUID, "volume {occupied}");
-            assert!((energy_for(m, eos.t) - e).abs() < 1e-6 * e.abs());
+            assert!((energy_for(m, eos.t).unwrap() - e).abs() < 1e-6 * e.abs());
         }
     }
 
     #[test]
-    fn eos_rejects_liquid_volume_beyond_the_vessel() {
-        // 200 t at 287 degC needs ~271 m3 of saturated liquid in a 254.8 m3 vessel.
+    fn eos_rejects_compression_beyond_region1() {
+        // 200 t at 287 degC overfills the vessel by ~6 %: a legitimate
+        // compressed-liquid state (tens of MPa), not a two-phase one.
         let m = 200_000.0;
-        match solve_eos(m, energy_for(m, 287.0)) {
+        let eos = solve_eos(m, energy_for(m, 287.0).unwrap()).unwrap();
+        assert_eq!(eos.regime, EosRegime::CompressedLiquid);
+        assert!(eos.p > 20.0e6 && eos.p < EOS_P_MAX, "p {}", eos.p);
+        // 240 t at 287 degC needs ~22 % compression, beyond Region 1's 100 MPa.
+        let m = 240_000.0;
+        assert!(matches!(energy_for(m, 287.0), Err(EosError::OverCompressed { .. })));
+        let e = m * sat_t(287.0).u_f() + METAL_HEAT_CAP * 287.0;
+        match solve_eos(m, e) {
+            // Reported at the hottest admissible temperature (100 MPa there).
             Err(EosError::OverCompressed { over_fill, .. }) => assert!(over_fill > 0.05, "over {over_fill}"),
             other => panic!("expected OverCompressed, got {other:?}"),
         }
@@ -685,48 +826,147 @@ mod tests {
     #[test]
     fn eos_rejects_energy_outside_bracket() {
         let m = 100_000.0;
-        assert!(matches!(solve_eos(m, energy_for(m, EOS_T_MAX) + 1e12), Err(EosError::AboveDomain { .. })));
-        assert!(matches!(solve_eos(m, energy_for(m, EOS_T_MIN) - 1e12), Err(EosError::BelowDomain { .. })));
-        let m = 1_000.0;
-        assert!(matches!(solve_eos(m, energy_for(m, EOS_T_MAX) + 1e9), Err(EosError::AboveDomain { .. })));
+        let e_max = energy_for(m, EOS_T_MAX).unwrap();
+        let e_min = energy_for(m, EOS_T_MIN).unwrap();
+        assert!(matches!(solve_eos(m, e_max + 1e12), Err(EosError::AboveDomain { .. })));
+        assert!(matches!(solve_eos(m, e_min - 1e12), Err(EosError::BelowDomain { .. })));
         assert!(matches!(solve_eos(0.0, 1.0), Err(EosError::NonFinite)));
         // Just inside both ends still solves (for a mass that is two-phase at both).
-        let m = 100_000.0;
-        assert!(solve_eos(m, energy_for(m, EOS_T_MAX - 0.01)).is_ok());
-        assert!(solve_eos(m, energy_for(m, EOS_T_MIN + 0.01)).is_ok());
+        assert!(solve_eos(m, energy_for(m, EOS_T_MAX - 0.01).unwrap()).is_ok());
+        assert!(solve_eos(m, energy_for(m, EOS_T_MIN + 0.01).unwrap()).is_ok());
+    }
+
+    /// Sol rereview / Astra 10: the hot bracket end is no longer evaluated
+    /// with a clamped quality. A light inventory is superheated there and a
+    /// heavy one over-compressed; energies past the admissible states report
+    /// that reason instead of a fictitious AboveDomain maximum.
+    #[test]
+    fn hot_bracket_end_reports_the_inadmissible_phase() {
+        let m = 1_000.0;
+        assert!(matches!(energy_for(m, EOS_T_MAX), Err(EosError::Superheated { .. })));
+        let e = m * sat_t(EOS_T_MAX).u_g() + METAL_HEAT_CAP * EOS_T_MAX;
+        assert!(matches!(solve_eos(m, e), Err(EosError::Superheated { .. })), "{:?}", solve_eos(m, e));
+        // Inside the two-phase range the same light inventory still solves.
+        let ok = solve_eos(m, m * sat_t(150.0).u_g() + METAL_HEAT_CAP * 150.0).unwrap();
+        assert!(ok.x > 0.5 && ok.x <= 1.0, "{ok:?}");
+        let m = 230_000.0;
+        assert!(matches!(energy_for(m, EOS_T_MAX), Err(EosError::OverCompressed { .. })));
+        let e = m * sat_t(300.0).u_f() + METAL_HEAT_CAP * 300.0;
+        assert!(matches!(solve_eos(m, e), Err(EosError::OverCompressed { .. })), "{:?}", solve_eos(m, e));
+    }
+
+    /// Sol 5 / Astra 4 / Sol 23: water-solid state against independent
+    /// IAPWS-IF97 Region 1 solves of fixed mass, volume and energy (both
+    /// re-reviews). Tolerances (5 mK, 10 kPa) cover the 1 degC table
+    /// interpolation the model anchors on; it lands within 0.5 kPa.
+    #[test]
+    fn compressed_liquid_matches_independent_if97_solve() {
+        // Astra re-review: M, E given; IF97 gives 201.858653 degC / 16.273779 MPa.
+        let (m, e) = (219_799.661608, 241_960_515_187.185);
+        let eos = solve_eos(m, e).unwrap();
+        assert_eq!(eos.regime, EosRegime::CompressedLiquid);
+        assert!(eos.solid && eos.x == 0.0);
+        assert!((eos.t - 201.858653).abs() < 0.005, "t {}", eos.t);
+        assert!((eos.p - 16.273779e6).abs() < 0.01e6, "p {}", eos.p);
+        // The solved state occupies the vessel at the solved (T, p).
+        let v = m * steam::region1(eos.t, eos.p).v;
+        assert!((v - V_VESSEL_FLUID).abs() < 1e-3 * V_VESSEL_FLUID, "volume {v}");
+        assert!(eos.p > VESSEL_DESIGN_PRESSURE);
+        // Sol re-review: 1 % over-fill at 287 degC with saturated-liquid energy;
+        // IF97 gives 288.847 degC / 13.408 MPa.
+        let s = sat_t(287.0);
+        let m = 1.01 * V_VESSEL_FLUID * s.rho_f;
+        let e = m * s.u_f() + METAL_HEAT_CAP * 287.0;
+        let eos = solve_eos(m, e).unwrap();
+        assert!((eos.t - 288.847).abs() < 0.005, "t {}", eos.t);
+        assert!((eos.p - 13.408e6).abs() < 0.01e6, "p {}", eos.p);
     }
 
     #[test]
-    fn water_solid_state_reports_compression_pressure() {
-        // Astra #4 fixture: 1 % more saturated liquid than the vessel holds at
-        // 200 degC; IF97 gives ~16 MPa, the old code reported 1.55 MPa.
-        let m = V_VESSEL_FLUID * sat_t(200.0).rho_f * 1.01;
-        let eos = solve_eos(m, energy_for(m, 200.0)).unwrap();
-        assert_eq!(eos.regime, EosRegime::CompressedLiquid);
-        assert!(eos.solid && eos.x == 0.0);
-        assert!((eos.t - 200.0).abs() < 1e-3);
-        assert!(eos.p > 12.0e6 && eos.p < 20.0e6, "p {}", eos.p);
-        assert!((eos.over_fill - 0.01).abs() < 1e-6);
-        assert!(eos.p > VESSEL_DESIGN_PRESSURE);
-        // Cold overfill is also pressurised, not pinned to atmospheric.
+    fn water_solid_state_is_continuous_with_two_phase() {
+        let t = 200.0;
+        let m_full = V_VESSEL_FLUID * sat_t(t).rho_f;
+        let below = solve_eos(m_full * (1.0 - 1e-9), energy_for(m_full * (1.0 - 1e-9), t).unwrap()).unwrap();
+        let above = solve_eos(m_full * (1.0 + 1e-9), energy_for(m_full * (1.0 + 1e-9), t).unwrap()).unwrap();
+        assert_eq!(below.regime, EosRegime::TwoPhase);
+        assert_eq!(above.regime, EosRegime::CompressedLiquid);
+        assert!((above.p - below.p).abs() < 5.0e3, "{} -> {}", below.p, above.p);
+        // Cold overfill is pressurised, not pinned to atmospheric.
         let m_cold = V_VESSEL_FLUID * steam::rho_liquid(40.0) * 1.005;
-        let cold = solve_eos(m_cold, energy_for(m_cold, 40.0)).unwrap();
+        let cold = solve_eos(m_cold, energy_for(m_cold, 40.0).unwrap()).unwrap();
         assert!(cold.solid && cold.subcooled && cold.p > 5.0e6, "p {}", cold.p);
+    }
+
+    /// Astra 9: below 100 degC a vented head space sits at atmospheric while a
+    /// sealed one carries vapour plus trapped-gas partial pressure.
+    #[test]
+    fn cold_gas_boundary_depends_on_vent_state() {
+        let m = 200_000.0;
+        let e40 = energy_for(m, 40.0).unwrap();
+        let at40 = solve_eos(m, e40).unwrap();
+        assert_eq!(at40.p, P_ATM);
+        let gas = vented_gas_mass(&at40, m);
+        assert!(gas > 10.0, "air {gas} kg");
+        // Sealing at 40 degC keeps atmospheric total pressure at that state.
+        let sealed40 = solve_eos_with(m, e40, HeadSpace::Sealed { gas_mass: gas }).unwrap();
+        assert!((sealed40.p - P_ATM).abs() < 1e-6 * P_ATM, "p {}", sealed40.p);
+        // Heat to 90 degC at constant mass.
+        let e90 = energy_for(m, 90.0).unwrap();
+        let vented = solve_eos_with(m, e90, HeadSpace::Vented).unwrap();
+        let sealed = solve_eos_with(m, e90, HeadSpace::Sealed { gas_mass: gas }).unwrap();
+        assert_eq!(vented.p, P_ATM);
+        // Independent ideal-gas + Dalton check at the solved state.
+        let s = sat_t(sealed.t);
+        let v_space = V_VESSEL_FLUID - m * (1.0 - sealed.x) / s.rho_f;
+        let p_expect = s.p + gas * R_AIR * (sealed.t + 273.15) / v_space;
+        assert!((sealed.p - p_expect).abs() < 1e-9 * p_expect, "{} vs {p_expect}", sealed.p);
+        assert!(sealed.p > 1.2 * P_ATM, "p {}", sealed.p);
+        // Sealed without gas (closed hot, then cooled) is at vapour pressure.
+        let no_gas = solve_eos_with(m, e90, HeadSpace::Sealed { gas_mass: 0.0 }).unwrap();
+        assert!((no_gas.p - sat_t(no_gas.t).p).abs() < 1.0 && no_gas.p < P_ATM);
+        // Trapped gas cannot be compressed into a water-solid vessel.
+        let m_solid = V_VESSEL_FLUID * steam::rho_liquid(60.0) * 1.002;
+        let e = energy_for(m_solid, 60.0).unwrap();
+        assert!(matches!(
+            solve_eos_with(m_solid, e, HeadSpace::Sealed { gas_mass: gas }),
+            Err(EosError::GasSpaceCollapsed { .. })
+        ));
+    }
+
+    #[test]
+    fn vessel_traps_gas_when_sealed_and_vents_it_when_open() {
+        let heat = VesselInputs { q_core: 20.0e6, q_ic: 0.0, w_feed: 0.0, h_feed: 0.0, w_steam: 0.0, w_liquid_out: 0.0 };
+        let mut vented = Vessel::new(40.0, Z_NWL, 0.0, 0.0, 40.0, true);
+        let mut sealed = Vessel::new(40.0, Z_NWL, 0.0, 0.0, 40.0, false);
+        let gas0 = sealed.gas_mass;
+        assert!(gas0 > 10.0 && (vented.gas_mass - gas0).abs() < 1e-9);
+        let mut expelled = 0.0;
+        while vented.eos.t < 90.0 {
+            vented.step(1.0, &heat);
+            sealed.step(1.0, &heat);
+            assert!(vented.last_error.is_none() && sealed.last_error.is_none());
+            expelled += vented.flows.w_vent_gas;
+        }
+        assert_eq!(vented.eos.p, P_ATM);
+        assert!(sealed.eos.p > 1.2 * P_ATM, "sealed p {}", sealed.eos.p);
+        assert_eq!(sealed.gas_mass, gas0);
+        assert!(vented.gas_mass < gas0 && (gas0 - vented.gas_mass - expelled).abs() < 1e-6, "expelled {expelled}");
     }
 
     #[test]
     fn energy_is_continuous_through_boiling_onset() {
         let m = 100_000.0;
-        let gap = energy_for(m, 100.0) - energy_for(m, 99.999);
+        let gap = energy_for(m, 100.0).unwrap() - energy_for(m, 99.999).unwrap();
         assert!(gap.abs() < 1.0e6, "gap {gap}");
         for &t in &[99.9995, 100.0005] {
-            let e = energy_for(m, t);
+            let e = energy_for(m, t).unwrap();
             let eos = solve_eos(m, e).unwrap();
             assert!((eos.t - t).abs() < 1e-6, "t {t} -> {}", eos.t);
-            assert!((energy_for(m, eos.t) - e).abs() < 1.0, "residual {}", energy_for(m, eos.t) - e);
+            let residual = energy_for(m, eos.t).unwrap() - e;
+            assert!(residual.abs() < 1.0, "residual {residual}");
         }
-        let below = solve_eos(m, energy_for(m, 99.9995)).unwrap();
-        let above = solve_eos(m, energy_for(m, 100.0005)).unwrap();
+        let below = solve_eos(m, energy_for(m, 99.9995).unwrap()).unwrap();
+        let above = solve_eos(m, energy_for(m, 100.0005).unwrap()).unwrap();
         assert!(below.subcooled && !above.subcooled);
         assert!((above.p - below.p).abs() < 200.0, "pressure jump {} -> {}", below.p, above.p);
     }
@@ -810,5 +1050,101 @@ mod tests {
             let v = liquid_volume_below(z, 0.4, 0.7);
             assert!((level_from_volume(v, 0.4, 0.7) - z).abs() < 1e-6);
         }
+    }
+
+    /// Astra 19 / Sol N1: IC transfers the vessel cannot supply are refused,
+    /// reported with the ratio the trains commit with, and the combined
+    /// vessel + IC inventory is conserved.
+    fn ic_round_trip(v: &mut Vessel, trains: &mut [crate::ic::IcTrain], dt: f64) -> (f64, f64) {
+        let t_sat = v.eos.t;
+        let reqs: Vec<_> = trains.iter().map(|t| t.request(dt, t_sat, !v.eos.subcooled)).collect();
+        let mut ports = IcPorts::default();
+        let mut h_sum = 0.0;
+        for r in &reqs {
+            ports.w_steam += r.w_steam_in;
+            ports.w_return += r.w_cond_return;
+            h_sum += r.w_cond_return * r.h_return;
+        }
+        ports.h_return = if ports.w_return > 0.0 { h_sum / ports.w_return } else { 0.0 };
+        let inp = VesselInputs { q_core: 0.0, q_ic: 0.0, w_feed: 0.0, h_feed: 0.0, w_steam: 0.0, w_liquid_out: 0.0 };
+        v.step_with_ic(dt, &inp, &ports);
+        assert!(v.last_error.is_none(), "{:?}", v.last_error);
+        let ratio = v.flows.ic_ratio;
+        let mut q_pool = 0.0;
+        for (t, r) in trains.iter_mut().zip(reqs) {
+            q_pool += t.commit(dt, r.scaled(ratio)).q_pool;
+        }
+        (ports.w_steam, q_pool)
+    }
+
+    fn open_trains() -> Vec<crate::ic::IcTrain> {
+        (0..3)
+            .map(|_| {
+                let mut t = crate::ic::IcTrain::new();
+                t.cmd_open = true;
+                t.valve_pos = 1.0;
+                t.tube_mass = 500.0;
+                t.heat = IC_TRAIN_RATED_W;
+                t
+            })
+            .collect()
+    }
+
+    fn primary_inventory(v: &Vessel, trains: &[crate::ic::IcTrain]) -> (f64, f64) {
+        let m = v.mass + trains.iter().map(|t| t.tube_mass).sum::<f64>();
+        let e = v.energy + trains.iter().map(|t| t.tube_mass * t.tube_h).sum::<f64>();
+        (m, e)
+    }
+
+    #[test]
+    fn water_solid_vessel_refuses_ic_transfers_and_trains_commit_nothing() {
+        let t = 200.0;
+        let m = V_VESSEL_FLUID * sat_t(t).rho_f * 1.005;
+        let mut v = vessel_at(t, m);
+        assert!(v.eos.solid);
+        let mut trains = open_trains();
+        let (m0, e0) = primary_inventory(&v, &trains);
+        let (requested, q_pool) = ic_round_trip(&mut v, &mut trains, 0.05);
+        assert!(requested > 10.0);
+        assert_eq!(v.flows.ic_ratio, 0.0);
+        assert_eq!((v.flows.w_ic_steam, v.flows.w_ic_return, q_pool), (0.0, 0.0, 0.0));
+        let (m1, e1) = primary_inventory(&v, &trains);
+        let loss = HEAT_LOSS_HOT * ((v.eos.t - 20.0) / 268.0).max(0.0) * 0.05;
+        assert!((m1 - m0).abs() < 1e-6, "mass created {}", m1 - m0);
+        assert!((e1 - e0 + loss).abs() < 1.0e3, "energy residual {}", e1 - e0 + loss);
+    }
+
+    #[test]
+    fn vapour_limited_ic_draw_is_scaled_and_conserved() {
+        // Nearly full vessel: a few kg of vapour against ~60 kg/s requested.
+        let t = 200.0;
+        let m = V_VESSEL_FLUID * sat_t(t).rho_f * (1.0 - 1e-6);
+        let mut v = vessel_at(t, m);
+        assert!(!v.eos.solid && v.mass * v.eos.x < 1.0, "vapour {}", v.mass * v.eos.x);
+        let mut trains = open_trains();
+        let (m0, e0) = primary_inventory(&v, &trains);
+        let ret_req: f64 = trains.iter().map(|tr| tr.request(0.05, v.eos.t, true).w_cond_return).sum();
+        let (requested, q_pool) = ic_round_trip(&mut v, &mut trains, 0.05);
+        let f = v.flows;
+        assert!(f.ic_ratio > 0.0 && f.ic_ratio < 0.1, "ratio {}", f.ic_ratio);
+        assert!((f.w_ic_steam - f.ic_ratio * requested).abs() < 1e-9);
+        assert!((f.w_ic_return - f.ic_ratio * ret_req).abs() < 1e-9);
+        assert!(f.h_ic_return > 0.0);
+        let committed: f64 = trains.iter().map(|t| t.last.w_steam_in).sum();
+        assert!((committed - f.w_ic_steam).abs() < 1e-9, "trains {committed} vs vessel {}", f.w_ic_steam);
+        let (m1, e1) = primary_inventory(&v, &trains);
+        let loss = HEAT_LOSS_HOT * ((v.eos.t - 20.0) / 268.0).max(0.0) * 0.05;
+        assert!((m1 - m0).abs() < 1e-6, "mass created {}", m1 - m0);
+        // Combined primary energy falls by exactly the pool duty and ambient loss.
+        assert!((e1 - e0 + q_pool * 0.05 + loss).abs() < 1.0e3, "energy residual {}", e1 - e0 + q_pool * 0.05 + loss);
+    }
+
+    #[test]
+    fn ic_ratio_is_one_without_a_steam_request() {
+        let mut v = Vessel::new(sat_p(P_RATED).t, Z_NWL, RATED_POWER_W, STEAM_FLOW_RATED, T_FW_RATED, false);
+        let inp = VesselInputs { q_core: 0.0, q_ic: 0.0, w_feed: 0.0, h_feed: 0.0, w_steam: 0.0, w_liquid_out: 0.0 };
+        v.step_with_ic(0.05, &inp, &IcPorts { w_steam: 0.0, w_return: 50.0, h_return: 1.0e5 });
+        assert_eq!(v.flows.ic_ratio, 1.0);
+        assert_eq!((v.flows.w_ic_return, v.flows.h_ic_return), (50.0, 1.0e5));
     }
 }

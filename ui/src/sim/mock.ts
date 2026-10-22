@@ -30,6 +30,17 @@ const IC_MW = 33;
 const LAMBDA_I = 2.87e-5;
 const LAMBDA_X = 2.09e-5;
 const XE_BURN = 2;
+const FUEL_ENVELOPE_C = 1200; // lumped fuel node model limit (same as the engine flag)
+const COOLANT_MAX_C = 320; // upper edge of the mock's coolant-temperature model
+const HOTWELL_KG_PER_PCT = 400; // hotwell inventory per % level (matches the level equation)
+const VESSEL_KG_PER_M = 8900;
+const PUMP_RAMP_PCT_S = 10; // ASD speed ramp
+const H_FG_POOL = 2257; // kJ/kg, pool boiling at atmospheric pressure
+const H_FG_IC = 1500; // kJ/kg, primary steam condensed in the IC tubes (~7 MPa)
+const FEED_CP = 4.19; // kJ/kg/K
+const COLD_FEED_C = 40;
+const HEAD_SPACE_M3 = 100; // mock head-space volume for the trapped-gas readout
+const R_AIR_KJ = 0.287; // kJ/kg/K
 
 /** 57 rods on a 9x9 grid: drop a 3+2+1 triangle from every corner. */
 function buildLayout(): [number, number][] {
@@ -54,6 +65,8 @@ const psat = (tC: number) => Math.pow(Math.max(tC, 1) / 179.9, 1 / 0.24);
 const approach = (v: number, target: number, rate: number, dt: number) =>
   v < target ? Math.min(target, v + rate * dt) : Math.max(target, v - rate * dt);
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+/** Feed pump ASD speed demand: idle at 25 % when running, rising with valve demand. */
+const pumpSpeedDemand = (running: boolean, fcvPos: number) => (running ? 25 + 75 * fcvPos : 0);
 
 interface Hidden {
   precursor: number; // normalized so equilibrium precursor == power
@@ -116,6 +129,8 @@ function blankSnapshot(): Snapshot {
       headVentOpen: true,
       heatupRateCph: 0,
       inventoryShortfallKg: 0,
+      headGasKg: 0,
+      headGasPressureMpa: 0,
     },
     steam: {
       msivPos: [0, 0],
@@ -257,16 +272,19 @@ export class MockSim {
         // Validate the whole batch against the current state before touching any
         // target, so a rejected command has no partial effect.
         if (s.scrammed) throw new Error("ROD BLOCK: scram not reset");
-        const t = clamp(Math.round(cmd.target / 2) * 2, 0, 48);
+        // Fine-motion drives: any position in [0, 48] is valid (same as the engine).
+        if (!Number.isFinite(cmd.target)) throw new Error("Command rejected: non-finite rod target");
+        const t = clamp(cmd.target, 0, 48);
         const accepted = cmd.indices.filter((i) => Number.isInteger(i) && i >= 0 && i < s.rods.targets.length);
         const withdrawBlocked = s.modeSwitch === "shutdown" || s.modeSwitch === "refuel";
-        if (withdrawBlocked && accepted.some((i) => t > s.rods.positions[i]))
+        if (withdrawBlocked && accepted.some((i) => t > s.rods.positions[i] + 1e-6))
           throw new Error(`ROD WITHDRAW BLOCK: mode switch in ${s.modeSwitch.toUpperCase()}`);
         for (const i of accepted) s.rods.targets[i] = t;
         break;
       }
       case "rodStop":
-        s.rods.targets = s.rods.positions.map((p) => Math.round(p));
+        // Fine-motion drives stop where they are; no snap to a notch.
+        s.rods.targets = [...s.rods.positions];
         break;
       case "setIrmRange":
         s.neutronics.irmRange = clamp(Math.round(cmd.range), 1, 10);
@@ -447,6 +465,8 @@ export class MockSim {
       this.h.rhoBias = -s.neutronics.reactivity.total;
       this.computeReactivity();
     }
+    // Loaded plant starts at its steady pump speed rather than ramping from zero.
+    for (const p of s.feedwater.pumps) p.speedPct = pumpSpeedDemand(p.running, s.feedwater.fcvPos);
     this.h.precursor = s.neutronics.powerFrac;
     this.h.prevPower = s.neutronics.powerFrac;
     this.h.omega = 0;
@@ -463,6 +483,7 @@ export class MockSim {
         const dt = Math.min(0.05, remaining);
         this.step(dt);
         remaining -= dt;
+        if (s.paused) break; // a model-domain error pauses mid-tick
       }
     }
     this.updateAlarms();
@@ -519,7 +540,9 @@ export class MockSim {
 
     // Reactivity & kinetics (prompt-jump, one delayed group)
     this.computeReactivity();
+    // The prompt-jump form is only valid below prompt critical; the clamp is the mock's kinetics fault.
     const rho = Math.min(n.reactivity.total, BETA - 30);
+    n.kineticsFault = n.reactivity.total > BETA - 30 ? "reactivity at prompt critical: prompt-jump model clamped" : null;
     const P = (BETA * this.h.precursor + SOURCE_PCM) / (BETA - rho);
     const pNew = Math.max(P, 1e-12);
     this.h.precursor += LAMBDA * (pNew - this.h.precursor) * dt;
@@ -533,6 +556,7 @@ export class MockSim {
     n.decayHeatMw = this.h.decayFrac * RATED_MWT;
     n.thermalPowerMw = pNew * RATED_MWT * (1 - 0.065) + n.decayHeatMw;
     n.fuelTempC += ((v.coolantTempC + 620 * pNew - n.fuelTempC) / 5) * dt;
+    if (n.fuelTempC > FUEL_ENVELOPE_C) n.fuelEnvelopeExceeded = true; // latched until scenario load
 
     // Xenon / iodine (normalised to 100% equilibrium)
     n.iodineRel += LAMBDA_I * (Math.min(pNew, 1.2) - n.iodineRel) * dt;
@@ -545,9 +569,15 @@ export class MockSim {
     st.msivPos = st.msivPos.map((p, i) => approach(p, st.msivCommandOpen[i] ? 1 : 0, 1 / 5, dt));
     for (const ic of s.ic) {
       ic.valvePos = approach(ic.valvePos, ic.commandOpen ? 1 : 0, 1 / 20, dt);
-      ic.heatMw = ic.valvePos * IC_MW * clamp(v.pressureMpa / 7.2, 0, 1) * (v.coolantTempC > 110 ? 1 : 0);
+      // A dry pool has no heat sink.
+      const sink = ic.poolEmpty ? 0 : 1;
+      ic.heatMw = sink * ic.valvePos * IC_MW * clamp(v.pressureMpa / 7.2, 0, 1) * (v.coolantTempC > 110 ? 1 : 0);
       ic.poolTempC = Math.min(100, ic.poolTempC + (ic.heatMw / 2000) * dt - ((ic.poolTempC - 30) / 1e5) * dt);
-      if (ic.poolTempC >= 100) ic.poolLevelPct = Math.max(0, ic.poolLevelPct - (ic.heatMw / 5000) * dt);
+      const pooling = ic.poolTempC >= 100;
+      if (pooling) ic.poolLevelPct = Math.max(0, ic.poolLevelPct - (ic.heatMw / 5000) * dt);
+      ic.poolEmpty = ic.poolLevelPct <= 0;
+      ic.boiloffKgs = pooling ? (ic.heatMw * 1000) / H_FG_POOL : 0;
+      ic.condensateReturnKgs = (ic.heatMw * 1000) / H_FG_IC;
     }
 
     // Pressure control: integrator on (p - setpoint) drives total valve demand.
@@ -631,22 +661,27 @@ export class MockSim {
     }
     fw.fcvPos = approach(fw.fcvPos, fcvTarget, 0.1, dt);
     const totalFeed = headOk ? fw.fcvPos * cap : 0;
+    // Feed demanded of a hotwell too low to supply it (pump suction cut off).
+    if (nCond > 0 && !headOk) cd.withdrawalDeficitKg += fw.fcvPos * cap * dt;
     const condOnly = headOk && nFeed === 0 && v.pressureMpa < 1.5 ? fw.fcvPos * nCond * 60 * (1 - v.pressureMpa / 1.5) : 0;
     v.feedFlowKgs = totalFeed + condOnly;
     for (const p of fw.pumps) {
       p.flowKgs = p.running && nFeed > 0 ? totalFeed / nFeed : 0;
-      p.speedPct = p.running ? 25 + 75 * fw.fcvPos : 0;
+      p.speedPct = approach(p.speedPct, pumpSpeedDemand(p.running, fw.fcvPos), PUMP_RAMP_PCT_S, dt);
     }
     const fracSteam = clamp(v.steamFlowKgs / 475, 0, 1.1);
     fw.feedTempC = approach(fw.feedTempC, fw.heatersInService ? 40 + 190 * fracSteam : 40, 1, dt);
+    fw.extractionHeatMw = fw.heatersInService ? (v.feedFlowKgs * FEED_CP * Math.max(0, fw.feedTempC - COLD_FEED_C)) / 1000 : 0;
 
     // Hotwell
-    cd.hotwellLevelPct = clamp(
-      cd.hotwellLevelPct + ((st.steamToTurbineKgs + st.steamToBypassKgs + fw.rwcuRejectKgs - v.feedFlowKgs) / 400) * dt +
-        (cd.hotwellLevelPct < 50 ? 0.05 * dt : 0),
-      0,
-      100,
-    );
+    const hotwellRaw =
+      cd.hotwellLevelPct +
+      ((st.steamToTurbineKgs + st.steamToBypassKgs + fw.rwcuRejectKgs - v.feedFlowKgs) / HOTWELL_KG_PER_PCT) * dt +
+      (cd.hotwellLevelPct < 50 ? 0.05 * dt : 0);
+    cd.overflowKg += Math.max(0, hotwellRaw - 100) * HOTWELL_KG_PER_PCT;
+    cd.hotwellLevelPct = clamp(hotwellRaw, 0, 100);
+    // Condensate settles toward saturation at condenser pressure.
+    cd.hotwellTempC = approach(cd.hotwellTempC, tsat(cd.pressureKpa / 1000), 0.05, dt);
 
     // Vessel energy balance
     const qIc = s.ic.reduce((a, ic) => a + ic.heatMw, 0);
@@ -661,16 +696,23 @@ export class MockSim {
     const capMJperK = 1100;
     const dT = ((n.thermalPowerMw - qSteam - qFeed - qIc - qLoss) / capMJperK) * dt;
     const prevT = v.coolantTempC;
-    v.coolantTempC = clamp(v.coolantTempC + dT, 15, 320);
+    const coolantRaw = v.coolantTempC + dT;
+    v.coolantTempC = clamp(coolantRaw, 15, COOLANT_MAX_C);
     if (v.headVentOpen && v.coolantTempC > 100 && v.pressureMpa < 0.2) v.coolantTempC = 100;
     v.heatupRateCph = v.heatupRateCph + (((v.coolantTempC - prevT) / dt) * 3600 - v.heatupRateCph) * Math.min(1, dt / 30);
     v.pressureMpa = v.coolantTempC > 100 ? Math.max(psat(v.coolantTempC), 0.101) : 0.101;
     if (v.headVentOpen) v.pressureMpa = Math.min(v.pressureMpa, 0.12);
+    // Head-space air follows the atmosphere while vented and stays trapped once sealed.
+    if (v.headVentOpen) {
+      v.headGasPressureMpa = Math.max(0, 0.101325 - (v.coolantTempC < 100 ? psat(v.coolantTempC) : 0.101325));
+      v.headGasKg = (v.headGasPressureMpa * 1e3 * HEAD_SPACE_M3) / (R_AIR_KJ * (v.coolantTempC + 273.15));
+    }
     v.coreInletSubcoolingKjKg = Math.max(0, 4.19 * (tsat(v.pressureMpa) - (v.coolantTempC * 0.9 + fw.feedTempC * 0.1)));
 
     // Inventory: 8900 kg per metre of level, plus void swell
     const boilOff = boiling ? v.steamFlowKgs : 0;
-    this.h.massLevelM += ((v.feedFlowKgs - boilOff - fw.rwcuRejectKgs) / 8900) * dt;
+    this.h.massLevelM += ((v.feedFlowKgs - boilOff - fw.rwcuRejectKgs) / VESSEL_KG_PER_M) * dt;
+    v.inventoryShortfallKg += Math.max(0, -6 - this.h.massLevelM) * VESSEL_KG_PER_M;
     this.h.massLevelM = clamp(this.h.massLevelM, -6, 16);
     this.updateVoids(dt);
     v.levelAboveTafM = this.h.massLevelM + (v.chimneyVoid - 0.45) * 1.2 ;
@@ -682,6 +724,15 @@ export class MockSim {
     const fs = Math.pow(10, -6 + 0.5 * (n.irmRange - 1));
     n.irmReadingPct = clamp((n.powerFrac / fs) * 100 * noise(), 0, 125);
     n.aprmPct = (n.thermalPowerMw / RATED_MWT) * 100 * (1 + (Math.random() - 0.5) * 0.004);
+
+    // Leaving the mock's modeled range pauses the sim, as the engine does on a model-domain error.
+    const finite = [v.pressureMpa, v.coolantTempC, n.powerFrac, n.fuelTempC, this.h.massLevelM].every(Number.isFinite);
+    s.modelError = !finite
+      ? "non-finite state in mock step"
+      : coolantRaw > COOLANT_MAX_C
+        ? `coolant temperature above mock model range (${COOLANT_MAX_C} C)`
+        : null;
+    if (s.modelError) s.paused = true;
 
     this.autoTrips();
   }

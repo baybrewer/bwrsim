@@ -23,6 +23,10 @@ pub struct SteamSystem {
     /// The steam line and valve throttling are isenthalpic: this is the vessel
     /// outlet enthalpy, not the saturated-vapour enthalpy at chest pressure.
     pub h_steam: f64,
+    /// Remaining time of a latched bypass fast-open stroke, s. A turbine-trip or
+    /// load-rejection signal arms it for one full fast stroke even when the
+    /// signal itself lasts only one scan.
+    pub fast_open_latch: f64,
 }
 
 impl SteamSystem {
@@ -40,6 +44,7 @@ impl SteamSystem {
             w_bypass: 0.0,
             p_chest: 0.0,
             h_steam: sat_p(P_ATM).h_g,
+            fast_open_latch: 0.0,
         }
     }
 
@@ -92,7 +97,11 @@ impl SteamSystem {
     }
 
     /// As `step`, with the bypass fast-open demand given explicitly: `fast_open`
-    /// is the valid turbine-trip / generator load-rejection signal.
+    /// is the valid turbine-trip / generator load-rejection signal. The signal
+    /// latches for one full fast stroke (`BYPASS_FAST_OPEN_TIME`). While latched,
+    /// the TCVs fast-close to the governor demand (power/load unbalance action)
+    /// and the bypass takes the pressure regulator demand net of that governor
+    /// demand at once, instead of waiting for the TCVs to stroke shut.
     pub fn step_ext(
         &mut self,
         dt: f64,
@@ -108,11 +117,21 @@ impl SteamSystem {
             self.msiv_pos[i] += d.clamp(-dt / MSIV_STROKE, dt / MSIV_STROKE);
         }
         let p_ref = if self.p_chest > 0.5e6 { self.p_chest } else { (p - 0.05e6).max(0.2e6) };
+        if fast_open {
+            self.fast_open_latch = BYPASS_FAST_OPEN_TIME;
+        }
+        let latched = self.fast_open_latch > 0.0;
 
         // Turbine control valves.
         let tcv_target = if tripped { 0.0 } else { (tcv_flow_demand / (C_TCV * p_ref)).clamp(0.0, 1.0) };
         let d = tcv_target - self.tcv_pos;
-        let (open_rate, close_rate) = if tripped { (0.0, 5.0) } else { (0.10, 0.5) };
+        let (open_rate, close_rate) = if tripped {
+            (0.0, 5.0)
+        } else if latched {
+            (0.10, 5.0)
+        } else {
+            (0.10, 0.5)
+        };
         self.tcv_pos += d.clamp(-close_rate * dt, open_rate * dt);
 
         // Bypass valves.
@@ -120,7 +139,10 @@ impl SteamSystem {
             0.0
         } else if self.bypass_auto {
             let demand = self.pressure_demand(p);
-            let tcv_flow = if tripped { 0.0 } else { C_TCV * self.tcv_pos * p_ref };
+            // During a fast-open stroke the TCVs are heading for their target, so
+            // the bypass is sized against that target, not the valve's lagging position.
+            let tcv_open = if latched { tcv_target } else { self.tcv_pos };
+            let tcv_flow = if tripped { 0.0 } else { C_TCV * tcv_open * p_ref };
             ((demand - tcv_flow).max(0.0) / (C_BYPASS * p_ref)).clamp(0.0, 1.0)
         } else {
             self.bypass_manual_pos.clamp(0.0, 1.0)
@@ -128,12 +150,17 @@ impl SteamSystem {
         let d = target - self.bypass_pos;
         let (open_rate, close_rate) = if !self.bypass_auto {
             (BYPASS_MANUAL_RATE, BYPASS_MANUAL_RATE)
-        } else if fast_open {
+        } else if latched {
             (BYPASS_FAST_OPEN_RATE, BYPASS_REG_RATE)
         } else {
             (BYPASS_REG_RATE, BYPASS_REG_RATE)
         };
         self.bypass_pos += d.clamp(-close_rate * dt, open_rate * dt);
+        // Drop a rounding remainder so a stroke of n steps latches exactly n steps.
+        self.fast_open_latch = self.fast_open_latch - dt;
+        if self.fast_open_latch < 1e-9 {
+            self.fast_open_latch = 0.0;
+        }
     }
 }
 
@@ -289,25 +316,39 @@ impl Turbine {
 
 // ------------------------------------------------------------------ condenser
 
-/// Lumped condenser / hotwell energy, J, on a liquid-enthalpy basis (zero at 0 degC):
-/// hotwell water plus the condenser metal at the same temperature.
-fn condenser_energy(t: f64, hotwell_mass: f64) -> f64 {
-    hotwell_mass * steam::h_liquid(t) + CONDENSER_METAL_HEAT_CAP * t
+/// Shell vapour mass in saturated equilibrium at `t` with total node mass `m`, kg:
+/// the shell steam space is filled with saturated vapour, unless there is too
+/// little water to fill it.
+fn condenser_vapour_mass(t: f64, m: f64) -> f64 {
+    (sat_t(t).rho_g * CONDENSER_VOLUME).min(m.max(0.0))
 }
 
+/// Equilibrium energy of the condenser node, J, at temperature `t` with total
+/// water mass `m` (hotwell liquid plus shell vapour): liquid on a saturated-liquid
+/// enthalpy basis (zero at 0 degC), vapour on its internal energy, plus the
+/// condenser metal at the same temperature.
+fn condenser_energy(t: f64, m: f64) -> f64 {
+    let sat = sat_t(t);
+    let m_v = condenser_vapour_mass(t, m);
+    (m - m_v) * sat.h_f + m_v * sat.u_g() + CONDENSER_METAL_HEAT_CAP * t
+}
+
+const CONDENSER_T_MIN: f64 = 1.0;
+const CONDENSER_T_MAX: f64 = 200.0;
+
 /// Inverse of `condenser_energy` for the temperature, degC (bisection; the
-/// energy is strictly increasing in temperature).
-fn condenser_temperature(energy: f64, hotwell_mass: f64) -> f64 {
-    let (mut lo, mut hi) = (1.0f64, 200.0f64);
-    if condenser_energy(lo, hotwell_mass) >= energy {
+/// energy is strictly increasing in temperature because u_g > h_f).
+fn condenser_temperature(energy: f64, m: f64) -> f64 {
+    let (mut lo, mut hi) = (CONDENSER_T_MIN, CONDENSER_T_MAX);
+    if condenser_energy(lo, m) >= energy {
         return lo;
     }
-    if condenser_energy(hi, hotwell_mass) <= energy {
+    if condenser_energy(hi, m) <= energy {
         return hi;
     }
-    for _ in 0..50 {
+    for _ in 0..60 {
         let mid = 0.5 * (lo + hi);
-        if condenser_energy(mid, hotwell_mass) < energy {
+        if condenser_energy(mid, m) < energy {
             lo = mid;
         } else {
             hi = mid;
@@ -316,9 +357,12 @@ fn condenser_temperature(energy: f64, hotwell_mass: f64) -> f64 {
     0.5 * (lo + hi)
 }
 
-/// Condenser and hotwell as one first-law node: the shell vapour is in
-/// equilibrium with the hotwell liquid, cooling water removes heat from that
-/// node, and every mass transfer across the boundary is reported explicitly.
+/// Condenser shell and hotwell as one equilibrium two-phase node: shell vapour
+/// (`vapour_mass`) and hotwell liquid (`hotwell_mass`) share one saturation
+/// temperature, so condensation and evaporation are the phase split of the
+/// conserved total mass and energy. Cooling water removes heat from the node,
+/// the shell relief vents saturated steam (mass and enthalpy) at its set
+/// pressure, and every mass transfer across the boundary is reported explicitly.
 #[derive(Clone, Debug)]
 pub struct Condenser {
     pub m_air: f64,
@@ -326,18 +370,23 @@ pub struct Condenser {
     pub p_steam: f64,
     pub cw_pumps: [bool; N_CW_PUMPS],
     pub vacuum_pump: bool,
+    /// Hotwell liquid, kg.
     pub hotwell_mass: f64,
+    /// Saturated vapour in the shell steam space, kg.
+    pub vapour_mass: f64,
     /// Thermal load delivered to the node this step, W (same as `q_in_w`).
     pub heat_load: f64,
     /// Node (condensing / hotwell) temperature, degC.
     pub t_sat: f64,
-    /// Lumped water + metal energy, J. See `condenser_energy`.
+    /// Node energy, J: the conserved state. See `condenser_energy`.
     pub energy_j: f64,
     /// Enthalpy flow entering the node this step, W (steam, drains, returns).
     pub q_in_w: f64,
     /// Heat rejected to the circulating water this step, W.
     pub q_cw_w: f64,
-    /// Energy vented through the shell relief this step, W.
+    /// Steam vented through the shell relief this step, kg/s.
+    pub w_relief: f64,
+    /// Enthalpy vented with that steam this step, W (`w_relief * h_g`).
     pub q_relief_w: f64,
     /// Makeup from the condensate storage tank this step, kg/s.
     pub w_makeup: f64,
@@ -349,55 +398,75 @@ pub struct Condenser {
     pub w_out_accepted: f64,
     /// Requested withdrawal that the hotwell could not supply, kg/s.
     pub w_out_shortfall: f64,
+    /// Net enthalpy flow exchanged with the condensate storage tank this step
+    /// (makeup in minus reject and overflow out), W.
+    pub q_cst_w: f64,
     /// Cumulative boundary exchanges with the condensate storage tank, kg.
     pub makeup_kg: f64,
     pub reject_kg: f64,
     pub overflow_kg: f64,
+    /// Cumulative net enthalpy received from the condensate storage tank, J.
+    pub cst_energy_j: f64,
     /// Cumulative withdrawal the hotwell could not supply, kg.
     pub withdrawal_deficit_kg: f64,
-    /// Cumulative energy vented through the shell relief, J.
+    /// Cumulative steam vented through the shell relief, kg.
+    pub relief_kg: f64,
+    /// Cumulative enthalpy vented through the shell relief, J.
     pub relief_energy_j: f64,
     /// Cumulative energy the node could not absorb within its temperature
-    /// domain (only non-zero if the caller withdraws more heat than stored), J.
+    /// domain (only non-zero outside 1..200 degC), J.
     pub energy_residual_j: f64,
 }
 
 impl Condenser {
     pub fn new(vacuum: bool) -> Self {
         let p_air = if vacuum { 0.3e3 } else { P_ATM - 2.3e3 };
-        let t = CW_INLET_C;
-        let hotwell_mass = 0.6 * HOTWELL_CAPACITY;
-        Self {
+        let mut c = Self {
             m_air: p_air * CONDENSER_VOLUME / (287.0 * 303.0),
-            p_steam: sat_t(t).p,
+            p_steam: 0.0,
             cw_pumps: [vacuum; N_CW_PUMPS],
             vacuum_pump: vacuum,
-            hotwell_mass,
+            hotwell_mass: 0.6 * HOTWELL_CAPACITY,
+            vapour_mass: 0.0,
             heat_load: 0.0,
-            t_sat: t,
-            energy_j: condenser_energy(t, hotwell_mass),
+            t_sat: CW_INLET_C,
+            energy_j: 0.0,
             q_in_w: 0.0,
             q_cw_w: 0.0,
+            w_relief: 0.0,
             q_relief_w: 0.0,
             w_makeup: 0.0,
             w_reject: 0.0,
             w_overflow: 0.0,
             w_out_accepted: 0.0,
             w_out_shortfall: 0.0,
+            q_cst_w: 0.0,
             makeup_kg: 0.0,
             reject_kg: 0.0,
             overflow_kg: 0.0,
+            cst_energy_j: 0.0,
             withdrawal_deficit_kg: 0.0,
+            relief_kg: 0.0,
             relief_energy_j: 0.0,
             energy_residual_j: 0.0,
-        }
+        };
+        c.set_temperature(CW_INLET_C);
+        c
     }
 
-    /// Set the node temperature directly (scenario initialisation).
+    /// Set the node temperature directly (scenario initialisation), keeping
+    /// `hotwell_mass` as the liquid inventory and filling the shell with
+    /// saturated vapour at that temperature.
     pub fn set_temperature(&mut self, t: f64) {
         self.t_sat = t;
         self.p_steam = sat_t(t).p;
-        self.energy_j = condenser_energy(t, self.hotwell_mass);
+        self.vapour_mass = sat_t(t).rho_g * CONDENSER_VOLUME;
+        self.energy_j = condenser_energy(t, self.inventory_kg());
+    }
+
+    /// Water held by the node (hotwell liquid plus shell vapour), kg.
+    pub fn inventory_kg(&self) -> f64 {
+        self.hotwell_mass + self.vapour_mass
     }
 
     pub fn p_air(&self) -> f64 {
@@ -429,6 +498,27 @@ impl Condenser {
         (mcp * eff * (t - CW_INLET_C)).max(0.0)
     }
 
+    /// Makeup rate the level controller runs this step, kg/s.
+    fn makeup_rate(&self) -> f64 {
+        if self.hotwell_mass / HOTWELL_CAPACITY < HOTWELL_MAKEUP_FRAC {
+            HOTWELL_TRANSFER_RATE
+        } else {
+            0.0
+        }
+    }
+
+    /// Condensate withdrawal the hotwell can supply over the next step of
+    /// length `dt` from its current liquid plus makeup, kg/s, before counting
+    /// any of this step's returns. A caller that bounds its feed demand by this
+    /// before integrating the receiving vessel gets `w_out_accepted` equal to
+    /// that bounded demand from `step_energy`, so both ends see the same flow.
+    pub fn withdrawal_limit(&self, dt: f64) -> f64 {
+        if dt <= 0.0 {
+            return 0.0;
+        }
+        (self.hotwell_mass / dt + self.makeup_rate()).max(0.0)
+    }
+
     /// Advance with `q` the heat to reject (W) net of the hotwell enthalpy of the
     /// returned mass, `w_in` water returned to the hotwell and `w_out` condensate
     /// pumped out, kg/s. Kept for callers that already subtract `w_in * h(hotwell)`;
@@ -440,46 +530,83 @@ impl Condenser {
 
     /// Advance the node: `q_in_w` is the enthalpy flow carried into the shell by
     /// the returned mass `w_in` (kg/s), net of any turbine work and extraction
-    /// already taken from that steam; `w_out` is the condensate withdrawal demand.
+    /// already taken from that steam; `w_out` is the condensate withdrawal demand,
+    /// taken at the start-of-step hotwell enthalpy (the enthalpy the feedwater
+    /// train is given for the same step).
+    ///
+    /// Order: returns, makeup, CW and the withdrawal change the conserved mass and
+    /// energy; the node then re-equilibrates (condensing or evaporating); the
+    /// relief vents saturated steam if the shell is above its set pressure; level
+    /// reject and overflow finally remove liquid at the end temperature, which
+    /// leaves that temperature unchanged.
     pub fn step_energy(&mut self, dt: f64, q_in_w: f64, w_in: f64, w_out: f64) {
-        let h_hw = steam::h_liquid(self.t_sat);
+        let h_hw0 = steam::h_liquid(self.t_sat);
         let h_cst = steam::h_liquid(CST_TEMP_C);
         let frac0 = self.hotwell_mass / HOTWELL_CAPACITY;
 
-        // Mass: returns and makeup first, then withdrawals bounded by what is there.
-        self.w_makeup = if frac0 < HOTWELL_MAKEUP_FRAC { HOTWELL_TRANSFER_RATE } else { 0.0 };
-        let mut mass = self.hotwell_mass + (w_in.max(0.0) + self.w_makeup) * dt;
-        self.w_out_accepted = w_out.max(0.0).min(mass / dt);
+        // Returns and makeup, then the withdrawal bounded by the liquid that is there.
+        self.w_makeup = self.makeup_rate();
+        let mut mass = self.inventory_kg() + (w_in.max(0.0) + self.w_makeup) * dt;
+        let liquid = (mass - self.vapour_mass).max(0.0);
+        self.w_out_accepted = w_out.max(0.0).min(liquid / dt);
         self.w_out_shortfall = w_out.max(0.0) - self.w_out_accepted;
         mass -= self.w_out_accepted * dt;
-        self.w_reject = if frac0 > HOTWELL_REJECT_FRAC { HOTWELL_TRANSFER_RATE.min(mass / dt) } else { 0.0 };
-        mass -= self.w_reject * dt;
-        self.w_overflow = ((mass - HOTWELL_CAPACITY) / dt).max(0.0);
-        mass -= self.w_overflow * dt;
-        self.hotwell_mass = mass;
-        self.makeup_kg += self.w_makeup * dt;
-        self.reject_kg += self.w_reject * dt;
-        self.overflow_kg += self.w_overflow * dt;
-        self.withdrawal_deficit_kg += self.w_out_shortfall * dt;
 
-        // Energy: first law on the lumped node.
         self.q_in_w = q_in_w;
         self.heat_load = q_in_w;
         self.q_cw_w = self.cw_rejection(self.t_sat);
-        let q_boundary = self.w_makeup * h_cst - (self.w_out_accepted + self.w_reject + self.w_overflow) * h_hw;
-        self.energy_j += (q_in_w - self.q_cw_w + q_boundary) * dt;
+        let mut energy = self.energy_j
+            + (q_in_w - self.q_cw_w + self.w_makeup * h_cst - self.w_out_accepted * h_hw0) * dt;
+
+        // Phase equilibrium of the conserved mass and energy.
+        let mut t = condenser_temperature(energy, mass);
+
+        // Shell relief: vent saturated steam until the node is back at the relief
+        // temperature. With h_fg the latent heat there, the vented mass follows
+        // exactly from E - m h_g = E_eq(M - m, T_r) = E_eq(M, T_r) - m h_f.
         let t_relief = sat_p(CONDENSER_RELIEF_P).t;
-        let e_relief = condenser_energy(t_relief, self.hotwell_mass);
-        self.q_relief_w = if self.energy_j > e_relief { (self.energy_j - e_relief) / dt } else { 0.0 };
-        self.energy_j -= self.q_relief_w * dt;
+        self.w_relief = 0.0;
+        self.q_relief_w = 0.0;
+        if t > t_relief {
+            let sat_r = sat_t(t_relief);
+            let m_relief = ((energy - condenser_energy(t_relief, mass)) / sat_r.h_fg()).clamp(0.0, mass);
+            self.w_relief = m_relief / dt;
+            self.q_relief_w = self.w_relief * sat_r.h_g;
+            mass -= m_relief;
+            energy -= m_relief * sat_r.h_g;
+            t = t_relief;
+        }
+        self.relief_kg += self.w_relief * dt;
         self.relief_energy_j += self.q_relief_w * dt;
-        let t = condenser_temperature(self.energy_j, self.hotwell_mass);
-        let e_t = condenser_energy(t, self.hotwell_mass);
-        // Only the lower domain bound can leave a residual (heat withdrawn below 1 degC).
-        self.energy_residual_j += self.energy_j - e_t;
-        self.energy_j = e_t;
+
+        // Only the 1..200 degC domain bounds can leave a residual.
+        if t <= CONDENSER_T_MIN || t >= CONDENSER_T_MAX {
+            let e_t = condenser_energy(t, mass);
+            self.energy_residual_j += energy - e_t;
+            energy = e_t;
+        }
+        self.vapour_mass = condenser_vapour_mass(t, mass);
+        let mut liquid = mass - self.vapour_mass;
+
+        // Level control and overflow to the CST: liquid leaves at h_f(t), which
+        // keeps the equilibrium temperature unchanged.
+        let h_hw = steam::h_liquid(t);
+        self.w_reject = if frac0 > HOTWELL_REJECT_FRAC { HOTWELL_TRANSFER_RATE.min(liquid / dt) } else { 0.0 };
+        liquid -= self.w_reject * dt;
+        self.w_overflow = ((liquid - HOTWELL_CAPACITY) / dt).max(0.0);
+        liquid -= self.w_overflow * dt;
+        energy -= (self.w_reject + self.w_overflow) * h_hw * dt;
+        self.q_cst_w = self.w_makeup * h_cst - (self.w_reject + self.w_overflow) * h_hw;
+
+        self.hotwell_mass = liquid;
+        self.energy_j = energy;
         self.t_sat = t;
         self.p_steam = sat_t(t).p;
+        self.makeup_kg += self.w_makeup * dt;
+        self.reject_kg += self.w_reject * dt;
+        self.overflow_kg += self.w_overflow * dt;
+        self.cst_energy_j += self.q_cst_w * dt;
+        self.withdrawal_deficit_kg += self.w_out_shortfall * dt;
 
         let p = self.pressure();
         let leak = AIR_INLEAKAGE * ((P_ATM - p) / P_ATM).clamp(0.0, 1.0);
@@ -541,7 +668,13 @@ pub struct Feedwater {
     /// Heater train outlet (feedwater) temperature, degC: the lumped heater node.
     pub t_feed: f64,
     pub rwcu_reject: f64,
+    /// Feedwater flow, kg/s: the pump hydraulic flow after `step_hydraulics`, and
+    /// the flow actually delivered (after any hotwell limit) after `step_heater`.
     pub flow: f64,
+    /// Specific enthalpy of the feedwater delivered this step, J/kg: the heater
+    /// outlet at the start of the step. The heater energy balance debits exactly
+    /// `flow * h_feed_delivered`, so the vessel feed port must use this value.
+    pub h_feed_delivered: f64,
     /// Extraction heat actually transferred to the heater node this step, W.
     /// Debit this from the turbine / condenser side.
     pub q_extraction_w: f64,
@@ -578,6 +711,7 @@ impl Feedwater {
             t_feed,
             rwcu_reject: 0.0,
             flow: 0.0,
+            h_feed_delivered: steam::h_liquid(t_feed),
             q_extraction_w: 0.0,
             q_extraction_avail_w: 0.0,
             q_pump_w: 0.0,
@@ -632,8 +766,10 @@ impl Feedwater {
         let valve = |q: f64| (q / (C_FCV * fcv_characteristic(pos))).powi(2);
         // Differential the pumps must supply at total flow q.
         let header_dp = |q: f64| p_reactor + static_dp + valve(q) - p_suction;
-        let speeds: Vec<f64> =
-            self.pumps.iter().zip(self.pump_speed.iter()).filter(|(&on, _)| on).map(|(_, &s)| s).collect();
+        // Every turning shaft develops head by the affinity law, energised or
+        // coasting; a pump's check valve closes once its shutoff head falls below
+        // the header differential (`pump_curve_flow` returns zero there).
+        let speeds: Vec<f64> = self.pump_speed.iter().copied().filter(|&s| s > 0.0).collect();
 
         if speeds.is_empty() {
             // Condensate pressure alone, through the idle feed pumps.
@@ -674,10 +810,9 @@ impl Feedwater {
         let q = 0.5 * (lo + hi);
         let dp = header_dp(q);
         let raw: Vec<f64> = self
-            .pumps
+            .pump_speed
             .iter()
-            .zip(self.pump_speed.iter())
-            .map(|(&on, &s)| if on { Self::pump_curve_flow(s, dp) } else { 0.0 })
+            .map(|&s| if s > 0.0 { Self::pump_curve_flow(s, dp) } else { 0.0 })
             .collect();
         let sum: f64 = raw.iter().sum();
         if sum > 0.0 {
@@ -688,7 +823,10 @@ impl Feedwater {
         q
     }
 
-    /// Level controller, pump drives, hydraulics and heater energy balance.
+    /// Level controller, pump drives, hydraulics and heater energy balance in one
+    /// call, with the extraction bounded by `turbine_flow` and the whole pump flow
+    /// delivered. A coupled plant step should call `step_hydraulics` before the
+    /// vessel and `step_heater` after it, with the delivered flows.
     /// Returns any pump trip message.
     pub fn step(
         &mut self,
@@ -699,6 +837,22 @@ impl Feedwater {
         turbine_flow: f64,
         hotwell_ok: bool,
         hotwell_t: f64,
+    ) -> Option<String> {
+        let msg = self.step_hydraulics(dt, p_reactor, level_cm, steam_flow, hotwell_ok);
+        self.step_heater(dt, self.flow, turbine_flow, hotwell_t);
+        msg
+    }
+
+    /// Level controller, pump drives and hydraulics: sets `flow` to the pump flow
+    /// demand on the hotwell and fixes `h_feed_delivered` for this step.
+    /// Returns any pump trip message.
+    pub fn step_hydraulics(
+        &mut self,
+        dt: f64,
+        p_reactor: f64,
+        level_cm: f64,
+        steam_flow: f64,
+        hotwell_ok: bool,
     ) -> Option<String> {
         let mut msg = None;
         let p_s = self.suction_pressure(hotwell_ok);
@@ -743,16 +897,32 @@ impl Feedwater {
         }
 
         self.flow = self.hydraulics(p_reactor, p_s);
+        self.h_feed_delivered = steam::h_liquid(self.t_feed);
+        msg
+    }
 
-        // Feedwater heater node: extraction steam from the turbine is the only heat
-        // source, bounded by the steam actually flowing to the turbine, and the
-        // node's stored energy drains into the feedwater once that steam is gone.
+    /// Feedwater heater node over the step, on the flows that were actually
+    /// delivered: `w_feed` (kg/s, at most the hydraulic flow) leaves at
+    /// `h_feed_delivered`, and extraction heat is bounded by `turbine_flow`, the
+    /// steam the vessel actually delivered to the turbine (kg/s). Extraction steam
+    /// is the only heat source; the stored energy drains into the feedwater once
+    /// that steam is gone.
+    pub fn step_heater(&mut self, dt: f64, w_feed: f64, turbine_flow: f64, hotwell_t: f64) {
+        let w_feed = w_feed.clamp(0.0, self.flow);
+        if self.flow > 0.0 {
+            let scale = w_feed / self.flow;
+            for pf in self.pump_flow.iter_mut() {
+                *pf *= scale;
+            }
+        }
+        self.flow = w_feed;
         let h_in = steam::h_liquid(hotwell_t);
-        let h_out = steam::h_liquid(self.t_feed);
+        let h_out = self.h_feed_delivered;
         let service = if self.heaters_in_service { 1.0 } else { 0.65 };
         let load = (turbine_flow / STEAM_FLOW_RATED).clamp(0.0, 1.2);
         let t_des = hotwell_t + (T_FW_RATED - 35.0) * load.powf(0.75) * service + FW_PUMP_TEMP_RISE;
-        self.q_pump_w = if self.running_pumps() > 0 { self.flow * CP_WATER * FW_PUMP_TEMP_RISE } else { 0.0 };
+        let pumped: f64 = self.pump_flow.iter().sum();
+        self.q_pump_w = pumped * CP_WATER * FW_PUMP_TEMP_RISE;
         self.q_loss_w = FW_HEATER_LOSS_UA * (self.t_feed - CST_TEMP_C).max(0.0);
         self.q_extraction_avail_w = turbine_flow.max(0.0) * FW_EXTRACTION_HEAT_PER_KG * service;
         let q_needed = self.flow * (steam::h_liquid(t_des) - h_in) + FW_HEATER_HEAT_CAP * (t_des - self.t_feed) / 60.0
@@ -761,11 +931,12 @@ impl Feedwater {
         self.q_extraction_w = q_needed.clamp(0.0, self.q_extraction_avail_w);
         let q_net = self.q_extraction_w + self.q_pump_w - self.q_loss_w - self.flow * (h_out - h_in);
         self.t_feed += q_net * dt / FW_HEATER_HEAT_CAP;
-        msg
     }
 
+    /// Feedwater enthalpy delivered to the vessel for the current step, J/kg.
+    /// This is `h_feed_delivered`, the value the heater balance debits.
     pub fn h_feed(&self) -> f64 {
-        steam::h_liquid(self.t_feed)
+        self.h_feed_delivered
     }
 }
 
@@ -872,10 +1043,11 @@ mod tests {
         let mut c = Condenser::new(true);
         c.hotwell_mass = HOTWELL_CAPACITY - 1.0;
         c.set_temperature(35.0);
-        let m0 = c.hotwell_mass;
+        let m0 = c.inventory_kg();
         c.step(1.0, 1.0e6, 100.0, 0.0);
         assert_eq!(c.hotwell_mass, HOTWELL_CAPACITY);
-        let accounted = (c.hotwell_mass - m0) + c.reject_kg + c.overflow_kg;
+        // CW cools the node, so some shell vapour condenses: count the whole inventory.
+        let accounted = (c.inventory_kg() - m0) + c.reject_kg + c.overflow_kg;
         assert!((accounted - 100.0).abs() < 1e-9, "accounted {accounted}");
         assert!(c.overflow_kg > 0.0 && c.reject_kg > 0.0);
     }
@@ -945,5 +1117,148 @@ mod tests {
         both.step(DT, P_RATED, 0.0, 0.0, 0.0, true, 35.0);
         assert!(both.pump_speed[0] < 1.0, "drives follow the feed demand");
         assert!((both.pump_flow[0] - both.pump_flow[1]).abs() < 1e-6);
+    }
+
+    /// One condenser step's mass and energy residuals against its reported
+    /// boundary flows, (kg, J).
+    fn condenser_step_residuals(c: &mut Condenser, dt: f64, q_in: f64, w_in: f64, w_out: f64) -> (f64, f64) {
+        let (m0, e0, h_hw0) = (c.inventory_kg(), c.energy_j, steam::h_liquid(c.t_sat));
+        c.step_energy(dt, q_in, w_in, w_out);
+        let dm = (w_in + c.w_makeup - c.w_out_accepted - c.w_reject - c.w_overflow - c.w_relief) * dt;
+        let de = (q_in - c.q_cw_w - c.w_out_accepted * h_hw0 + c.q_cst_w - c.q_relief_w) * dt;
+        (c.inventory_kg() - m0 - dm, c.energy_j - e0 - de)
+    }
+
+    #[test]
+    fn condenser_without_cw_conserves_mass_and_energy_and_accumulates_vapour() {
+        let mut c = Condenser::new(false);
+        c.set_temperature(35.0);
+        let (w, dt) = (STEAM_FLOW_RATED, 1.0);
+        let (v0, p0) = (c.vapour_mass, c.p_steam);
+        let (mut max_dm, mut max_de) = (0.0f64, 0.0f64);
+        let mut saw_vapour_rise = false;
+        for _ in 0..400 {
+            let q_in = 548.0e6 + w * steam::h_liquid(c.t_sat);
+            let (dm, de) = condenser_step_residuals(&mut c, dt, q_in, w, w);
+            max_dm = max_dm.max(dm.abs());
+            max_de = max_de.max(de.abs());
+            saw_vapour_rise |= c.w_relief == 0.0 && c.vapour_mass > 5.0 * v0;
+        }
+        eprintln!("no-CW condenser: max |residual| {max_dm:.3e} kg, {max_de:.3e} J per step");
+        // Residuals are floating-point rounding on a ~1e10 J, ~1e5 kg node.
+        assert!(max_dm < 1e-6, "mass residual {max_dm} kg per step");
+        assert!(max_de < 1e-2, "energy residual {max_de} J per step");
+        assert!(saw_vapour_rise, "shell vapour must accumulate before relief");
+        assert!(c.p_steam > 10.0 * p0, "pressure {} from {}", c.p_steam, p0);
+        assert!(c.relief_kg > 0.0, "relief must export steam mass");
+        assert_eq!(c.energy_residual_j, 0.0);
+    }
+
+    #[test]
+    fn condenser_relief_exports_steam_mass_with_its_enthalpy() {
+        let mut c = Condenser::new(false);
+        c.set_temperature(sat_p(CONDENSER_RELIEF_P).t);
+        let m0 = c.inventory_kg();
+        let (dm, de) = condenser_step_residuals(&mut c, 1.0, 100.0e6, 0.0, 0.0);
+        assert!(dm.abs() < 1e-6 && de.abs() < 1e-2, "residuals {dm} kg {de} J");
+        let h_g = sat_p(CONDENSER_RELIEF_P).h_g;
+        let h_fg = sat_p(CONDENSER_RELIEF_P).h_fg();
+        // 100 MJ boils off about 100 MJ / h_fg of water, which leaves as steam at h_g.
+        assert!((c.relief_kg - 100.0e6 / h_fg).abs() < 0.02 * c.relief_kg, "relief {} kg", c.relief_kg);
+        assert!((m0 - c.inventory_kg() - c.relief_kg).abs() < 1e-6);
+        assert!((c.relief_energy_j - c.relief_kg * h_g).abs() < 1e-3);
+        assert!(c.pressure() <= CONDENSER_RELIEF_P);
+    }
+
+    #[test]
+    fn bounded_feed_demand_is_fully_accepted_by_the_hotwell() {
+        let mut c = Condenser::new(true);
+        c.hotwell_mass = 6000.1;
+        c.set_temperature(35.0);
+        let dt = 20.0;
+        let w_feed = 989.0f64.min(c.withdrawal_limit(dt));
+        assert!(w_feed < 989.0, "the limit must bind in this case");
+        c.step_energy(dt, 50.0 * steam::h_liquid(35.0), 50.0, w_feed);
+        assert_eq!(c.w_out_accepted, w_feed);
+        assert_eq!(c.w_out_shortfall, 0.0);
+        assert!(c.hotwell_mass >= 0.0);
+    }
+
+    #[test]
+    fn heater_energy_identity_closes_each_step() {
+        let mut fw = Feedwater::new(2, T_FW_RATED, LevelControlMode::Manual, 0.7);
+        fw.fcv_manual = 0.7;
+        let hw = 35.0;
+        let h_hw = steam::h_liquid(hw);
+        let mut max_res = 0.0f64;
+        for k in 0..2400 {
+            // Full extraction, then none, then a delivered-feed limit.
+            let w_t = if k < 800 { STEAM_FLOW_RATED } else { 0.0 };
+            let t0 = fw.t_feed;
+            fw.step_hydraulics(DT, P_RATED, 0.0, 0.0, true);
+            let w_feed = if k >= 1600 { 0.5 * fw.flow } else { fw.flow };
+            fw.step_heater(DT, w_feed, w_t, hw);
+            assert_eq!(fw.h_feed(), fw.h_feed_delivered, "vessel and heater must see one enthalpy");
+            let stored = FW_HEATER_HEAT_CAP * (fw.t_feed - t0);
+            let ports = DT * (fw.q_extraction_w + fw.q_pump_w - fw.q_loss_w - fw.flow * (fw.h_feed_delivered - h_hw));
+            max_res = max_res.max((stored - ports).abs());
+        }
+        eprintln!("heater identity: max |residual| {max_res:.3e} J per step");
+        assert!(max_res < 1e-3, "heater residual {max_res} J");
+    }
+
+    #[test]
+    fn extraction_is_bounded_by_delivered_turbine_flow() {
+        let mut fw = Feedwater::new(2, T_FW_RATED, LevelControlMode::Manual, 0.7);
+        fw.fcv_manual = 0.7;
+        // The governor requests rated steam but the vessel delivers almost none.
+        fw.step_hydraulics(DT, P_RATED, 0.0, STEAM_FLOW_RATED, true);
+        let delivered = 0.002;
+        fw.step_heater(DT, fw.flow, delivered, 35.0);
+        assert!(fw.q_extraction_w <= delivered * FW_EXTRACTION_HEAT_PER_KG + 1e-9, "q {}", fw.q_extraction_w);
+    }
+
+    #[test]
+    fn load_rejection_latches_bypass_fast_open() {
+        let mut s = SteamSystem::new(true);
+        s.p_chest = 7.0e6;
+        s.tcv_pos = 0.87;
+        // Full power: regulator demand is rated flow, all of it through the TCVs.
+        assert!((s.pressure_demand(P_RATED) - STEAM_FLOW_RATED).abs() < 1e-6);
+        // Breaker opens: one scan of fast-open, governor demand collapses, no trip.
+        for k in 0..6 {
+            s.step_ext(DT, P_RATED, 0.0, true, false, k == 0);
+        }
+        assert!(s.bypass_pos >= 0.9, "bypass {} at 0.3 s", s.bypass_pos);
+        assert!(s.tcv_pos < 0.1, "TCVs fast-close on load rejection, at {}", s.tcv_pos);
+        assert_eq!(s.fast_open_latch, 0.0, "the latch spans one stroke only");
+    }
+
+    #[test]
+    fn coasting_feed_pump_delivers_flow_until_its_check_valve_closes() {
+        let mut fw = Feedwater::new(2, T_FW_RATED, LevelControlMode::Manual, 0.7);
+        fw.fcv_manual = 0.7;
+        for _ in 0..20 {
+            fw.step(DT, P_RATED, 0.0, 0.0, 0.0, true, 35.0);
+        }
+        let total0 = fw.flow;
+        fw.pumps[1] = false;
+        fw.step(DT, P_RATED, 0.0, 0.0, 0.0, true, 35.0);
+        assert!(fw.pump_speed[1] > 0.9, "shaft still near speed: {}", fw.pump_speed[1]);
+        assert!(fw.pump_flow[1] > 0.5 * fw.pump_flow[0], "coasting pump flow {}", fw.pump_flow[1]);
+        assert!(fw.flow > 0.9 * total0, "no flow step on trip: {} -> {}", total0, fw.flow);
+        let mut prev = fw.pump_flow[1];
+        let mut closed_at_speed = None;
+        for _ in 0..200 {
+            fw.step(DT, P_RATED, 0.0, 0.0, 0.0, true, 35.0);
+            assert!(fw.pump_flow[1] <= prev + 1e-9, "flow decays with speed");
+            prev = fw.pump_flow[1];
+            if prev == 0.0 && closed_at_speed.is_none() {
+                closed_at_speed = Some(fw.pump_speed[1]);
+            }
+        }
+        // Check valve closes at the shutoff-head crossover, while the shaft still turns.
+        let s_close = closed_at_speed.expect("check valve must close");
+        assert!(s_close > 0.5, "closed at speed {s_close}");
     }
 }

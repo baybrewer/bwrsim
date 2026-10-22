@@ -75,6 +75,10 @@ export interface Vessel {
   heatupRateCph: number;
   /** Cumulative outflow requested of the vessel that its inventory could not supply. */
   inventoryShortfallKg: number;
+  /** Noncondensable gas in the head space (atmospheric while vented, trapped once sealed). */
+  headGasKg: number;
+  /** Partial pressure of the head-space gas; total pressure = vapour + gas. */
+  headGasPressureMpa: number;
 }
 
 export interface Steam {

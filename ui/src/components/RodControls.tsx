@@ -3,6 +3,9 @@ import type { Command, Rods } from "../sim/types";
 import { clamp, fmtRodPos, rodName } from "../util/format";
 import { Btn } from "./common/Button";
 
+/** Jog increment for INSERT/WITHDRAW, position units. Drives are fine-motion: jogs start from the current target, not a notch. */
+const JOG_STEP = 2;
+
 /** Rod motion controls. Acts on the multi-select set if non-empty, else the selected rod. */
 export function RodControls(props: {
   rods: Rods;
@@ -15,12 +18,11 @@ export function RodControls(props: {
   const [to, setTo] = useState(48);
   const targets = multi.size > 0 ? [...multi] : rods.selected !== null ? [rods.selected] : [];
 
-  /** Move each rod by delta notch units; groups rods sharing a destination into one command. */
+  /** Move each rod by delta position units; groups rods sharing a destination into one command. */
   const step = (delta: number) => {
     const groups = new Map<number, number[]>();
     for (const i of targets) {
-      const base = Math.round(rods.targets[i] / 2) * 2;
-      const t = clamp(base + delta, 0, 48);
+      const t = clamp(rods.targets[i] + delta, 0, 48);
       groups.set(t, [...(groups.get(t) ?? []), i]);
     }
     for (const [target, indices] of groups) send({ type: "rodSetTarget", indices, target });
@@ -51,10 +53,10 @@ export function RodControls(props: {
         </div>
       </div>
       <div className="row gap4 wrap">
-        <Btn tone="green" onClick={() => step(-2)} disabled={!targets.length}>
+        <Btn tone="green" onClick={() => step(-JOG_STEP)} disabled={!targets.length}>
           ▼ INSERT
         </Btn>
-        <Btn tone="red" onClick={() => step(+2)} disabled={!targets.length || props.scrammed}>
+        <Btn tone="red" onClick={() => step(+JOG_STEP)} disabled={!targets.length || props.scrammed}>
           ▲ WITHDRAW
         </Btn>
         <Btn tone="amber" onClick={() => send({ type: "rodStop" })}>
@@ -66,14 +68,14 @@ export function RodControls(props: {
           type="number"
           min={0}
           max={48}
-          step={2}
+          step="any"
           value={to}
           onChange={(e) => setTo(clamp(Number(e.target.value) || 0, 0, 48))}
         />
         <Btn
           tone="plain"
           disabled={!targets.length}
-          onClick={() => send({ type: "rodSetTarget", indices: targets, target: Math.round(to / 2) * 2 })}
+          onClick={() => send({ type: "rodSetTarget", indices: targets, target: to })}
         >
           MOVE TO
         </Btn>

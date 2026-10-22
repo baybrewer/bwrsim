@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use bwr_core::api::{Command, ModeSwitch, ScenarioName};
+use bwr_core::api::{Command, ModeSwitch, ScenarioName, Severity, Snapshot};
 use bwr_core::bop::LevelControlMode;
 use bwr_core::params::*;
 use bwr_core::sim::{irm_full_scale, DT};
@@ -58,6 +58,29 @@ fn turbine_trip_rides_through_on_bypass() {
     assert!(s.neutronics.power_frac < 0.9, "select rod insert should cut power, got {}", s.neutronics.power_frac);
     assert!(s.steam.steam_to_bypass_kgs > 200.0);
     assert!(s.vessel.pressure_mpa < 7.4);
+}
+
+/// Sol 15 / Astra 6: the coupled SRI response to a full-power turbine trip.
+/// Vendor basis: GE 005N9751 Rev J section 3.2 quotes an approximate 0.8
+/// percentage point/s power reduction. The band 0.8 +/- 0.3 point/s carries that
+/// "approximate" plus the lumped-core model uncertainty; it is an acceptance
+/// envelope, not a fit target.
+const SRI_VENDOR_RATE_PCT_S: f64 = 0.8;
+const SRI_RATE_BAND_PCT_S: f64 = 0.3;
+
+#[test]
+fn sri_power_reduction_rate_matches_vendor_basis() {
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 5.0);
+    let start_pct = sim.core.kin.n * 100.0;
+    sim.apply(Command::TripTurbine);
+    run(&mut sim, 10.0);
+    assert!(!sim.scrammed, "SRI must ride through without scram: {:?}", sim.snapshot().scram_reason);
+    let rate = (start_pct - sim.core.kin.n * 100.0) / 10.0;
+    assert!(
+        (rate - SRI_VENDOR_RATE_PCT_S).abs() <= SRI_RATE_BAND_PCT_S,
+        "first-10 s average power reduction {rate:.3} point/s, vendor basis {SRI_VENDOR_RATE_PCT_S} +/- {SRI_RATE_BAND_PCT_S}"
+    );
 }
 
 #[test]
@@ -150,6 +173,13 @@ fn startup_from_hot_standby_to_30_percent() {
 // be missing from TypeScript, no TypeScript field may be missing from Rust, and
 // every leaf must have the declared type (a NaN serialises as null and fails a
 // `number` field). Dimensional numeric fields must carry a unit suffix.
+//
+// The reverse direction treats TypeScript as authoritative: at every field the
+// value TypeScript permits (each enum member, `null` where `| null`, a sample
+// number/string/boolean) is substituted and pushed through serde into the Rust
+// type; it must be accepted and re-emitted unchanged, and `null` must be
+// rejected where TypeScript forbids it. Every string-literal union is compared
+// exhaustively with its Rust enum in both directions.
 
 const TS_SOURCE: &str = include_str!("../../../ui/src/sim/types.ts");
 
@@ -380,8 +410,13 @@ fn check_commands(c: &TsContract) -> Result<(), String> {
                 return Err(format!("{tag}: Rust field {k} missing from TypeScript"));
             }
         }
-        // The TypeScript shape must also deserialise back into Rust.
-        serde_json::from_value::<Command>(v.clone()).map_err(|e| format!("{tag}: {e}"))?;
+        let deser = |m: &Value| -> Result<Value, String> {
+            let cmd: Command = serde_json::from_value(m.clone()).map_err(|e| e.to_string())?;
+            serde_json::to_value(cmd).map_err(|e| e.to_string())
+        };
+        for (k, ty) in fields {
+            probe_ts(c, &v, &format!("/{k}"), &format!("{tag}.{k}"), ty, &deser)?;
+        }
         seen.insert(tag);
     }
     for tag in c.commands.keys() {
@@ -392,24 +427,198 @@ fn check_commands(c: &TsContract) -> Result<(), String> {
     Ok(())
 }
 
-#[test]
-fn json_contract_matches_ui() {
-    let c = parse_ts(TS_SOURCE);
-    assert!(c.interfaces.contains_key("Snapshot") && !c.commands.is_empty(), "parser found nothing in types.ts");
-    check_unit_naming(&c).unwrap();
-    check_commands(&c).unwrap();
+type Deser<'a> = &'a dyn Fn(&Value) -> Result<Value, String>;
 
-    // Snapshots from every scenario, after enough operation to populate alarms,
-    // events, a selected rod and a finite period.
-    for name in [ScenarioName::ColdShutdown, ScenarioName::HotStandby, ScenarioName::FullPower] {
+/// Substitute `probe` at JSON pointer `ptr`, push the document through the Rust
+/// type and return what Rust re-emits at that location.
+fn through_rust(root: &Value, ptr: &str, probe: Value, deser: Deser) -> Result<Value, String> {
+    let mut m = root.clone();
+    *m.pointer_mut(ptr).unwrap_or_else(|| panic!("{ptr}: walker left the fixture")) = probe;
+    let back = deser(&m)?;
+    back.pointer(ptr).cloned().ok_or_else(|| format!("{ptr}: Rust did not re-emit the field"))
+}
+
+/// JSON equality with numbers compared by value (Rust re-emits 2 as 2.0 for f64).
+fn same_json(a: &Value, b: &Value) -> bool {
+    match (a.as_f64(), b.as_f64()) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+fn expect_accepts(root: &Value, ptr: &str, label: &str, probe: Value, deser: Deser) -> Result<(), String> {
+    let back = through_rust(root, ptr, probe.clone(), deser)
+        .map_err(|e| format!("{label}: TypeScript allows {probe} but Rust rejects it ({e})"))?;
+    if same_json(&back, &probe) {
+        Ok(())
+    } else {
+        Err(format!("{label}: Rust re-emits {back} for TypeScript value {probe}"))
+    }
+}
+
+fn expect_rejects(root: &Value, ptr: &str, label: &str, probe: Value, deser: Deser) -> Result<(), String> {
+    match through_rust(root, ptr, probe.clone(), deser) {
+        Ok(_) => Err(format!("{label}: TypeScript forbids {probe} but Rust accepts it")),
+        Err(_) => Ok(()),
+    }
+}
+
+/// Walk `root` (a Rust-emitted fixture) by TypeScript type `ty`, checking at every
+/// location that Rust accepts exactly the values TypeScript allows there.
+fn probe_ts(c: &TsContract, root: &Value, ptr: &str, label: &str, ty: &str, deser: Deser) -> Result<(), String> {
+    let ty = ty.trim();
+    if let Some(inner) = ty.strip_suffix(" | null") {
+        expect_accepts(root, ptr, label, Value::Null, deser)?;
+        return probe_non_null(c, root, ptr, label, inner, deser);
+    }
+    expect_rejects(root, ptr, label, Value::Null, deser)?;
+    probe_non_null(c, root, ptr, label, ty, deser)
+}
+
+fn probe_non_null(c: &TsContract, root: &Value, ptr: &str, label: &str, ty: &str, deser: Deser) -> Result<(), String> {
+    let here = root.pointer(ptr).expect("walker stays inside the fixture");
+    if let Some(elem) = ty.strip_suffix("[]") {
+        // Element types are probed on the first element; an empty array has nothing to substitute into.
+        return match here.as_array() {
+            Some(a) if !a.is_empty() => probe_ts(c, root, &format!("{ptr}/0"), &format!("{label}[0]"), elem, deser),
+            _ => Ok(()),
+        };
+    }
+    if ty.starts_with('[') && ty.ends_with(']') {
+        for (i, p) in ty[1..ty.len() - 1].split(',').map(str::trim).enumerate() {
+            probe_ts(c, root, &format!("{ptr}/{i}"), &format!("{label}[{i}]"), p, deser)?;
+        }
+        return Ok(());
+    }
+    match ty {
+        "number" => expect_accepts(root, ptr, label, Value::from(2), deser),
+        "string" => expect_accepts(root, ptr, label, Value::from("contract probe"), deser),
+        "boolean" => {
+            expect_accepts(root, ptr, label, Value::from(true), deser)?;
+            expect_accepts(root, ptr, label, Value::from(false), deser)
+        }
+        name => {
+            if let Some(vals) = c.enums.get(name) {
+                for m in vals {
+                    expect_accepts(root, ptr, label, Value::from(m.as_str()), deser)?;
+                }
+                return expect_rejects(root, ptr, label, Value::from("notATypeScriptMember"), deser);
+            }
+            let fields = c.interfaces.get(name).ok_or_else(|| format!("{label}: unknown TypeScript type {name}"))?;
+            if !here.is_object() {
+                // A nullable interface the fixture left null cannot be walked.
+                return Err(format!("{label}: fixture has no {name} object to probe"));
+            }
+            for (k, fty) in fields {
+                probe_ts(c, root, &format!("{ptr}/{k}"), &format!("{label}.{k}"), fty, deser)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn check_snapshot_ts_authoritative(c: &TsContract, snap: &Value) -> Result<(), String> {
+    let deser = |m: &Value| -> Result<Value, String> {
+        let s: Snapshot = serde_json::from_value(m.clone()).map_err(|e| e.to_string())?;
+        serde_json::to_value(s).map_err(|e| e.to_string())
+    };
+    probe_ts(c, snap, "", "snapshot", "Snapshot", &deser)
+}
+
+/// Every variant of each wire enum. The `match` has no wildcard, so a new Rust
+/// variant fails to compile until it is listed here.
+fn all_mode_switches() -> Vec<ModeSwitch> {
+    use ModeSwitch::*;
+    let v = vec![Shutdown, Refuel, Startup, Run];
+    v.iter().for_each(|m| match m {
+        Shutdown | Refuel | Startup | Run => {}
+    });
+    v
+}
+fn all_level_control_modes() -> Vec<LevelControlMode> {
+    use LevelControlMode::*;
+    let v = vec![Manual, SingleElement, ThreeElement];
+    v.iter().for_each(|m| match m {
+        Manual | SingleElement | ThreeElement => {}
+    });
+    v
+}
+fn all_severities() -> Vec<Severity> {
+    use Severity::*;
+    let v = vec![Info, Warning, Alarm, Trip];
+    v.iter().for_each(|m| match m {
+        Info | Warning | Alarm | Trip => {}
+    });
+    v
+}
+fn all_scenarios() -> Vec<ScenarioName> {
+    use ScenarioName::*;
+    let v = vec![ColdShutdown, HotStandby, FullPower];
+    v.iter().for_each(|m| match m {
+        ColdShutdown | HotStandby | FullPower => {}
+    });
+    v
+}
+
+/// The Rust enum and the TypeScript union must have identical wire members.
+fn check_enum<E: serde::Serialize + serde::de::DeserializeOwned>(c: &TsContract, ts_name: &str, all: &[E]) -> Result<(), String> {
+    let ts = c.enums.get(ts_name).ok_or_else(|| format!("TypeScript enum {ts_name} missing"))?;
+    let rust: Vec<String> = all
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap().as_str().expect("unit enum serialises as a string").to_string())
+        .collect();
+    if let Some(r) = rust.iter().find(|r| !ts.contains(r)) {
+        return Err(format!("Rust {ts_name} variant '{r}' missing from TypeScript"));
+    }
+    for t in ts {
+        let back: E = serde_json::from_value(Value::from(t.as_str()))
+            .map_err(|_| format!("TypeScript {ts_name} member '{t}' has no Rust variant"))?;
+        if serde_json::to_value(back).unwrap() != Value::from(t.as_str()) {
+            return Err(format!("TypeScript {ts_name} member '{t}' does not round-trip"));
+        }
+    }
+    Ok(())
+}
+
+fn check_enums(c: &TsContract) -> Result<(), String> {
+    check_enum(c, "ModeSwitch", &all_mode_switches())?;
+    check_enum(c, "LevelControlMode", &all_level_control_modes())?;
+    check_enum(c, "Severity", &all_severities())?;
+    check_enum(c, "ScenarioName", &all_scenarios())?;
+    let mapped: HashSet<&str> = ["ModeSwitch", "LevelControlMode", "Severity", "ScenarioName"].into();
+    match c.enums.keys().find(|k| !mapped.contains(k.as_str())) {
+        Some(k) => Err(format!("TypeScript enum {k} has no Rust enum mapped in check_enums")),
+        None => Ok(()),
+    }
+}
+
+/// Fixture snapshots: every scenario fresh and after a scram with a selected rod
+/// (populates alarms, the period and `selected`).
+fn contract_snapshots() -> Vec<(String, Value)> {
+    let mut out = Vec::new();
+    for name in all_scenarios() {
         let mut sim = Sim::new(name);
-        check_snapshot(&c, &serde_json::to_value(sim.snapshot()).unwrap()).unwrap_or_else(|e| panic!("{name:?}: {e}"));
+        out.push((format!("{name:?}"), serde_json::to_value(sim.snapshot()).unwrap()));
         sim.apply(Command::SelectRod { index: Some(1) });
         sim.apply(Command::ManualScram);
         run(&mut sim, 2.0);
         let v = serde_json::to_value(sim.snapshot()).unwrap();
         assert!(!v["alarms"].as_array().unwrap().is_empty());
-        check_snapshot(&c, &v).unwrap_or_else(|e| panic!("{name:?} after scram: {e}"));
+        out.push((format!("{name:?} after scram"), v));
+    }
+    out
+}
+
+#[test]
+fn json_contract_matches_ui() {
+    let c = parse_ts(TS_SOURCE);
+    assert!(c.interfaces.contains_key("Snapshot") && !c.commands.is_empty(), "parser found nothing in types.ts");
+    check_unit_naming(&c).unwrap();
+    check_enums(&c).unwrap();
+    check_commands(&c).unwrap();
+    for (label, v) in contract_snapshots() {
+        check_snapshot(&c, &v).unwrap_or_else(|e| panic!("{label}: {e}"));
+        check_snapshot_ts_authoritative(&c, &v).unwrap_or_else(|e| panic!("{label}: {e}"));
     }
 }
 
@@ -435,6 +644,38 @@ fn contract_check_fails_on_a_mirror_mutation() {
     // A numeric field without a unit suffix.
     let mutated = TS_SOURCE.replace("coolantTempC: number;", "coolantTemp: number;");
     assert!(check_unit_naming(&parse_ts(&mutated)).is_err());
+}
+
+/// Sol 24 / Astra 26 / Sol N8: the mutations the 2026-10-22 re-reviews showed
+/// passing the self-roundtrip gate must each fail the TypeScript-authoritative one.
+#[test]
+fn contract_check_fails_on_payload_enum_and_nullability_drift() {
+    let mutate = |from: &str, to: &str| {
+        assert!(TS_SOURCE.contains(from), "mutation anchor '{from}' not in types.ts");
+        parse_ts(&TS_SOURCE.replacen(from, to, 1))
+    };
+    let snaps = contract_snapshots();
+    let snap_err = |c: &TsContract| {
+        snaps.iter().find_map(|(_, v)| check_snapshot(c, v).and_then(|_| check_snapshot_ts_authoritative(c, v)).err())
+    };
+    let full_err = |c: &TsContract| check_enums(c).and_then(|_| check_commands(c)).err().or_else(|| snap_err(c));
+    let cases: [(&str, &str, &str); 7] = [
+        ("selectRod index loses nullability", "type: \"selectRod\"; index: number | null", "type: \"selectRod\"; index: number"),
+        ("setSpeed gains nullability", "type: \"setSpeed\"; speed: number }", "type: \"setSpeed\"; speed: number | null }"),
+        ("setSpeed payload renamed", "type: \"setSpeed\"; speed: number }", "type: \"setSpeed\"; rate: number }"),
+        ("ModeSwitch member renamed", "\"shutdown\" | \"refuel\" |", "\"shutdown\" | \"refuellingTypo\" |"),
+        ("ModeSwitch member removed", "\"shutdown\" | \"refuel\" |", "\"shutdown\" |"),
+        ("ModeSwitch member added", "| \"run\";", "| \"run\" | \"bogus\";"),
+        ("kineticsFault string -> number", "kineticsFault: string | null;", "kineticsFault: number | null;"),
+    ];
+    for (what, from, to) in cases {
+        let err = full_err(&mutate(from, to)).unwrap_or_else(|| panic!("contract gate passed a mutation: {what}"));
+        eprintln!("{what}: {err}");
+    }
+    // Snapshot-side enum drift is caught on the snapshot walk alone.
+    let err = snap_err(&mutate("\"manual\" | \"singleElement\"", "\"manualTypo\" | \"singleElement\""));
+    eprintln!("LevelControlMode member renamed (snapshot walk): {}", err.expect("snapshot walk passed an enum rename"));
+    assert_eq!(full_err(&parse_ts(TS_SOURCE)), None);
 }
 
 // ------------------------------------------------------------------ energy / BOP regressions
@@ -724,4 +965,161 @@ fn energy_and_mass_close_across_a_turbine_trip() {
     let m_res = (sim.vessel.mass - m0) - m_ports;
     assert!(e_res.abs() <= 1e-6 * q_core_j, "energy residual {e_res:.3e} J over {q_core_j:.3e} J of core heat");
     assert!(m_res.abs() <= 1e-3, "mass residual {m_res:.3e} kg");
+}
+
+// ------------------------------------------------------------------ round 2 integration
+
+/// Sol 14 / Astra 14: generator load rejection (breaker opens, no turbine trip)
+/// must fast-open the bypass within the published 300 ms (GE 005N9751 Rev J 5.1.4).
+#[test]
+fn load_rejection_fast_opens_bypass_within_300_ms() {
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 5.0);
+    sim.apply(Command::OpenBreaker);
+    run(&mut sim, 0.3);
+    assert!(!sim.turbine.tripped, "load rejection alone, no turbine trip");
+    assert!(sim.steam.bypass_pos >= 0.9, "bypass {} at 0.3 s after load rejection", sim.steam.bypass_pos);
+}
+
+/// Sol N4 / Astra N2: a large public step that exhausts the hotwell must not
+/// create water: vessel + hotwell/shell + IC inventory changes only by the
+/// explicit CST makeup/reject/overflow, relief and RWCU/vent boundary flows.
+#[test]
+fn hotwell_exhaustion_does_not_create_vessel_water() {
+    let mut sim = Sim::new(ScenarioName::HotStandby);
+    sim.steam.msiv_cmd = [false; N_STEAM_LINES];
+    sim.steam.msiv_pos = [0.0; N_STEAM_LINES];
+    sim.fw = bwr_core::bop::Feedwater::new(2, 150.0, LevelControlMode::Manual, 1.0);
+    sim.cond.hotwell_mass = 6000.1;
+    sim.cond.set_temperature(35.0);
+    let inv = |s: &Sim| s.vessel.mass + s.cond.inventory_kg();
+    let (m0, mk0, rj0, ov0, rl0) = (inv(&sim), sim.cond.makeup_kg, sim.cond.reject_kg, sim.cond.overflow_kg, sim.cond.relief_kg);
+    sim.step(20.0);
+    assert!(sim.model_error.is_none(), "{:?}", sim.model_error);
+    assert_eq!(sim.cond.w_out_shortfall, 0.0, "feed is bounded before the vessel, so nothing is short");
+    let f = sim.vessel.flows;
+    let explicit = (sim.cond.makeup_kg - mk0) - (sim.cond.reject_kg - rj0) - (sim.cond.overflow_kg - ov0)
+        - (sim.cond.relief_kg - rl0)
+        - 20.0 * (sim.fw.rwcu_reject + f.w_vent);
+    let ic_in: f64 = sim.ic.iter().map(|t| t.last.w_steam_in - t.last.w_cond_return).sum::<f64>() * 20.0;
+    let created = inv(&sim) - m0 - explicit + ic_in;
+    assert!(created.abs() < 1.0, "created {created} kg");
+}
+
+/// Sol N2: when the vessel cannot deliver the requested turbine steam, the
+/// heaters may only take extraction heat from what was delivered.
+#[test]
+fn extraction_is_funded_by_delivered_turbine_steam() {
+    let mut sim = Sim::new(ScenarioName::FullPower);
+    run(&mut sim, 1.0);
+    let t = sim.vessel.eos.t;
+    let m = V_VESSEL_FLUID * bwr_core::steam::sat_t(t).rho_f * (1.0 - 1e-8);
+    sim.vessel.mass = m;
+    sim.vessel.energy = bwr_core::vessel::energy_for(m, t).unwrap();
+    sim.vessel.eos = bwr_core::vessel::solve_eos(m, sim.vessel.energy).expect("eos");
+    sim.step(DT);
+    let delivered = sim.vessel.flows.w_steam;
+    assert!(
+        sim.fw.q_extraction_w <= delivered * FW_EXTRACTION_HEAT_PER_KG + 1e-6,
+        "extraction {} W from {} kg/s delivered",
+        sim.fw.q_extraction_w,
+        delivered
+    );
+    assert!(sim.cond.q_in_w > -1.0e3, "condenser inlet energy {}", sim.cond.q_in_w);
+}
+
+/// Sol N1 / Astra N1: a water-solid vessel cannot supply IC steam, so the
+/// trains commit nothing: vessel + IC tube inventory is unchanged and no heat
+/// reaches the pools (old code committed the train before the vessel refused).
+#[test]
+fn water_solid_vessel_ic_transfers_conserve_mass_at_plant_level() {
+    let mut sim = Sim::new(ScenarioName::HotStandby);
+    let m = V_VESSEL_FLUID * bwr_core::steam::sat_t(200.0).rho_f * 1.005;
+    sim.vessel.mass = m;
+    sim.vessel.energy = bwr_core::vessel::energy_for(m, 200.0).unwrap();
+    sim.vessel.eos = bwr_core::vessel::solve_eos(m, sim.vessel.energy).unwrap();
+    sim.vessel.gas_mass = 0.0;
+    sim.steam.msiv_cmd = [false; N_STEAM_LINES];
+    sim.steam.msiv_pos = [0.0; N_STEAM_LINES];
+    sim.fw = bwr_core::bop::Feedwater::new(0, 150.0, LevelControlMode::Manual, 0.0);
+    for t in sim.ic.iter_mut() {
+        t.cmd_open = true;
+        t.valve_pos = 1.0;
+        t.heat = IC_TRAIN_RATED_W;
+        t.tube_mass = 500.0;
+    }
+    let inv = |s: &Sim| s.vessel.mass + s.ic.iter().map(|t| t.tube_mass).sum::<f64>();
+    let m0 = inv(&sim);
+    sim.step(0.05);
+    assert!(sim.model_error.is_none(), "{:?}", sim.model_error);
+    assert!((inv(&sim) - m0).abs() < 1e-6, "vessel + IC tubes changed by {} kg", inv(&sim) - m0);
+    assert!(sim.ic.iter().all(|t| t.last.q_pool == 0.0), "pool heat with no steam supplied");
+}
+
+/// Sol N1 / Astra N1, vapour-limited case: a two-phase vessel holding almost
+/// no vapour can supply only part of the IC steam the trains request. The
+/// trains commit exactly the accepted fraction, so vessel + tube inventory is
+/// conserved and pool duty never exceeds what the accepted steam can carry.
+#[test]
+fn vapour_limited_ic_draw_is_conserved_at_plant_level() {
+    let mut sim = Sim::new(ScenarioName::HotStandby);
+    let t = sim.vessel.eos.t;
+    let m = V_VESSEL_FLUID * bwr_core::steam::sat_t(t).rho_f * (1.0 - 1e-6);
+    sim.vessel.mass = m;
+    sim.vessel.energy = bwr_core::vessel::energy_for(m, t).unwrap();
+    sim.vessel.eos = bwr_core::vessel::solve_eos(m, sim.vessel.energy).unwrap();
+    sim.steam.msiv_cmd = [false; N_STEAM_LINES];
+    sim.steam.msiv_pos = [0.0; N_STEAM_LINES];
+    sim.fw = bwr_core::bop::Feedwater::new(0, 150.0, LevelControlMode::Manual, 0.0);
+    for tr in sim.ic.iter_mut() {
+        tr.cmd_open = true;
+        tr.valve_pos = 1.0;
+        tr.heat = IC_TRAIN_RATED_W;
+    }
+    let inv = |s: &Sim| s.vessel.mass + s.ic.iter().map(|t| t.tube_mass).sum::<f64>();
+    let m0 = inv(&sim);
+    sim.step(DT);
+    assert!(sim.model_error.is_none(), "{:?}", sim.model_error);
+    let ratio = sim.vessel.flows.ic_ratio;
+    assert!(ratio < 1.0, "case must be vapour-limited, ic_ratio {ratio}");
+    let drawn: f64 = sim.ic.iter().map(|t| t.last.w_steam_in).sum();
+    assert!((drawn - sim.vessel.flows.w_ic_steam).abs() <= 1e-9 * drawn.max(1.0), "trains {drawn} vs vessel {}", sim.vessel.flows.w_ic_steam);
+    assert!((inv(&sim) - m0).abs() < 1e-6, "vessel + IC tubes changed by {} kg", inv(&sim) - m0);
+}
+
+/// The physical and controller state a rejected step must leave untouched.
+fn transactional_state(sim: &Sim) -> String {
+    let v = &sim.vessel;
+    format!(
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{}|{}",
+        sim.core, sim.steam, sim.turbine, sim.cond, sim.fw, sim.ic, v.eos, v.mass, v.energy, v.gas_mass, sim.time, sim.q_core, sim.scrammed
+    )
+}
+
+/// Sol N3 / Astra N3: a rejected step restores every subsystem and controller
+/// (here an accelerating, disconnected turbine whose governor would ramp) and
+/// repeated retries change nothing.
+#[test]
+fn rejected_step_restores_turbine_governor_and_all_state() {
+    let mut sim = Sim::new(ScenarioName::HotStandby);
+    sim.apply(Command::ResetTurbine);
+    sim.apply(Command::SetSpeedSetpoint { rpm: 3600.0 });
+    sim.vessel.energy *= 3.0;
+    let before = transactional_state(&sim);
+    for _ in 0..3 {
+        assert!(!sim.step(DT), "step must report rejection");
+        assert!(sim.model_error.is_some());
+        assert_eq!(transactional_state(&sim), before, "rejected step mutated plant/controller state");
+    }
+}
+
+/// Astra N3: a rejected step inside `advance` keeps its DT in the backlog.
+#[test]
+fn rejected_step_does_not_consume_clock_backlog() {
+    let mut sim = Sim::new(ScenarioName::HotStandby);
+    sim.vessel.energy *= 3.0;
+    sim.advance(0.1);
+    assert_eq!(sim.time, 0.0);
+    assert!(sim.paused && sim.model_error.is_some());
+    assert!((sim.backlog_s() - 0.1).abs() < 1e-12, "backlog {} s, expected 0.1 s retained", sim.backlog_s());
 }

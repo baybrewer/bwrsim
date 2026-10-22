@@ -25,6 +25,9 @@ pub enum KineticsError {
     /// The implicit solve gave a non-positive denominator or a non-finite
     /// population for this substep (`rho`, `h`).
     StepRejected { rho: f64, h: f64 },
+    /// The timestep was negative or non-finite, or the source was negative or
+    /// non-finite (Sol 20): rejected before any state changes.
+    InvalidInput { dt: f64, source: f64 },
 }
 
 impl fmt::Display for KineticsError {
@@ -33,6 +36,9 @@ impl fmt::Display for KineticsError {
             Self::NonFiniteReactivity => write!(f, "kinetics: non-finite reactivity"),
             Self::StepRejected { rho, h } => {
                 write!(f, "kinetics: implicit step rejected (rho = {rho:.5}, h = {h:.2e} s)")
+            }
+            Self::InvalidInput { dt, source } => {
+                write!(f, "kinetics: invalid input (dt = {dt:e} s, source = {source:e})")
             }
         }
     }
@@ -69,13 +75,23 @@ impl Kinetics {
         }
     }
 
+    /// Domain of every public entry point: finite reactivity, a finite
+    /// non-negative timestep and a finite non-negative source.
+    fn check_inputs(rho: f64, s: f64, dt: f64) -> Result<(), KineticsError> {
+        if !rho.is_finite() {
+            return Err(KineticsError::NonFiniteReactivity);
+        }
+        if !(dt.is_finite() && dt >= 0.0 && s.is_finite() && s >= 0.0) {
+            return Err(KineticsError::InvalidInput { dt, source: s });
+        }
+        Ok(())
+    }
+
     /// One backward-Euler substep of `h` seconds with constant reactivity `rho`
     /// (dk/k) and source `s`. The solve is checked: a non-positive denominator
     /// or a non-finite result is rejected without touching the state.
     pub fn step(&mut self, rho: f64, s: f64, h: f64) -> Result<(), KineticsError> {
-        if !rho.is_finite() {
-            return Err(KineticsError::NonFiniteReactivity);
-        }
+        Self::check_inputs(rho, s, h)?;
         let n0 = self.n;
         let mut lhs = 1.0 - h * (rho - BETA) / GEN_TIME;
         let mut rhs = n0 + h * s;
@@ -111,9 +127,7 @@ impl Kinetics {
     /// prompt growth per substep stays bounded (see [`Self::max_substep`]).
     /// On error the state is left at the last accepted substep.
     pub fn advance(&mut self, rho: f64, s: f64, dt: f64) -> Result<(), KineticsError> {
-        if !rho.is_finite() {
-            return Err(KineticsError::NonFiniteReactivity);
-        }
+        Self::check_inputs(rho, s, dt)?;
         let steps = ((dt / Self::max_substep(rho)).ceil() as usize).max(1);
         let h = dt / steps as f64;
         for _ in 0..steps {
@@ -207,6 +221,21 @@ mod tests {
         let mut k = Kinetics::equilibrium(1.0);
         assert_eq!(k.advance(f64::NAN, 0.0, 1.0e-3), Err(KineticsError::NonFiniteReactivity));
         assert_eq!(k.n, 1.0);
+    }
+
+    /// Sol 20: negative or non-finite time and source are rejected at the
+    /// public entry points without touching the state (old code accepted
+    /// advance(0, 0, -0.001) and returned n = 0.97).
+    #[test]
+    fn invalid_timestep_or_source_is_rejected() {
+        for (s, dt) in [(0.0, -1.0e-3), (0.0, f64::NAN), (0.0, f64::INFINITY), (-1.0, 1.0e-3), (f64::NAN, 1.0e-3)] {
+            let mut k = Kinetics::equilibrium(1.0);
+            let before = k.clone();
+            assert!(matches!(k.advance(1.0e-3, s, dt), Err(KineticsError::InvalidInput { .. })), "s={s} dt={dt}");
+            assert!(matches!(k.step(1.0e-3, s, dt), Err(KineticsError::InvalidInput { .. })), "s={s} dt={dt}");
+            assert_eq!(k.n, before.n);
+            assert_eq!(k.c, before.c);
+        }
     }
 
     /// Sol 19 / Astra 25: a source start from zero population keeps a finite

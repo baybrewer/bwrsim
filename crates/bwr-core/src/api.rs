@@ -92,6 +92,11 @@ pub struct Vessel {
     pub heatup_rate_cph: f64,
     /// Cumulative outflow requested of the vessel that its inventory could not supply.
     pub inventory_shortfall_kg: f64,
+    /// Noncondensable gas in the head space (follows the atmosphere while the
+    /// head vent is open, trapped once it shuts).
+    pub head_gas_kg: f64,
+    /// Partial pressure of that gas; total pressure = vapour + gas.
+    pub head_gas_pressure_mpa: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

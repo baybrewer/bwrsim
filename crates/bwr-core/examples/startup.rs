@@ -1,6 +1,7 @@
 //! Scripted operator: hot standby -> critical -> heat -> turbine roll -> sync -> 40 % power.
 use bwr_core::api::{Command, ModeSwitch, ScenarioName};
 use bwr_core::bop::LevelControlMode;
+use bwr_core::params::RATED_RPM;
 use bwr_core::sim::{irm_full_scale, DT};
 use bwr_core::Sim;
 
@@ -45,10 +46,10 @@ fn main() {
         }
         if stage == 0 && n > 0.035 && sim.vessel.eos.p > 6.9e6 {
             sim.apply(Command::ResetTurbine);
-            sim.apply(Command::SetSpeedSetpoint { rpm: 1800.0 });
+            sim.apply(Command::SetSpeedSetpoint { rpm: RATED_RPM });
             stage = 1;
         }
-        if stage == 1 && (sim.turbine.speed_rpm - 1800.0).abs() < 5.0 && sim.turbine.phase_deg.abs() < 5.0 {
+        if stage == 1 && (sim.turbine.speed_rpm - RATED_RPM).abs() < 5.0 && sim.turbine.phase_deg.abs() < 5.0 {
             sim.apply(Command::CloseBreaker);
             if sim.turbine.breaker_closed {
                 sim.apply(Command::SetModeSwitch { mode: ModeSwitch::Run });
@@ -79,5 +80,10 @@ fn main() {
     println!("END t={:.0} n={:.3} MWe={:.1} scram={:?}", sim.time, s.neutronics.power_frac, s.turbine.net_mwe, s.scram_reason);
     for a in s.alarms {
         println!("  {:?} {}", a.severity, a.text);
+    }
+    // A demonstration that silently stalls must not exit zero.
+    if stage < 2 || s.neutronics.power_frac < target * 0.98 || s.scram_reason.is_some() {
+        eprintln!("startup FAILED: stage {stage}, n={:.3} (target {target}), scram={:?}", s.neutronics.power_frac, s.scram_reason);
+        std::process::exit(1);
     }
 }
