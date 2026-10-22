@@ -137,7 +137,7 @@ const R1_IJN: [(i32, i32, f64); 34] = [
     (32, -41, -0.93537087292458e-25),
 ];
 /// Specific gas constant of water in IF97, J/kgK.
-const R_WATER: f64 = 461.526;
+pub const R_WATER: f64 = 461.526;
 
 /// Compressed-liquid state from IF97 Region 1.
 #[derive(Clone, Copy, Debug, PartialEq)]

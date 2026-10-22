@@ -719,7 +719,7 @@ impl Vessel {
         let m_vap = self.mass * x;
         let m_liq = self.mass - m_vap;
         let line_req = if solid { 0.0 } else { inp.w_steam };
-        let gas_frac = if line_req > 0.0 && self.gas_mass > 0.0 { self.gas_mass / (self.gas_mass + m_vap) } else { 0.0 };
+        let gas_frac = if line_req > 0.0 { self.dome_gas_mass_fraction() } else { 0.0 };
         let steam_req = line_req * (1.0 - gas_frac);
         let line_gas_req = line_req * gas_frac;
         let h_vent_port = if solid { h_liq } else { h_steam };
@@ -861,6 +861,20 @@ impl Vessel {
     /// temperature in the equilibrium EOS, absent when water-solid.
     pub fn vapour_available(&self) -> bool {
         !self.eos.solid && self.eos.x > 0.0
+    }
+
+    /// Noncondensable mass fraction of the dome gas: the composition every main
+    /// steam line withdrawal carries (no selective separator).
+    pub fn dome_gas_mass_fraction(&self) -> f64 {
+        if self.gas_mass > 0.0 { self.gas_mass / (self.gas_mass + self.mass * self.eos.x) } else { 0.0 }
+    }
+
+    /// Water-vapour mole fraction of the dome gas from the EOS's own Dalton
+    /// partition (vapour partial pressure over total). Throttling keeps the
+    /// composition, so the turbine's water partial pressure is this times the
+    /// chest pressure (round-6 R2). Exactly 1 with no noncondensables.
+    pub fn dome_water_mole_fraction(&self) -> f64 {
+        if self.gas_mass > 0.0 && self.eos.p > 0.0 { ((self.eos.p - self.eos.p_gas) / self.eos.p).clamp(0.0, 1.0) } else { 1.0 }
     }
 
     /// Density (kg/m3) of the dome gas entering the main steam lines: the
@@ -1446,7 +1460,7 @@ mod tests {
             let void = core_th(&s, w_core, q, steam::h_liquid(t).min(s.h_f)).alpha_avg;
             let mut line = crate::bop::SteamSystem::new(true);
             line.tcv_pos = 0.1;
-            line.compute_flows_from(v.eos.p, v.steam_port_enthalpy(), v.steam_line_density(), 5.6e3, true);
+            line.compute_flows_from(v.eos.p, v.steam_port_enthalpy(), v.steam_line_density(), crate::bop::LineGas::STEAM, 5.6e3, true);
             let now = [v.eos.p, s.t, void, line.total_flow()];
             assert!(now[3] > 0.0, "pressurized line must flow at {t} degC");
             if let Some(p) = prev {

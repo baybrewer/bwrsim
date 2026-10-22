@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::api::{self, Command, ModeSwitch, ScenarioName, Severity, Snapshot};
-use crate::bop::{Condenser, Feedwater, LevelControlMode, SteamSystem, Turbine, TurbineInlet};
+use crate::bop::{Condenser, Feedwater, LevelControlMode, LineGas, SteamSystem, Turbine, TurbineInlet};
 use crate::ic::IcTrain;
 use crate::params::*;
 use crate::reactor::{Core, DecayHeat, Xenon, ROD_GRID};
@@ -436,13 +436,16 @@ impl Sim {
         self.steam.step_ext(dt, p, tcv_demand, byp_ok, self.turbine.tripped, fast_open);
         // The flow transmitter reads what last left the vessel (committed below),
         // not this step's hydraulic request, which the vessel may not supply (R6).
-        let w_steam_measured = self.steam.total_flow();
+        // Feed replaces water, so it sees the water part of a gas-bearing line
+        // flow, not the air purged with it (round-6 R1).
+        let w_steam_measured = self.steam.water_flow();
         // The line carries dome gas (vapour plus any noncondensables) at its
         // density, driven by total dome pressure into the condenser, the
         // receiver of both turbine and bypass paths (round-5 R4/Astra R3). A
         // water-solid vessel supplies none (`Vessel::step_with_ic`).
         let (h_line, rho_line) = (self.vessel.steam_port_enthalpy(), self.vessel.steam_line_density());
-        self.steam.compute_flows_from(p, h_line, rho_line, self.cond.pressure(), !self.turbine.tripped);
+        let gas = LineGas::new(self.vessel.dome_gas_mass_fraction(), self.vessel.dome_water_mole_fraction());
+        self.steam.compute_flows_from(p, h_line, rho_line, gas, self.cond.pressure(), !self.turbine.tripped);
 
         // --- isolation condensers: requests only; nothing is committed until
         // the vessel has decided how much IC steam it can supply. `t_cool` (not
@@ -501,16 +504,18 @@ impl Sim {
         // protection and next step's level control must see flow that left (R6).
         // The request is rebuilt from valve positions every step, so nothing is lost.
         // Chest pressure is re-solved with the flow so both stay one hydraulic state (R2).
-        let w_line = f.w_steam + f.w_steam_gas;
-        self.steam.limit_to_delivered(w_line);
+        self.steam.limit_to_delivered(f.w_steam, f.w_steam_gas);
         // The line flow is a mixture: water vapour and the noncondensables it
         // carried out of the dome. Only the water does work and condenses; the
         // gas goes to the condenser shell air (below).
-        let water_frac = if w_line > 0.0 { f.w_steam / w_line } else { 1.0 };
+        let water_frac = self.steam.water_frac;
         let (w_tcv, w_byp) = (self.steam.w_tcv * water_frac, self.steam.w_bypass * water_frac);
         // Work and extraction come only from the vapour the turbine received, out
-        // of one available-energy budget (Sol N2, R1).
-        let inlet = TurbineInlet::new(w_tcv, f.h_steam, self.steam.p_chest, self.cond.pressure());
+        // of one available-energy budget (Sol N2, R1). The water's phase and
+        // expansion follow its own partial pressure at both ends (the mixture
+        // keeps its composition through the blading); the air rides along as an
+        // inert diluent and does no modelled work (round-6 R2).
+        let inlet = TurbineInlet::mixture(w_tcv, f.h_steam, self.steam.p_chest, self.cond.pressure(), self.steam.gas.y_water);
         self.turbine.step(dt, &inlet);
         let q_budget = inlet.extraction_budget(self.turbine.p_mech);
         self.fw.step_heater_capped(dt, w_feed, inlet.w_vapour, q_budget, self.cond.hotwell_t());
@@ -980,8 +985,10 @@ impl Sim {
                 bypass_pos: self.steam.bypass_pos,
                 bypass_auto: self.steam.bypass_auto,
                 bypass_manual_pos: self.steam.bypass_manual_pos,
-                steam_to_turbine_kgs: self.steam.w_tcv,
-                steam_to_bypass_kgs: self.steam.w_bypass,
+                // Water vapour only, matching the vessel steam-flow telemetry;
+                // purged air is the condenser's noncondensable receipt.
+                steam_to_turbine_kgs: self.steam.w_tcv * self.steam.water_frac,
+                steam_to_bypass_kgs: self.steam.w_bypass * self.steam.water_frac,
                 pressure_setpoint_mpa: self.steam.p_setpoint / 1e6,
             },
             turbine: api::Turbine {

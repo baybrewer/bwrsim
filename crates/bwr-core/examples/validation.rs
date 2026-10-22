@@ -268,7 +268,7 @@ fn port_balance_step(sim: &mut Sim, dt: f64) -> (f64, f64) {
     // RWCU is the flow the vessel accepted (phase-limited), not the fw.rwcu_reject request.
     // The committed line flow carries any dome noncondensables with the vapour;
     // only the water is vessel inventory.
-    let (w_steam, w_feed, w_rwcu) = (sim.steam.total_flow() - f.w_steam_gas, sim.fw.flow, f.w_liquid);
+    let (w_steam, w_feed, w_rwcu) = (sim.steam.water_flow(), sim.fw.flow, f.w_liquid);
     let dm = w_feed + ic_ret_m - w_steam - w_rwcu - f.w_vent - ic_in;
     let de = sim.q_core - heat_loss + w_feed * sim.fw.h_feed() + ic_ret_e
         - w_steam * sim.steam.h_steam

@@ -2,7 +2,8 @@
 //! condenser, condensate and feedwater.
 
 use crate::params::*;
-use crate::steam::{self, sat_p, sat_t, P_ATM};
+use crate::steam::{self, sat_p, sat_t, P_ATM, R_WATER};
+use crate::vessel::R_AIR;
 use serde::{Deserialize, Serialize};
 
 // ------------------------------------------------------------------ main steam & EHC
@@ -35,10 +36,114 @@ pub struct SteamSystem {
     /// load-rejection signal arms it for one full fast stroke even when the
     /// signal itself lasts only one scan.
     pub fast_open_latch: f64,
+    /// Composition of the dome gas the valves pass this step (`compute_flows_from`).
+    pub gas: LineGas,
+    /// Water-vapour mass fraction of the committed line flow: the request's dome
+    /// composition, then the vessel's delivered split (`limit_to_delivered`).
+    pub water_frac: f64,
 }
 
 /// Critical (choking) pressure ratio of the steam valves, receiver / upstream.
 const VALVE_CRITICAL_RATIO: f64 = 0.55;
+/// Ideal-gas heat-capacity ratios for the composition correction. 1.3 is the
+/// superheated-steam nozzle value consistent with the 0.55 critical ratio.
+const GAMMA_STEAM: f64 = 1.3;
+const GAMMA_AIR: f64 = 1.4;
+
+/// Ideal-gas critical pressure ratio (2/(g+1))^(g/(g-1)).
+fn ideal_critical_ratio(gamma: f64) -> f64 {
+    (2.0 / (gamma + 1.0)).powf(gamma / (gamma - 1.0))
+}
+
+/// Ideal-gas choked mass flux per unit area and upstream pressure, times sqrt(T):
+/// sqrt(g/R) (2/(g+1))^((g+1)/(2(g-1))).
+fn ideal_choked_flux(gamma: f64, r_gas: f64) -> f64 {
+    (gamma / r_gas).sqrt() * (2.0 / (gamma + 1.0)).powf((gamma + 1.0) / (2.0 * (gamma - 1.0)))
+}
+
+/// Dome-gas composition seen by the main-steam valves and turbine. The valve
+/// conductances and critical ratio are the rated pure-steam calibration; a
+/// mixture rescales them by the ideal-gas choked law at the same upstream
+/// pressure and temperature (which cancel in the ratio), using the mixture gas
+/// constant and heat-capacity ratio (round-6 R3). Pure steam is exactly the
+/// calibration, so its flows are unchanged bit for bit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineGas {
+    /// Noncondensable (air) mass fraction.
+    pub x_gas: f64,
+    /// Water-vapour mole fraction: the water partial pressure over total
+    /// pressure, preserved through isenthalpic throttling of the mixture.
+    pub y_water: f64,
+    /// Choked mass capacity relative to pure steam at the same p and T.
+    pub capacity: f64,
+    /// Critical (choking) pressure ratio, receiver / upstream.
+    pub critical_ratio: f64,
+}
+
+impl LineGas {
+    pub const STEAM: Self = Self { x_gas: 0.0, y_water: 1.0, capacity: 1.0, critical_ratio: VALVE_CRITICAL_RATIO };
+
+    /// Composition from the air mass fraction `x_gas` and the water mole
+    /// fraction `y_water` (the vessel's own Dalton partition).
+    pub fn new(x_gas: f64, y_water: f64) -> Self {
+        if !(x_gas > 0.0) {
+            return Self::STEAM;
+        }
+        let x_gas = x_gas.min(1.0);
+        let x_w = 1.0 - x_gas;
+        // Ideal mixing by mass: R and cp add; gamma = cp / (cp - R).
+        let cp = |g: f64, r: f64| g * r / (g - 1.0);
+        let r_mix = x_w * R_WATER + x_gas * R_AIR;
+        let cp_mix = x_w * cp(GAMMA_STEAM, R_WATER) + x_gas * cp(GAMMA_AIR, R_AIR);
+        let gamma = cp_mix / (cp_mix - r_mix);
+        Self {
+            x_gas,
+            y_water: y_water.clamp(0.0, 1.0),
+            capacity: ideal_choked_flux(gamma, r_mix) / ideal_choked_flux(GAMMA_STEAM, R_WATER),
+            critical_ratio: VALVE_CRITICAL_RATIO * ideal_critical_ratio(gamma) / ideal_critical_ratio(GAMMA_STEAM),
+        }
+    }
+
+    /// Mass flow, kg/s, through valves of pure-steam conductance `a` passing
+    /// this gas; see `valve_flow`.
+    pub fn valve_flow(&self, a: f64, p_up: f64, p_down: f64) -> f64 {
+        if !(p_up > 0.0) || p_down >= p_up {
+            return 0.0;
+        }
+        let rc = self.critical_ratio;
+        let r = (p_down / p_up).max(0.0);
+        let g = if r <= rc {
+            1.0
+        } else {
+            let y = (r - rc) / (1.0 - rc);
+            (1.0 - y * y).sqrt()
+        };
+        a * self.capacity * p_up * g
+    }
+
+    /// Upstream pressure at which a unit-conductance valve passes `per_area`
+    /// (kg/s per unit `a`) into `p_down`: the inverse of `valve_flow`, which is
+    /// strictly increasing in upstream pressure above the receiver.
+    fn valve_upstream_for(&self, per_area: f64, p_down: f64) -> f64 {
+        if !(per_area > 0.0) {
+            return p_down;
+        }
+        let choked_p = per_area / self.capacity;
+        if p_down <= self.critical_ratio * choked_p {
+            return choked_p;
+        }
+        let (mut lo, mut hi) = (p_down, p_down / self.critical_ratio);
+        for _ in 0..100 {
+            let mid = 0.5 * (lo + hi);
+            if self.valve_flow(1.0, mid, p_down) < per_area {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    }
+}
 
 /// Mass flow, kg/s, through steam valves of conductance `a` (kg/s per Pa of
 /// upstream pressure while choked) from `p_up` into a receiver at `p_down`.
@@ -47,39 +152,7 @@ const VALVE_CRITICAL_RATIO: f64 = 0.55;
 /// subcritical curve takes it continuously to zero at equal pressure. A
 /// reversed difference passes nothing: the line has no backflow path.
 pub fn valve_flow(a: f64, p_up: f64, p_down: f64) -> f64 {
-    if !(p_up > 0.0) || p_down >= p_up {
-        return 0.0;
-    }
-    let r = (p_down / p_up).max(0.0);
-    let g = if r <= VALVE_CRITICAL_RATIO {
-        1.0
-    } else {
-        let y = (r - VALVE_CRITICAL_RATIO) / (1.0 - VALVE_CRITICAL_RATIO);
-        (1.0 - y * y).sqrt()
-    };
-    a * p_up * g
-}
-
-/// Upstream pressure at which a unit-conductance valve passes `per_area`
-/// (kg/s per unit `a`) into `p_down`: the inverse of `valve_flow`, which is
-/// strictly increasing in upstream pressure above the receiver.
-fn valve_upstream_for(per_area: f64, p_down: f64) -> f64 {
-    if !(per_area > 0.0) {
-        return p_down;
-    }
-    if p_down <= VALVE_CRITICAL_RATIO * per_area {
-        return per_area;
-    }
-    let (mut lo, mut hi) = (p_down, p_down / VALVE_CRITICAL_RATIO);
-    for _ in 0..100 {
-        let mid = 0.5 * (lo + hi);
-        if valve_flow(1.0, mid, p_down) < per_area {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    0.5 * (lo + hi)
+    LineGas::STEAM.valve_flow(a, p_up, p_down)
 }
 
 impl SteamSystem {
@@ -101,6 +174,8 @@ impl SteamSystem {
             p_down: 0.0,
             h_steam: sat_p(P_ATM).h_g,
             fast_open_latch: 0.0,
+            gas: LineGas::STEAM,
+            water_frac: 1.0,
         }
     }
 
@@ -112,12 +187,12 @@ impl SteamSystem {
     /// receiver at `p_down`, taking the vessel outlet as saturated vapour at `p`.
     pub fn compute_flows(&mut self, p: f64, p_down: f64, tsv_open: bool) {
         let s = sat_p(p);
-        self.compute_flows_from(p, s.h_g, s.rho_g, p_down, tsv_open);
+        self.compute_flows_from(p, s.h_g, s.rho_g, LineGas::STEAM, p_down, tsv_open);
     }
 
     /// Steam flows for the current valve positions at dome pressure `p` with vessel
-    /// outlet enthalpy `h_in` and dome-gas density `rho_in` (vapour plus any
-    /// noncondensables), discharging into the receiving pressure `p_down`. The
+    /// outlet enthalpy `h_in`, dome-gas density `rho_in` (vapour plus any
+    /// noncondensables) and composition `gas`, discharging into the receiving pressure `p_down`. The
     /// main line carries dome gas only: a water-solid vessel delivers nothing
     /// (the vessel bounds that), because the plant trips turbine and feed at L8
     /// long before carryover. No heat or work is exchanged in the line or the
@@ -125,13 +200,15 @@ impl SteamSystem {
     ///
     /// The line is Darcy friction, dp = K w^2 / rho, with K fixed by the
     /// rated-steam calibration (rated flow, 0.2 MPa drop), so its coefficient
-    /// scales by rho_rated / rho_in. The valves follow `valve_flow`: choked
+    /// scales by rho_rated / rho_in. The valves follow `gas.valve_flow`: choked
     /// (pressure-linear, the rated calibration) until the receiver reaches the
     /// critical ratio, then subcritical down to zero at equal pressure. Turbine
     /// and bypass both exhaust to the condenser, the only receiver modelled.
-    pub fn compute_flows_from(&mut self, p: f64, h_in: f64, rho_in: f64, p_down: f64, tsv_open: bool) {
+    pub fn compute_flows_from(&mut self, p: f64, h_in: f64, rho_in: f64, gas: LineGas, p_down: f64, tsv_open: bool) {
         self.h_steam = h_in;
         self.p_down = p_down;
+        self.gas = gas;
+        self.water_frac = 1.0 - gas.x_gas;
         let m = self.msiv_open_fraction();
         let a_tcv = if tsv_open { C_TCV * self.tcv_pos } else { 0.0 };
         let a_byp = C_BYPASS * self.bypass_pos;
@@ -145,16 +222,18 @@ impl SteamSystem {
             return;
         }
         let k = STEAM_LINE_DP / (STEAM_FLOW_RATED * STEAM_FLOW_RATED) / (m * m) * Self::line_density_factor(rho_in);
-        // Choked valves: w = a (p - k w^2), closed form.
-        let mut w = (-1.0 + (1.0 + 4.0 * a * a * k * p).sqrt()) / (2.0 * a * k);
-        if p_down > VALVE_CRITICAL_RATIO * (p - k * w * w) {
+        // Choked valves: w = a_m (p - k w^2), closed form, with the mixture
+        // capacity a_m = capacity * a.
+        let a_m = a * gas.capacity;
+        let mut w = (-1.0 + (1.0 + 4.0 * a_m * a_m * k * p).sqrt()) / (2.0 * a_m * k);
+        if p_down > gas.critical_ratio * (p - k * w * w) {
             // Subcritical: valve flow minus line flow rises with w (the chest
             // pressure falls), so the joint solution is bracketed by zero flow
             // and the flow that drops the whole difference across the line.
             let (mut lo, mut hi) = (0.0, ((p - p_down) / k).sqrt());
             for _ in 0..100 {
                 let mid = 0.5 * (lo + hi);
-                if valve_flow(a, p - k * mid * mid, p_down) > mid {
+                if gas.valve_flow(a, p - k * mid * mid, p_down) > mid {
                     lo = mid;
                 } else {
                     hi = mid;
@@ -164,8 +243,8 @@ impl SteamSystem {
         }
         self.k_line = k;
         self.p_chest = p - k * w * w;
-        self.w_tcv = valve_flow(a_tcv, self.p_chest, p_down);
-        self.w_bypass = valve_flow(a_byp, self.p_chest, p_down);
+        self.w_tcv = gas.valve_flow(a_tcv, self.p_chest, p_down);
+        self.w_bypass = gas.valve_flow(a_byp, self.p_chest, p_down);
     }
 
     /// Line resistance multiplier for dome gas of density `rho_in`; see
@@ -177,20 +256,32 @@ impl SteamSystem {
         sat_p(P_RATED).rho_g / rho_in
     }
 
+    /// Total line mass flow, water vapour plus noncondensables, kg/s: the
+    /// hydraulic quantity (vessel withdrawal, high-flow line-break protection).
     pub fn total_flow(&self) -> f64 {
         self.w_tcv + self.w_bypass
     }
 
-    /// Commit the flow the vessel actually delivered (`w_delivered`, at most the
-    /// hydraulic request). Valve areas are fixed for the step, so a supply
+    /// Water-vapour part of the line flow, kg/s: what the vessel loses as water,
+    /// so the feed controller replaces it and the condenser condenses it
+    /// (round-6 R1). Equal to `total_flow` for pure steam.
+    pub fn water_flow(&self) -> f64 {
+        self.total_flow() * self.water_frac
+    }
+
+    /// Commit the flow the vessel actually delivered: `w_water` vapour and
+    /// `w_gas` noncondensables, at most the hydraulic request in total. Valve areas are fixed for the step, so a supply
     /// shortfall cannot coexist with dome pressure at the line inlet: the
     /// starved inlet is the explicit supply-limited boundary. The valves pass the
-    /// delivered flow at the chest pressure their own relation (`valve_flow`
-    /// into the same receiver) gives, and the line inlet sits at
+    /// delivered flow at the chest pressure their own relation (`gas.valve_flow`
+    /// into the same receiver, the law the request was solved with) gives, and the line inlet sits at
     /// p_chest + k w^2, below dome pressure. Both relations hold at the committed
     /// flow, so turbine work, the next EHC scan and MSIV protection see one
     /// hydraulic state (R2).
-    pub fn limit_to_delivered(&mut self, w_delivered: f64) {
+    pub fn limit_to_delivered(&mut self, w_water: f64, w_gas: f64) {
+        let w_delivered = w_water + w_gas;
+        // The vessel may clip the gas to its inventory, so take its split.
+        self.water_frac = if w_delivered > 0.0 { w_water / w_delivered } else { 1.0 - self.gas.x_gas };
         let w_req = self.total_flow();
         if !(w_req > 0.0 && w_delivered < w_req) {
             return;
@@ -200,8 +291,8 @@ impl SteamSystem {
         self.w_bypass *= ratio;
         // Both valves see one chest pressure, so the flow per unit area scales by
         // the same ratio; invert it for the chest pressure.
-        let per_area = ratio * valve_flow(1.0, self.p_chest, self.p_down);
-        self.p_chest = valve_upstream_for(per_area, self.p_down);
+        let per_area = ratio * self.gas.valve_flow(1.0, self.p_chest, self.p_down);
+        self.p_chest = self.gas.valve_upstream_for(per_area, self.p_down);
         let w = self.total_flow();
         self.p_line_inlet = self.p_chest + self.k_line * w * w;
     }
@@ -456,6 +547,8 @@ pub struct TurbineInlet {
     /// Liquid fraction, kg/s, and its enthalpy, J/kg.
     pub w_liquid: f64,
     pub h_liquid: f64,
+    /// Water-vapour (partial) pressures at the chest and the exhaust, Pa:
+    /// the totals for pure steam (see `mixture`).
     pub p_chest: f64,
     pub p_cond: f64,
     /// Shaft work bound per kg of vapour, J/kg: TURBINE_ETA_IS times the
@@ -480,6 +573,20 @@ impl TurbineInlet {
         let w_vapour = w * x;
         let work_limit = if w_vapour > 0.0 { TURBINE_ETA_IS * steam::isentropic_drop(h_vapour, p_chest, p_cond) } else { 0.0 };
         Self { w, h, w_vapour, h_vapour, w_liquid: w - w_vapour, h_liquid, p_chest, p_cond, work_limit, h_floor }
+    }
+
+    /// Inlet for water `w` (enthalpy `h`) carried in a gas mixture of water
+    /// mole fraction `y_water` at total chest pressure `p_chest`, exhausting at
+    /// total condenser pressure `p_cond`. Water phase equilibrium is set by its
+    /// partial pressure, not the total (round-6 R2), and the mixture keeps its
+    /// composition through the blading, so the water expands between its
+    /// partial pressures at both ends; the noncondensable is an inert diluent
+    /// that does no modelled work. The condensate floor stays the condenser's
+    /// own (total-pressure) saturation, as for pure steam. With `y_water` = 1
+    /// this is exactly `new`.
+    pub fn mixture(w: f64, h: f64, p_chest: f64, p_cond: f64, y_water: f64) -> Self {
+        let h_floor = sat_p(p_cond.max(1.0)).h_f;
+        Self { h_floor, ..Self::new(w, h, p_chest * y_water, p_cond * y_water) }
     }
 
     /// Extraction heat the vapour can still give up after `p_mech` of shaft
@@ -1345,12 +1452,12 @@ mod tests {
         assert!(w > 0.0 && p_down > 0.55 * s.p_chest, "must be subcritical: w {w}, chest {}", s.p_chest);
         let a = C_TCV * 0.4 + C_BYPASS * 0.3;
         assert!((valve_flow(a, s.p_chest, p_down) - w).abs() <= 1e-9 * w);
-        s.limit_to_delivered(0.5 * w);
+        s.limit_to_delivered(0.5 * w, 0.0);
         let wd = s.total_flow();
         assert!((wd - 0.5 * w).abs() < 1e-9 * w);
         assert!((valve_flow(a, s.p_chest, p_down) - wd).abs() < 1e-9 * w, "valve law off at delivered flow");
         assert!((s.p_line_inlet - (s.p_chest + s.k_line * wd * wd)).abs() < 1e-6, "line law off at delivered flow");
-        s.limit_to_delivered(0.0);
+        s.limit_to_delivered(0.0, 0.0);
         assert_eq!(s.total_flow(), 0.0);
         assert!((s.p_chest - p_down).abs() < 1e-9 * p_down, "no flow sits at the receiver: {}", s.p_chest);
     }
