@@ -104,6 +104,15 @@ pub fn sat_p(p: f64) -> Sat {
     sat_t(T0 + i as f64 + f)
 }
 
+/// Saturation properties at pressure `p` (Pa), or `None` outside the table's
+/// pressure domain (1..350 degC) where `sat_p` would silently clamp to an end
+/// row. For callers whose pressure is not bounded by plant state, such as a
+/// turbine expansion endpoint (round-7 R2).
+pub fn sat_p_checked(p: f64) -> Option<Sat> {
+    let in_domain = p >= SAT_TABLE[0][1] && p <= SAT_TABLE[N - 1][1];
+    in_domain.then(|| sat_p(p))
+}
+
 /// Temperature (degC) of liquid water with specific enthalpy `h` (J/kg),
 /// using the saturated-liquid curve (good for compressed liquid at BWR pressures).
 pub fn t_from_h_liquid(h: f64) -> f64 {
@@ -260,6 +269,8 @@ pub fn entropy_hp(h: f64, p: f64) -> f64 {
 /// to `p_out`: the reversible work limit of any expansion between those states.
 /// The exit state at `p_out` is wet (lever rule on entropy), compressed liquid
 /// (drop = v_f dp, liquid is nearly incompressible) or slightly superheated.
+/// Both pressures must lie in the table domain (`sat_p_checked`); outside it
+/// the lookups clamp, so callers with unbounded pressures check first.
 pub fn isentropic_drop(h_in: f64, p_in: f64, p_out: f64) -> f64 {
     if !(p_in > p_out && p_out > 0.0) {
         return 0.0;
@@ -280,6 +291,18 @@ pub fn isentropic_drop(h_in: f64, p_in: f64, p_out: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_saturation_rejects_pressures_outside_the_table() {
+        let (p_lo, p_hi) = (SAT_TABLE[0][1], SAT_TABLE[N - 1][1]);
+        for p in [p_lo, 5.6e3, 7.0e6, p_hi] {
+            assert_eq!(sat_p_checked(p), Some(sat_p(p)), "p {p}");
+        }
+        // Round-7 fixture: 323.56 Pa water partial pressure, below the 1 degC row.
+        for p in [323.561675, 0.999 * p_lo, 1.001 * p_hi, 0.0, -1.0, f64::NAN] {
+            assert_eq!(sat_p_checked(p), None, "p {p}");
+        }
+    }
 
     #[test]
     fn known_points() {

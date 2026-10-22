@@ -433,7 +433,11 @@ impl Sim {
         let byp_ok = self.cond.available_for_bypass();
         let gen_online = self.turbine.breaker_closed && !self.turbine.tripped;
         let fast_open = self.turbine.tripped || (self.prev_gen_online && !gen_online);
-        self.steam.step_ext(dt, p, tcv_demand, byp_ok, self.turbine.tripped, fast_open);
+        // Gas-bearing steam is not admitted to the turbine (round-7 R1/R2): the
+        // permissive shuts the TCVs and stops admission as a trip does, without
+        // latching one, while the bypass keeps purging gas to the condenser.
+        let admit = !self.turbine.tripped && !self.turbine_gas_blocked();
+        self.steam.step_ext(dt, p, tcv_demand, byp_ok, !admit, fast_open);
         // The flow transmitter reads what last left the vessel (committed below),
         // not this step's hydraulic request, which the vessel may not supply (R6).
         // Feed replaces water, so it sees the water part of a gas-bearing line
@@ -444,8 +448,8 @@ impl Sim {
         // receiver of both turbine and bypass paths (round-5 R4/Astra R3). A
         // water-solid vessel supplies none (`Vessel::step_with_ic`).
         let (h_line, rho_line) = (self.vessel.steam_port_enthalpy(), self.vessel.steam_line_density());
-        let gas = LineGas::new(self.vessel.dome_gas_mass_fraction(), self.vessel.dome_water_mole_fraction());
-        self.steam.compute_flows_from(p, h_line, rho_line, gas, self.cond.pressure(), !self.turbine.tripped);
+        let gas = LineGas::new(self.vessel.dome_gas_mass_fraction());
+        self.steam.compute_flows_from(p, h_line, rho_line, gas, self.cond.pressure(), admit);
 
         // --- isolation condensers: requests only; nothing is committed until
         // the vessel has decided how much IC steam it can supply. `t_cool` (not
@@ -511,11 +515,10 @@ impl Sim {
         let water_frac = self.steam.water_frac;
         let (w_tcv, w_byp) = (self.steam.w_tcv * water_frac, self.steam.w_bypass * water_frac);
         // Work and extraction come only from the vapour the turbine received, out
-        // of one available-energy budget (Sol N2, R1). The water's phase and
-        // expansion follow its own partial pressure at both ends (the mixture
-        // keeps its composition through the blading); the air rides along as an
-        // inert diluent and does no modelled work (round-6 R2).
-        let inlet = TurbineInlet::mixture(w_tcv, f.h_steam, self.steam.p_chest, self.cond.pressure(), self.steam.gas.y_water);
+        // of one available-energy budget (Sol N2, R1). Admission is pure steam
+        // (the gas permissive above); any trace gas does no work.
+        let inlet = TurbineInlet::new(w_tcv, f.h_steam, self.steam.p_chest, self.cond.pressure());
+        debug_assert!(!inlet.out_of_domain, "turbine pressures outside the property table: {inlet:?}");
         self.turbine.step(dt, &inlet);
         let q_budget = inlet.extraction_budget(self.turbine.p_mech);
         self.fw.step_heater_capped(dt, w_feed, inlet.w_vapour, q_budget, self.cond.hotwell_t());
@@ -800,6 +803,12 @@ impl Sim {
 
     // ------------------------------------------------------------------ alarms & snapshot
 
+    /// Turbine admission permissive is not met: the dome carries more than a
+    /// trace of noncondensables (`TURBINE_ADMISSION_MAX_GAS_FRACTION`).
+    fn turbine_gas_blocked(&self) -> bool {
+        self.vessel.dome_gas_mass_fraction() > TURBINE_ADMISSION_MAX_GAS_FRACTION
+    }
+
     fn active_alarms(&self) -> Vec<(String, String, Severity)> {
         let mut v: Vec<(String, String, Severity)> = Vec::new();
         let mut add = |id: &str, text: String, sev: Severity| v.push((id.to_string(), text, sev));
@@ -887,6 +896,10 @@ impl Sim {
         // condenser at any temperature (water-solid included).
         if !self.cond.available_for_bypass() && p > 1.0e6 {
             add("byp_unavail", "TURBINE BYPASS UNAVAILABLE".into(), Severity::Warning);
+        }
+        // Only meaningful with a steam path to the turbine.
+        if self.turbine_gas_blocked() && self.msivs_open() {
+            add("turb_gas", "TURBINE ADMISSION BLOCKED: NONCONDENSABLES".into(), Severity::Warning);
         }
         if self.fw.t_feed < 150.0 && n > 0.3 {
             add("fw_temp", "FEEDWATER TEMPERATURE LOW".into(), Severity::Warning);

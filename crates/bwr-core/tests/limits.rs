@@ -332,7 +332,7 @@ fn gas_turbine_fixture() -> Sim {
 }
 
 fn dome_gas(sim: &Sim) -> LineGas {
-    LineGas::new(sim.vessel.dome_gas_mass_fraction(), sim.vessel.dome_water_mole_fraction())
+    LineGas::new(sim.vessel.dome_gas_mass_fraction())
 }
 
 /// Round-6 Sol R2 / Astra R1: three-element feed replaces the water that left,
@@ -375,39 +375,94 @@ fn gas_bearing_line_feeds_forward_water_only() {
     assert!(mixture_ref.fcv_pos > water_ref.fcv_pos + 1e-4, "mixture {} vs water {}", mixture_ref.fcv_pos, water_ref.fcv_pos);
 }
 
-/// Round-6 Sol R1 / Astra R2: the air-bearing chest stream is all vapour at
-/// the water partial pressure (~70.18 kPa, not the ~230 kPa total); the work
-/// bound is the water's own isentropic drop between partial pressures, and a
-/// gas-free inlet is exactly the pure-steam one.
+fn has_alarm(sim: &Sim, id: &str) -> bool {
+    sim.snapshot().alarms.iter().any(|a| a.id == id)
+}
+
+/// `open_line_cold_fixture` with `gas` kg of air, the turbine reset and rolling
+/// (the governor holds the TCVs open), TCVs at `tcv` and the bypass at `bypass`.
+fn admission_fixture(t: f64, gas: f64, tcv: f64, bypass: f64) -> Sim {
+    let mut sim = open_line_cold_fixture(t, 180_000.0, gas);
+    sim.turbine.reset();
+    sim.turbine.speed_target = RATED_RPM;
+    sim.steam.tcv_pos = tcv;
+    sim.steam.bypass_manual_pos = bypass;
+    sim.steam.bypass_pos = bypass;
+    sim
+}
+
+/// Round-7 Sol R1/R2, Astra R1/R2: gas-bearing steam is not admitted to the
+/// turbine. Reviewers' fixtures (sealed 90 C and 40 C, 180 t, 100 kg air, stop
+/// valves reset) plus a TCV already well open: no TCV flow or shaft work from
+/// the first step, the TCVs stroke shut without a latched trip, the permissive
+/// is annunciated, and an open bypass still purges the air to the condenser
+/// with the vessel water + gas balance closed.
 #[test]
-fn gas_bearing_turbine_inlet_uses_water_partial_pressure() {
-    use bwr_core::bop::TurbineInlet;
-    let sim = gas_turbine_fixture();
-    let (v, p_cond) = (&sim.vessel, sim.cond.pressure());
-    assert!((p_cond - 5928.62).abs() < 0.1, "condenser {p_cond}");
-    let gas = dome_gas(&sim);
-    let h = v.steam_port_enthalpy();
-    let mut st = sim.steam.clone();
-    st.compute_flows_from(v.eos.p, h, v.steam_line_density(), gas, p_cond, true);
-    assert!(st.p_chest > 2.29e5 && v.eos.p - st.p_chest < 1.0, "chest {} vs dome {}", st.p_chest, v.eos.p);
-    let p_w = st.p_chest * gas.y_water;
-    assert!((p_w - sat_t(90.0).p).abs() < 1e-4 * p_w, "water partial {p_w}");
-    let w = st.w_tcv * st.water_frac;
-    let inlet = TurbineInlet::mixture(w, h, st.p_chest, p_cond, gas.y_water);
-    assert_eq!(inlet.w_liquid, 0.0, "no condensate invented at the water partial pressure");
-    assert_eq!((inlet.w_vapour, inlet.h_vapour), (w, h));
-    let bound = TURBINE_ETA_IS * isentropic_drop(h, p_w, p_cond * gas.y_water);
-    assert!((inlet.work_limit - bound).abs() <= 1e-9 * bound, "work bound {} vs {bound}", inlet.work_limit);
-    // Frozen-composition expansion to the water's exhaust partial pressure,
-    // below the ~453.6 kJ/kg the total-pressure state claimed.
-    assert!(inlet.work_limit < TurbineInlet::new(w, h, st.p_chest, p_cond).work_limit);
-    assert_eq!(inlet.h_floor, sat_p(p_cond).h_f);
-    // The total-pressure state wrongly made ~2.43% liquid.
-    assert!(TurbineInlet::new(w, h, st.p_chest, p_cond).w_liquid > 0.02 * w);
-    // Pure steam: identical to the pure-water inlet.
-    for (p_chest, h) in [(6.9e6, sat_p(6.9e6).h_g), (6.9e6, sat_p(7.1e6).h_g), (0.5e6, 2.9e6)] {
-        assert_eq!(TurbineInlet::mixture(400.0, h, p_chest, 5.6e3, 1.0), TurbineInlet::new(400.0, h, p_chest, 5.6e3));
+fn gas_bearing_steam_is_not_admitted_to_the_turbine() {
+    let dt = 0.05;
+    for (t, tcv, bypass) in [(90.0, 0.01, 1.0), (90.0, 0.5, 0.0), (40.0, 0.001, 0.0)] {
+        let mut sim = admission_fixture(t, 100.0, tcv, bypass);
+        assert!(sim.vessel.dome_gas_mass_fraction() > TURBINE_ADMISSION_MAX_GAS_FRACTION);
+        assert!(has_alarm(&sim, "turb_gas"), "{t} C: permissive not annunciated");
+        for _ in 0..(1.0 / dt) as usize {
+            let (m0, g0) = (sim.vessel.mass, sim.vessel.gas_mass);
+            assert!(sim.step(dt), "{t} C: {:?}", sim.model_error);
+            assert_eq!((sim.steam.w_tcv, sim.turbine.p_mech, sim.fw.q_extraction_w), (0.0, 0.0, 0.0), "{t} C: turbine admitted gas-bearing steam");
+            let f = sim.vessel.flows;
+            assert!((sim.steam.total_flow() - (f.w_steam + f.w_steam_gas)).abs() <= 1e-9 * sim.steam.total_flow().max(1.0));
+            let res = (sim.vessel.mass + sim.vessel.gas_mass) - (m0 + g0) - (vessel_net_water(&sim) - f.w_steam_gas) * dt;
+            assert!(res.abs() <= 1e-9 * m0, "{t} C: water + gas residual {res} kg");
+        }
+        assert_eq!(sim.steam.tcv_pos, 0.0, "{t} C: TCVs must stroke shut");
+        assert!(!sim.turbine.tripped && has_alarm(&sim, "turb_gas"), "{t} C: permissive, not a latched trip");
+        let gas_out = 100.0 - sim.vessel.gas_mass;
+        assert!((sim.cond.noncondensable_in_kg - gas_out).abs() <= 1e-9 * 100.0, "booked {} vs {gas_out}", sim.cond.noncondensable_in_kg);
+        if bypass > 0.0 {
+            assert!(gas_out > 0.1 && sim.steam.w_bypass > 0.0, "{t} C: bypass must keep purging, gas out {gas_out}");
+        } else {
+            assert_eq!(gas_out, 0.0);
+        }
     }
+}
+
+/// Below the permissive limit a trace of gas is admitted with the steam: the
+/// water expands as pure vapour between the total pressures, the gas does no
+/// work and is booked to the condenser shell.
+#[test]
+fn trace_gas_below_the_permissive_is_admitted_as_pure_steam() {
+    use bwr_core::bop::TurbineInlet;
+    let mut sim = admission_fixture(90.0, 0.01, 0.01, 0.0);
+    let x = sim.vessel.dome_gas_mass_fraction();
+    assert!(x > 1e-4 && x < TURBINE_ADMISSION_MAX_GAS_FRACTION, "trace fraction {x}");
+    let h = sim.vessel.steam_port_enthalpy();
+    assert!(sim.step(DT), "{:?}", sim.model_error);
+    assert!(!has_alarm(&sim, "turb_gas"));
+    let st = &sim.steam;
+    let f = sim.vessel.flows;
+    assert!(st.w_tcv > 0.0 && f.w_steam_gas > 0.0);
+    let inlet = TurbineInlet::new(st.w_tcv * st.water_frac, h, st.p_chest, sim.cond.pressure());
+    assert!(!inlet.out_of_domain && inlet.w_vapour > 0.0);
+    let p_mech = sim.turbine.p_mech;
+    assert!(p_mech > 0.0 && p_mech <= inlet.w_vapour * inlet.work_limit * (1.0 + 1e-12), "p_mech {p_mech}");
+    let gas_out = 0.01 - sim.vessel.gas_mass;
+    assert!((sim.cond.noncondensable_in_kg - gas_out).abs() <= 1e-15 && gas_out > 0.0, "booked {} vs {gas_out}", sim.cond.noncondensable_in_kg);
+}
+
+/// Round-7 Sol R2 / Astra R1: pressures below the water-property table (the
+/// former water partial pressures of air-rich admission) are not clamped onto
+/// the 1 C row. The inlet reports them out of domain and passes the flow
+/// unexpanded: no work and no extraction budget.
+#[test]
+fn turbine_inlet_outside_the_property_table_does_no_work() {
+    use bwr_core::bop::TurbineInlet;
+    let h = 2_573_542.0;
+    for (p_chest, p_cond) in [(7384.37, 323.561675), (54.331214, 43.779462), (6.9e6, 1.0)] {
+        let inlet = TurbineInlet::new(400.0, h, p_chest, p_cond);
+        assert!(inlet.out_of_domain, "({p_chest}, {p_cond})");
+        assert_eq!((inlet.w_vapour, inlet.work_limit, inlet.extraction_budget(0.0)), (0.0, 0.0, 0.0));
+        assert_eq!((inlet.w, inlet.h), (400.0, h));
+    }
+    assert!(!TurbineInlet::new(400.0, sat_p(6.9e6).h_g, 6.9e6, 5.6e3).out_of_domain);
 }
 
 /// Independent ideal-gas choked law at fixed T: w / (A p) ~ sqrt(g / R) psi(g).
@@ -431,10 +486,10 @@ fn valve_capacity_follows_composition_at_fixed_temperature() {
     };
     let base = w_per_p(LineGas::STEAM, rho_steam);
     assert_eq!(base, C_TCV * 0.001, "pure steam is the calibration");
-    assert_eq!(w_per_p(LineGas::new(0.0, 1.0), rho_steam), base);
+    assert_eq!(w_per_p(LineGas::new(0.0), rho_steam), base);
     let mut prev = 1.0;
     for x in [1e-9, 0.1, 0.3, 0.5, 0.7834, 0.9, 1.0] {
-        let gas = LineGas::new(x, 0.5);
+        let gas = LineGas::new(x);
         let rho = rho_steam / (1.0 - x * (1.0 - 461.526 / 287.05)).max(1e-9);
         let ratio = w_per_p(gas, rho) / base;
         // Independent ideal mixture: R and cp mix by mass, gamma = cp / cv.
@@ -445,10 +500,10 @@ fn valve_capacity_follows_composition_at_fixed_temperature() {
         prev = ratio;
     }
     assert!((prev - 1.3012).abs() < 2e-3, "air limit {prev}");
-    let mid = LineGas::new(0.78335823, 0.3);
+    let mid = LineGas::new(0.78335823);
     assert!((mid.capacity - 1.21).abs() < 5e-3, "78.3% air {}", mid.capacity);
     // The air critical ratio follows the ideal law, scaled to the 0.55 calibration.
-    let air = LineGas::new(1.0, 0.0);
+    let air = LineGas::new(1.0);
     assert!((air.critical_ratio - 0.55 * 0.528282 / 0.545727).abs() < 1e-4, "air critical {}", air.critical_ratio);
 }
 
@@ -470,7 +525,7 @@ fn mixture_valve_law_is_consistent_in_delivery() {
     assert!((ratio - dome_gas(&wet).capacity).abs() < 1e-9 && ratio > 1.19, "wet/dry {ratio}");
 
     for p_down in [5.0e3, 90.0e3] {
-        let gas = LineGas::new(0.6, 0.4);
+        let gas = LineGas::new(0.6);
         let mut s = bwr_core::bop::SteamSystem::new(true);
         s.tcv_pos = 0.4;
         s.bypass_pos = 0.3;

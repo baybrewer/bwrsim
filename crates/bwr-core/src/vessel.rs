@@ -869,14 +869,6 @@ impl Vessel {
         if self.gas_mass > 0.0 { self.gas_mass / (self.gas_mass + self.mass * self.eos.x) } else { 0.0 }
     }
 
-    /// Water-vapour mole fraction of the dome gas from the EOS's own Dalton
-    /// partition (vapour partial pressure over total). Throttling keeps the
-    /// composition, so the turbine's water partial pressure is this times the
-    /// chest pressure (round-6 R2). Exactly 1 with no noncondensables.
-    pub fn dome_water_mole_fraction(&self) -> f64 {
-        if self.gas_mass > 0.0 && self.eos.p > 0.0 { ((self.eos.p - self.eos.p_gas) / self.eos.p).clamp(0.0, 1.0) } else { 1.0 }
-    }
-
     /// Density (kg/m3) of the dome gas entering the main steam lines: the
     /// vapour plus the noncondensables sharing the head space. Unused when
     /// water-solid (the vessel delivers nothing to the lines then).

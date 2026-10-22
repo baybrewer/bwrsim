@@ -61,7 +61,7 @@ fn ideal_choked_flux(gamma: f64, r_gas: f64) -> f64 {
     (gamma / r_gas).sqrt() * (2.0 / (gamma + 1.0)).powf((gamma + 1.0) / (2.0 * (gamma - 1.0)))
 }
 
-/// Dome-gas composition seen by the main-steam valves and turbine. The valve
+/// Dome-gas composition seen by the main-steam valves. The valve
 /// conductances and critical ratio are the rated pure-steam calibration; a
 /// mixture rescales them by the ideal-gas choked law at the same upstream
 /// pressure and temperature (which cancel in the ratio), using the mixture gas
@@ -71,9 +71,6 @@ fn ideal_choked_flux(gamma: f64, r_gas: f64) -> f64 {
 pub struct LineGas {
     /// Noncondensable (air) mass fraction.
     pub x_gas: f64,
-    /// Water-vapour mole fraction: the water partial pressure over total
-    /// pressure, preserved through isenthalpic throttling of the mixture.
-    pub y_water: f64,
     /// Choked mass capacity relative to pure steam at the same p and T.
     pub capacity: f64,
     /// Critical (choking) pressure ratio, receiver / upstream.
@@ -81,11 +78,10 @@ pub struct LineGas {
 }
 
 impl LineGas {
-    pub const STEAM: Self = Self { x_gas: 0.0, y_water: 1.0, capacity: 1.0, critical_ratio: VALVE_CRITICAL_RATIO };
+    pub const STEAM: Self = Self { x_gas: 0.0, capacity: 1.0, critical_ratio: VALVE_CRITICAL_RATIO };
 
-    /// Composition from the air mass fraction `x_gas` and the water mole
-    /// fraction `y_water` (the vessel's own Dalton partition).
-    pub fn new(x_gas: f64, y_water: f64) -> Self {
+    /// Composition from the air mass fraction `x_gas`.
+    pub fn new(x_gas: f64) -> Self {
         if !(x_gas > 0.0) {
             return Self::STEAM;
         }
@@ -98,7 +94,6 @@ impl LineGas {
         let gamma = cp_mix / (cp_mix - r_mix);
         Self {
             x_gas,
-            y_water: y_water.clamp(0.0, 1.0),
             capacity: ideal_choked_flux(gamma, r_mix) / ideal_choked_flux(GAMMA_STEAM, R_WATER),
             critical_ratio: VALVE_CRITICAL_RATIO * ideal_critical_ratio(gamma) / ideal_critical_ratio(GAMMA_STEAM),
         }
@@ -536,6 +531,10 @@ impl Turbine {
 /// blading and feeds the extraction heaters; the liquid fraction (dome vapour
 /// throttled into the wet region at chest pressure) drains to the condenser at
 /// its own enthalpy with no work (R1).
+///
+/// The inlet is pure water vapour: gas-bearing admission is blocked upstream
+/// (`TURBINE_ADMISSION_MAX_GAS_FRACTION`), and the trace noncondensable it
+/// admits passes to the condenser shell with no work (round-7 R1).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TurbineInlet {
     /// Total accepted flow, kg/s, and its enthalpy, J/kg.
@@ -547,8 +546,7 @@ pub struct TurbineInlet {
     /// Liquid fraction, kg/s, and its enthalpy, J/kg.
     pub w_liquid: f64,
     pub h_liquid: f64,
-    /// Water-vapour (partial) pressures at the chest and the exhaust, Pa:
-    /// the totals for pure steam (see `mixture`).
+    /// Chest and exhaust (condenser) pressures, Pa.
     pub p_chest: f64,
     pub p_cond: f64,
     /// Shaft work bound per kg of vapour, J/kg: TURBINE_ETA_IS times the
@@ -557,6 +555,10 @@ pub struct TurbineInlet {
     /// Saturated-liquid enthalpy at condenser pressure, J/kg: the lowest state
     /// the vapour's exhaust and extraction drains can reach in the condenser.
     pub h_floor: f64,
+    /// A pressure lay outside the water-property table, so the flow passes to
+    /// the condenser unexpanded at its inlet enthalpy: no work, no extraction
+    /// (round-7 R2). Unreachable with pure-steam admission.
+    pub out_of_domain: bool,
 }
 
 impl TurbineInlet {
@@ -566,27 +568,17 @@ impl TurbineInlet {
         if !(w > 0.0 && p_chest > 0.0) {
             return Self { w, h, h_vapour: h, h_liquid: h, w_liquid: w, p_chest, p_cond, h_floor, ..Self::default() };
         }
-        let s = sat_p(p_chest);
+        let (Some(s), Some(_)) = (steam::sat_p_checked(p_chest), steam::sat_p_checked(p_cond)) else {
+            // No vapour expands and the floor is the inlet, so the extraction
+            // budget is zero; the condenser books the flow at `h`.
+            return Self { w, h, h_vapour: h, h_liquid: h, w_liquid: w, p_chest, p_cond, h_floor: h, out_of_domain: true, ..Self::default() };
+        };
         let x = ((h - s.h_f) / s.h_fg()).clamp(0.0, 1.0);
         let h_vapour = if x >= 1.0 { h } else { s.h_g };
         let h_liquid = if x <= 0.0 { h } else { s.h_f };
         let w_vapour = w * x;
         let work_limit = if w_vapour > 0.0 { TURBINE_ETA_IS * steam::isentropic_drop(h_vapour, p_chest, p_cond) } else { 0.0 };
-        Self { w, h, w_vapour, h_vapour, w_liquid: w - w_vapour, h_liquid, p_chest, p_cond, work_limit, h_floor }
-    }
-
-    /// Inlet for water `w` (enthalpy `h`) carried in a gas mixture of water
-    /// mole fraction `y_water` at total chest pressure `p_chest`, exhausting at
-    /// total condenser pressure `p_cond`. Water phase equilibrium is set by its
-    /// partial pressure, not the total (round-6 R2), and the mixture keeps its
-    /// composition through the blading, so the water expands between its
-    /// partial pressures at both ends; the noncondensable is an inert diluent
-    /// that does no modelled work. The condensate floor stays the condenser's
-    /// own (total-pressure) saturation, as for pure steam. With `y_water` = 1
-    /// this is exactly `new`.
-    pub fn mixture(w: f64, h: f64, p_chest: f64, p_cond: f64, y_water: f64) -> Self {
-        let h_floor = sat_p(p_cond.max(1.0)).h_f;
-        Self { h_floor, ..Self::new(w, h, p_chest * y_water, p_cond * y_water) }
+        Self { w, h, w_vapour, h_vapour, w_liquid: w - w_vapour, h_liquid, p_chest, p_cond, work_limit, h_floor, out_of_domain: false }
     }
 
     /// Extraction heat the vapour can still give up after `p_mech` of shaft

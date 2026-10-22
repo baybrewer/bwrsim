@@ -192,6 +192,14 @@ pub const TURBINE_DH_RATED: f64 = 0.703e6;
 /// rated conditions TURBINE_DH_RATED is ~0.71 of the isentropic drop, so the
 /// bound only acts at off-design states such as wet or low-pressure inlets.
 pub const TURBINE_ETA_IS: f64 = 0.85;
+/// Turbine admission permissive: the TCVs admit no flow while the dome
+/// noncondensable mass fraction exceeds this, mass basis. ASSUMED. Plants pull
+/// condenser and steam-side air with the SJAE / mechanical vacuum pump before
+/// turbine roll; normal radiolytic gas in BWR main steam is tens of ppm, so
+/// 1e-3 never blocks gas-free operation while any unvented-startup air
+/// inventory does. The model has no gas-bearing expansion (round-7 R1/R2); the
+/// bypass still purges gas to the condenser.
+pub const TURBINE_ADMISSION_MAX_GAS_FRACTION: f64 = 1.0e-3;
 pub const GENERATOR_EFF: f64 = 0.985;
 // Turbine-generator: 3,000/3,600 rpm turbine with a direct-driven 50/60 Hz
 // generator. CONFIRMED (GE Hitachi 005N9751 Rev. J, section 5.1.2, printed
