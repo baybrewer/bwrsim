@@ -7,9 +7,15 @@ use std::fmt;
 /// backward-Euler period error small for any sub-prompt-critical state.
 pub const MAX_SUBSTEP: f64 = 1.0e-3;
 /// Maximum prompt growth per substep, `(rho - beta) / Lambda * h`. The implicit
-/// denominator is singular at a growth of 1.0, so this keeps it well positive
-/// and the accumulated backward-Euler error at the ~1 % level per e-fold.
-pub const PROMPT_GROWTH_PER_SUBSTEP: f64 = 0.02;
+/// denominator is singular at a growth of 1.0, so this keeps it well positive;
+/// the backward-Euler error is about half this per e-fold, so 0.005 holds a
+/// six-e-fold prompt excursion (and its integrated energy) to ~1.5 %.
+pub const PROMPT_GROWTH_PER_SUBSTEP: f64 = 0.005;
+/// Maximum prompt decay per substep, `(beta - rho) / Lambda * h`. Backward
+/// Euler over-integrates a decaying prompt mode's area by about half this, so
+/// a prompt drop's energy stays within ~1 % of the resolved history. At
+/// critical this equals [`MAX_SUBSTEP`]; only negative reactivity refines.
+pub const PROMPT_DECAY_PER_SUBSTEP: f64 = 0.15;
 /// Populations at or below this cannot support a log-rate (period) estimate;
 /// the meter holds its last value until both samples are above the floor.
 pub const PERIOD_FLOOR: f64 = 1.0e-12;
@@ -65,11 +71,13 @@ impl Kinetics {
         Self { n, c, inv_period: 0.0 }
     }
 
-    /// Largest substep that keeps prompt growth per substep bounded for `rho`.
+    /// Largest substep that keeps prompt growth or decay per substep bounded for `rho`.
     pub fn max_substep(rho: f64) -> f64 {
         let growth_rate = (rho - BETA) / GEN_TIME;
         if growth_rate > 0.0 {
             MAX_SUBSTEP.min(PROMPT_GROWTH_PER_SUBSTEP / growth_rate)
+        } else if growth_rate < 0.0 {
+            MAX_SUBSTEP.min(PROMPT_DECAY_PER_SUBSTEP / -growth_rate)
         } else {
             MAX_SUBSTEP
         }
@@ -127,13 +135,33 @@ impl Kinetics {
     /// prompt growth per substep stays bounded (see [`Self::max_substep`]).
     /// On error the state is left at the last accepted substep.
     pub fn advance(&mut self, rho: f64, s: f64, dt: f64) -> Result<(), KineticsError> {
-        Self::check_inputs(rho, s, dt)?;
+        self.advance_integrating(rho, s, dt).1
+    }
+
+    /// [`Self::advance`] that also returns the population time integral
+    /// `int n dt` over `dt` (relative-power seconds), so callers can deposit
+    /// the energy of the resolved history rather than an end-point rectangle.
+    /// Each accepted substep contributes a trapezoid; the substep bound keeps
+    /// prompt growth per substep small, so that is accurate to well under 1 %.
+    /// After a fault the population is frozen at the last accepted substep, and
+    /// the integral holds that value for the rest of `dt`, matching what the
+    /// caller then reports.
+    pub fn advance_integrating(&mut self, rho: f64, s: f64, dt: f64) -> (f64, Result<(), KineticsError>) {
+        let held = |n: f64, t: f64| if t.is_finite() && t > 0.0 { n * t } else { 0.0 };
+        if let Err(e) = Self::check_inputs(rho, s, dt) {
+            return (held(self.n, dt), Err(e));
+        }
         let steps = ((dt / Self::max_substep(rho)).ceil() as usize).max(1);
         let h = dt / steps as f64;
-        for _ in 0..steps {
-            self.step(rho, s, h)?;
+        let mut n_dt = 0.0;
+        for k in 0..steps {
+            let n0 = self.n;
+            if let Err(e) = self.step(rho, s, h) {
+                return (n_dt + held(self.n, dt - k as f64 * h), Err(e));
+            }
+            n_dt += 0.5 * (n0 + self.n) * h;
         }
-        Ok(())
+        (n_dt, Ok(()))
     }
 }
 

@@ -283,14 +283,17 @@ fn vessel_heat_loss(t: f64) -> f64 {
     HEAT_LOSS_HOT * ((t - 20.0) / 268.0).max(0.0)
 }
 
-/// Water inside the plant boundary (kg) and fluid-side stored energy (J). The
-/// IC pools hold boundary mass but their energy is outside: pool duty is the
-/// energy boundary there.
+/// Water inside the plant boundary (kg) and stored energy (J), fuel included.
+/// The IC pools hold boundary mass but their energy is outside: pool duty is
+/// the energy boundary there. Fuel stored heat is inside so that the source can
+/// be the integrated fission+decay generation, not the imposed coolant heat:
+/// a wrong core energy integral then shows up as a residual (round8-astra R1).
 fn plant_inventory(sim: &Sim) -> (f64, f64) {
     let ic_mass: f64 = sim.ic.iter().map(|t| t.tube_mass + t.pool_mass).sum();
     let ic_energy: f64 = sim.ic.iter().map(|t| t.tube_mass * t.tube_h).sum();
     let mass = sim.vessel.mass + sim.cond.inventory_kg() + ic_mass;
-    let energy = sim.vessel.energy + sim.cond.energy_j + FW_HEATER_HEAT_CAP * sim.fw.t_feed + ic_energy;
+    let energy = sim.vessel.energy + sim.cond.energy_j + FW_HEATER_HEAT_CAP * sim.fw.t_feed + ic_energy
+        + FUEL_HEAT_CAP * sim.core.fuel_t;
     (mass, energy)
 }
 
@@ -320,12 +323,12 @@ impl PlantFlows {
     fn add_step(&mut self, sim: &Sim, t0: f64, dt: f64) {
         let f = sim.vessel.flows;
         let ic_duty: f64 = sim.ic.iter().map(|t| t.last.q_pool).sum();
-        let net = sim.q_core - vessel_heat_loss(t0) - ic_duty - sim.cond.q_cw_w - sim.turbine.p_mech + sim.fw.q_pump_w
+        let net = sim.core.q_gen - vessel_heat_loss(t0) - ic_duty - sim.cond.q_cw_w - sim.turbine.p_mech + sim.fw.q_pump_w
             - sim.fw.q_loss_w
             - f.w_vent * f.h_vent;
         self.mass_kg -= f.w_vent * dt;
         self.energy_j += net * dt;
-        self.core_j += sim.q_core * dt;
+        self.core_j += sim.core.q_gen * dt;
         self.cw_j += sim.cond.q_cw_w * dt;
         self.shaft_j += sim.turbine.p_mech * dt;
         self.elec_j += sim.turbine.p_elec * dt;

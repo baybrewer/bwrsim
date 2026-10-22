@@ -275,11 +275,22 @@ impl DecayHeat {
     }
 
     pub fn step(&mut self, n: f64, dt: f64) {
+        self.step_integrating(n, dt);
+    }
+
+    /// Advance with production from a constant population `n` (the interval's
+    /// average) and return the decay power time integral over `dt`
+    /// (relative-power seconds). Both are exact for a first-order lag with
+    /// constant forcing, so equilibrium is preserved to roundoff.
+    pub fn step_integrating(&mut self, n: f64, dt: f64) -> f64 {
+        let mut d_dt = 0.0;
         for (i, (f, l)) in DECAY_GROUPS.iter().enumerate() {
-            // Exact update for a first-order lag.
-            let a = 1.0 - (-l * dt).exp();
-            self.d[i] += (f * n - self.d[i]) * a;
+            let a = -(-l * dt).exp_m1();
+            let target = f * n;
+            d_dt += target * dt + (self.d[i] - target) * a / l;
+            self.d[i] += (target - self.d[i]) * a;
         }
+        d_dt
     }
 }
 
@@ -302,6 +313,9 @@ pub struct Core {
     /// is frozen at the last accepted substep while this is set; callers should
     /// surface it rather than trust `kin.n`.
     pub kin_error: Option<KineticsError>,
+    /// Step-average fission plus decay power generated during the last `step`,
+    /// W: the integrated source the fuel node and coolant share.
+    pub q_gen: f64,
 }
 
 impl Core {
@@ -319,6 +333,7 @@ impl Core {
             rho_xenon: 0.0,
             rho_total: 0.0,
             kin_error: None,
+            q_gen: 0.0,
         }
     }
 
@@ -357,44 +372,62 @@ impl Core {
     /// Advance neutronics, xenon, decay heat and fuel temperature.
     /// `coolant_t` is the coolant temperature, `htc_factor` scales fuel-to-coolant
     /// heat transfer (1 = normal, lower when the core is uncovered).
-    /// Returns heat delivered to the coolant, W.
+    /// Returns the step-average heat delivered to the coolant, W (energy
+    /// actually transferred over `dt`, divided by `dt`).
     ///
-    /// Rod motion and rod worth are advanced on the kinetics substep timeline,
-    /// so the neutron integration always sees the rod positions of the same
-    /// substep. Thermal feedback (Doppler, void, moderator, xenon) is held at
-    /// the values set by the last `update_reactivity`, i.e. one plant step of
-    /// lag. `rho_rods`/`rho_total` are refreshed to the committed end-of-step
-    /// positions. A kinetics fault is recorded in `kin_error`; rods keep moving
-    /// but the population stays at the last accepted substep.
+    /// Rod motion, rod worth, decay-heat production, fission/decay energy and
+    /// the fuel node are all advanced on the kinetics substep timeline, so the
+    /// deposited energy is the integral of the resolved power history rather
+    /// than the end-of-step power times `dt` (round8-astra R1). Thermal feedback
+    /// (Doppler, void, moderator, xenon) is held at the values set by the last
+    /// `update_reactivity`, i.e. one plant step of lag: the fuel time constant
+    /// (~4.5 s) is long against a plant step, and holding it keeps a step's
+    /// reactivity a function of the plant state alone. `rho_rods`/`rho_total`
+    /// are refreshed to the committed end-of-step positions. A kinetics fault
+    /// is recorded in `kin_error`; rods keep moving but the population stays at
+    /// the last accepted substep. Coolant temperature is held over the step.
     pub fn step(&mut self, dt: f64, coolant_t: f64, htc_factor: f64) -> f64 {
+        if !(dt > 0.0) {
+            // Nothing elapses; report the instantaneous split without advancing.
+            self.q_gen = self.thermal_power();
+            let r = FUEL_RESISTANCE / htc_factor.max(0.02);
+            return (self.fuel_t - coolant_t) / r + self.q_gen * DIRECT_COOLANT_HEAT;
+        }
         let rho_feedback = RHO_EXCESS_COLD + self.rho_doppler + self.rho_void + self.rho_mod + self.rho_xenon;
         self.kin_error = None;
         self.rho_rods = self.rods.reactivity();
         self.rho_total = rho_feedback + self.rho_rods;
         let substeps = ((dt / MAX_SUBSTEP).ceil() as usize).max(1);
         let h = dt / substeps as f64;
+        let r = FUEL_RESISTANCE / htc_factor.max(0.02);
+        let a = h / (FUEL_HEAT_CAP * r);
+        let prompt_frac = 1.0 - DecayHeat::total_fraction();
+        let (mut e_gen, mut e_conv) = (0.0, 0.0);
         for _ in 0..substeps {
             if self.rods.step(h) {
                 self.rho_rods = self.rods.reactivity();
                 self.rho_total = rho_feedback + self.rho_rods;
             }
-            if self.kin_error.is_none() {
-                if let Err(e) = self.kin.advance(self.rho_total, SOURCE, h) {
-                    self.kin_error = Some(e);
-                }
-            }
+            let n_dt = if self.kin_error.is_none() {
+                let (n_dt, res) = self.kin.advance_integrating(self.rho_total, SOURCE, h);
+                self.kin_error = res.err();
+                n_dt
+            } else {
+                self.kin.n * h
+            };
+            let d_dt = self.decay.step_integrating(n_dt / h, h);
+            let e_sub = (prompt_frac * n_dt + d_dt) * RATED_POWER_W;
+            e_gen += e_sub;
+            // Implicit update of the fuel node (stable for any h); it conserves
+            // C dT = E_fuel - h q_conv exactly, so fuel plus coolant energy
+            // equals the generated energy to roundoff.
+            let to_fuel = e_sub * (1.0 - DIRECT_COOLANT_HEAT);
+            self.fuel_t = (self.fuel_t + to_fuel / FUEL_HEAT_CAP + a * coolant_t) / (1.0 + a);
+            e_conv += h * (self.fuel_t - coolant_t) / r;
         }
         self.xenon.step(self.kin.n, dt);
-        self.decay.step(self.kin.n, dt);
-
-        let p = self.thermal_power();
-        let to_fuel = p * (1.0 - DIRECT_COOLANT_HEAT);
-        let r = FUEL_RESISTANCE / htc_factor.max(0.02);
-        // Implicit update of the fuel node (stable for any dt).
-        let a = dt / (FUEL_HEAT_CAP * r);
-        self.fuel_t = (self.fuel_t + dt * to_fuel / FUEL_HEAT_CAP + a * coolant_t) / (1.0 + a);
-        let q_conv = (self.fuel_t - coolant_t) / r;
-        q_conv + p * DIRECT_COOLANT_HEAT
+        self.q_gen = e_gen / dt;
+        (e_conv + e_gen * DIRECT_COOLANT_HEAT) / dt
     }
 }
 
@@ -590,6 +623,142 @@ mod tests {
         }
         assert!(faulted, "expected a kinetics fault, n = {}", c.kin.n);
         assert!(c.kin.n.is_finite() && c.kin.n > 0.0);
+    }
+
+    /// Independent reference for the energy-integral tests: classical RK4 at
+    /// 1e-5 s on the same point kinetics (six delayed groups, source), nine
+    /// decay-heat groups, lumped fuel node and the generated/coolant energy
+    /// integrals, at fixed reactivity. Written from the parameters only; it
+    /// calls no production kinetics, decay or fuel function.
+    /// Returns (n, generated J, delivered-to-coolant J, fuel_t).
+    fn reference_energy(n0: f64, rho: f64, t_end: f64, fuel_t0: f64, coolant_t: f64) -> (f64, f64, f64, f64) {
+        const NY: usize = 1 + 6 + 9 + 3;
+        let decay_sum: f64 = DECAY_GROUPS.iter().map(|g| g.0).sum();
+        let deriv = |y: &[f64; NY]| -> [f64; NY] {
+            let mut dy = [0.0; NY];
+            let n = y[0];
+            dy[0] = (rho - BETA) / GEN_TIME * n + SOURCE;
+            for i in 0..6 {
+                dy[0] += LAMBDA_DN[i] * y[1 + i];
+                dy[1 + i] = BETA * BETA_FRAC[i] / GEN_TIME * n - LAMBDA_DN[i] * y[1 + i];
+            }
+            let mut p = n * (1.0 - decay_sum);
+            for (j, (f, l)) in DECAY_GROUPS.iter().enumerate() {
+                dy[7 + j] = l * (f * n - y[7 + j]);
+                p += y[7 + j];
+            }
+            let p_w = p * RATED_POWER_W;
+            let q_conv = (y[16] - coolant_t) / FUEL_RESISTANCE;
+            dy[16] = (p_w * (1.0 - DIRECT_COOLANT_HEAT) - q_conv) / FUEL_HEAT_CAP;
+            dy[17] = p_w;
+            dy[18] = q_conv + p_w * DIRECT_COOLANT_HEAT;
+            dy
+        };
+        let mut y = [0.0; NY];
+        y[0] = n0;
+        for i in 0..6 {
+            y[1 + i] = BETA * BETA_FRAC[i] * n0 / (GEN_TIME * LAMBDA_DN[i]);
+        }
+        for (j, (f, _)) in DECAY_GROUPS.iter().enumerate() {
+            y[7 + j] = f * n0;
+        }
+        y[16] = fuel_t0;
+        let steps = (t_end / 1.0e-5).round() as usize;
+        let h = t_end / steps as f64;
+        let axpy = |y: &[f64; NY], k: &[f64; NY], s: f64| -> [f64; NY] {
+            let mut o = *y;
+            for i in 0..NY {
+                o[i] += s * k[i];
+            }
+            o
+        };
+        for _ in 0..steps {
+            let k1 = deriv(&y);
+            let k2 = deriv(&axpy(&y, &k1, 0.5 * h));
+            let k3 = deriv(&axpy(&y, &k2, 0.5 * h));
+            let k4 = deriv(&axpy(&y, &k3, h));
+            for i in 0..NY {
+                y[i] += h / 6.0 * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]);
+            }
+        }
+        (y[0], y[17], y[18], y[16])
+    }
+
+    /// Core held at fixed total reactivity: stationary rods, and feedback set
+    /// once and never refreshed (no `update_reactivity` between steps).
+    fn fixed_rho_core(n0: f64, rho: f64, fuel_t: f64) -> Core {
+        let mut c = Core::new(n0, 24.0, fuel_t);
+        c.rho_doppler = rho - RHO_EXCESS_COLD - c.rods.reactivity();
+        c
+    }
+
+    /// Run `t_end` in steps of `dt`; return (n, generated J, coolant J, fuel_t).
+    fn run_energy(n0: f64, rho: f64, t_end: f64, dt: f64, fuel_t0: f64, coolant_t: f64) -> (f64, f64, f64, f64) {
+        let mut c = fixed_rho_core(n0, rho, fuel_t0);
+        let (mut e_gen, mut e_cool) = (0.0, 0.0);
+        for _ in 0..(t_end / dt).round() as usize {
+            e_cool += c.step(dt, coolant_t, 1.0) * dt;
+            e_gen += c.q_gen * dt;
+            assert!(c.kin_error.is_none(), "{:?}", c.kin_error);
+        }
+        // Fuel plus coolant energy must account for everything generated.
+        let stored = FUEL_HEAT_CAP * (c.fuel_t - fuel_t0);
+        assert!((stored + e_cool - e_gen).abs() <= 1e-9 * e_gen.abs().max(1.0), "fuel+coolant {} vs generated {e_gen}", stored + e_cool);
+        (c.kin.n, e_gen, e_cool, c.fuel_t)
+    }
+
+    fn rel(a: f64, b: f64) -> f64 {
+        (a - b).abs() / b.abs()
+    }
+
+    /// Round8-astra R1: a fast power rise must deposit the integral of the
+    /// resolved power history, independent of the plant step. Old code
+    /// deposited 1.594 / 0.857 / 0.323 MJ at dt = 0.05 / 0.025 / 0.001 s
+    /// against an independent ~0.294 MJ.
+    #[test]
+    fn power_rise_energy_is_step_independent_and_matches_reference() {
+        let (n0, rho, t_end, t0) = (1e-4, 0.010, 0.05, 40.0);
+        let (n_ref, gen_ref, cool_ref, fuel_ref) = reference_energy(n0, rho, t_end, t0, t0);
+        assert!(gen_ref > 2.5e5 && gen_ref < 3.5e5, "reference {gen_ref} J");
+        for dt in [0.05, 0.025, 0.0125, 0.001] {
+            let (n, gen, cool, fuel_t) = run_energy(n0, rho, t_end, dt, t0, t0);
+            assert!(rel(n, n_ref) < 0.02, "dt {dt}: n {n} vs reference {n_ref}");
+            assert!(rel(gen, gen_ref) < 0.02, "dt {dt}: generated {gen} J vs reference {gen_ref} J");
+            assert!(rel(cool, cool_ref) < 0.02, "dt {dt}: to coolant {cool} J vs reference {cool_ref} J");
+            assert!(rel(fuel_t - t0, fuel_ref - t0) < 0.02, "dt {dt}: fuel rise {} vs {}", fuel_t - t0, fuel_ref - t0);
+        }
+    }
+
+    /// Prompt drop (rod-insertion reactivity) from rated power: the step must
+    /// capture the fast fall in fission power instead of charging the whole
+    /// step at the post-drop value.
+    #[test]
+    fn prompt_drop_energy_matches_reference() {
+        let (n0, rho, t_end, t0, tc) = (1.0, -0.020, 0.05, 550.0, 286.0);
+        let (n_ref, gen_ref, cool_ref, fuel_ref) = reference_energy(n0, rho, t_end, t0, tc);
+        for dt in [0.05, 0.025, 0.001] {
+            let (n, gen, cool, fuel_t) = run_energy(n0, rho, t_end, dt, t0, tc);
+            assert!(rel(n, n_ref) < 0.02, "dt {dt}: n {n} vs reference {n_ref}");
+            assert!(rel(gen, gen_ref) < 0.01, "dt {dt}: generated {gen} J vs reference {gen_ref} J");
+            assert!(rel(cool, cool_ref) < 0.01, "dt {dt}: to coolant {cool} J vs reference {cool_ref} J");
+            assert!((fuel_t - fuel_ref).abs() < 0.05, "dt {dt}: fuel {fuel_t} vs {fuel_ref}");
+        }
+    }
+
+    /// Steady rated operation (critical, equilibrium precursors, decay groups
+    /// and fuel temperature) is unchanged by the substep energy integration.
+    #[test]
+    fn steady_state_energy_unchanged() {
+        let tc = 286.0;
+        let fuel_eq = tc + FUEL_RESISTANCE * RATED_POWER_W * (1.0 - DIRECT_COOLANT_HEAT);
+        let mut c = fixed_rho_core(1.0, -SOURCE * GEN_TIME, fuel_eq);
+        for dt in [0.05, 1.0] {
+            let q = c.step(dt, tc, 1.0);
+            assert!(rel(q, RATED_POWER_W) < 1e-9, "dt {dt}: q {q}");
+            assert!(rel(c.q_gen, RATED_POWER_W) < 1e-9, "dt {dt}: q_gen {}", c.q_gen);
+            assert!((c.fuel_t - fuel_eq).abs() < 1e-6, "dt {dt}: fuel {}", c.fuel_t);
+            assert!((c.kin.n - 1.0).abs() < 1e-9 && (c.decay.power() - DecayHeat::total_fraction()).abs() < 1e-12);
+        }
     }
 
     #[test]
