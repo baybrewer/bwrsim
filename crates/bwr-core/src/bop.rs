@@ -591,15 +591,6 @@ impl Feedwater {
         self.pumps.iter().filter(|&&b| b).count()
     }
 
-    pub fn flow_per_pump(&self) -> f64 {
-        let n = self.running_pumps();
-        if n == 0 {
-            0.0
-        } else {
-            self.flow / n as f64
-        }
-    }
-
     /// Pump speed demand (per unit) for a feed demand `u` in 0..1.
     pub fn speed_demand(u: f64) -> f64 {
         FW_PUMP_MIN_SPEED + (1.0 - FW_PUMP_MIN_SPEED) * u.clamp(0.0, 1.0)

@@ -18,8 +18,12 @@ const SOURCE_PCM = 1.2e-5; // neutron source term: subcritical P = SOURCE_PCM / 
 const NWL_ABOVE_TAF_M = 9.5;
 const ROD_SPEED = 2 / 3; // notch units per second (one notch every 3 s)
 const SCRAM_SPEED = 16; // units per second
-const N_FEED = 3;
-const FEED_PUMP_CAP_KGS = 420; // at zero vessel pressure
+// Two 100 % adjustable-speed reactor feed pumps (GE 005N9751 Rev. J, section 5.1.6).
+const N_FEED = 2;
+const FEED_PUMP_CAP_KGS = 650; // per pump at zero vessel pressure (~rated flow at 7.2 MPa)
+// 3,600 rpm two-pole 60 Hz machine (GE 005N9751 Rev. J, section 5.1.2): f = rpm / 60.
+const RATED_RPM = 3600;
+const OVERSPEED_RPM = 1.1 * RATED_RPM;
 const STEAM_K_TCV = 72; // kg/s per MPa at full open
 const STEAM_K_BYP = 36;
 const IC_MW = 33;
@@ -71,6 +75,7 @@ function blankSnapshot(): Snapshot {
     modeSwitch: "shutdown",
     scrammed: false,
     scramReason: null,
+    modelError: null,
     neutronics: {
       powerFrac: 0,
       thermalPowerMw: 0,
@@ -85,6 +90,8 @@ function blankSnapshot(): Snapshot {
       xenonRel: 0,
       iodineRel: 0,
       fuelTempC: 20,
+      fuelEnvelopeExceeded: false,
+      kineticsFault: null,
     },
     rods: {
       positions: LAYOUT.map(() => 0),
@@ -108,6 +115,7 @@ function blankSnapshot(): Snapshot {
       feedFlowKgs: 0,
       headVentOpen: true,
       heatupRateCph: 0,
+      inventoryShortfallKg: 0,
     },
     steam: {
       msivPos: [0, 0],
@@ -128,7 +136,7 @@ function blankSnapshot(): Snapshot {
       grossMwe: 0,
       netMwe: 0,
       syncPhaseDeg: 0,
-      slipHz: -60,
+      slipHz: -60, // electrical frequency at standstill minus the 60 Hz grid
       loadLimitPct: 100,
     },
     condenser: {
@@ -137,9 +145,13 @@ function blankSnapshot(): Snapshot {
       cwPumps: [true, false],
       vacuumPumpOn: false,
       heatLoadMw: 0,
+      cwHeatRejectionMw: 0,
+      hotwellTempC: 35,
+      overflowKg: 0,
+      withdrawalDeficitKg: 0,
     },
     feedwater: {
-      pumps: Array.from({ length: N_FEED }, () => ({ running: false, flowKgs: 0 })),
+      pumps: Array.from({ length: N_FEED }, () => ({ running: false, flowKgs: 0, speedPct: 0 })),
       condensatePumps: [true, false],
       fcvPos: 0,
       fcvManualPos: 0,
@@ -148,6 +160,7 @@ function blankSnapshot(): Snapshot {
       feedTempC: 40,
       heatersInService: false,
       rwcuRejectKgs: 0,
+      extractionHeatMw: 0,
     },
     ic: Array.from({ length: 3 }, () => ({
       valvePos: 0,
@@ -155,6 +168,9 @@ function blankSnapshot(): Snapshot {
       heatMw: 0,
       poolTempC: 30,
       poolLevelPct: 100,
+      boiloffKgs: 0,
+      condensateReturnKgs: 0,
+      poolEmpty: false,
     })),
     alarms: [],
   };
@@ -223,12 +239,12 @@ export class MockSim {
         this.scram("MANUAL SCRAM");
         break;
       case "resetScram":
+        // The mode switch in SHUTDOWN is itself a scram signal: the reset is
+        // blocked until another mode is selected (same as the Rust engine).
         if (s.scrammed && s.rods.positions.every((p) => p < 0.5) && s.modeSwitch !== "shutdown") {
           s.scrammed = false;
           s.scramReason = null;
           s.rods.scramInProgress = false;
-        } else if (s.scrammed && s.modeSwitch === "shutdown") {
-          // Shutdown mode itself holds the scram signal.
         }
         break;
       case "setModeSwitch":
@@ -238,14 +254,15 @@ export class MockSim {
         s.rods.selected = cmd.index;
         break;
       case "rodSetTarget": {
+        // Validate the whole batch against the current state before touching any
+        // target, so a rejected command has no partial effect.
         if (s.scrammed) throw new Error("ROD BLOCK: scram not reset");
         const t = clamp(Math.round(cmd.target / 2) * 2, 0, 48);
-        for (const i of cmd.indices) {
-          if (i < 0 || i >= s.rods.targets.length) continue;
-          if (t > s.rods.positions[i] && (s.modeSwitch === "shutdown" || s.modeSwitch === "refuel"))
-            throw new Error(`ROD WITHDRAW BLOCK: mode switch in ${s.modeSwitch.toUpperCase()}`);
-          s.rods.targets[i] = t;
-        }
+        const accepted = cmd.indices.filter((i) => Number.isInteger(i) && i >= 0 && i < s.rods.targets.length);
+        const withdrawBlocked = s.modeSwitch === "shutdown" || s.modeSwitch === "refuel";
+        if (withdrawBlocked && accepted.some((i) => t > s.rods.positions[i]))
+          throw new Error(`ROD WITHDRAW BLOCK: mode switch in ${s.modeSwitch.toUpperCase()}`);
+        for (const i of accepted) s.rods.targets[i] = t;
         break;
       }
       case "rodStop":
@@ -269,7 +286,7 @@ export class MockSim {
         s.steam.bypassManualPos = clamp(cmd.pos, 0, 1);
         break;
       case "setSpeedSetpoint":
-        s.turbine.speedSetpointRpm = clamp(cmd.rpm, 0, 1900);
+        s.turbine.speedSetpointRpm = clamp(cmd.rpm, 0, RATED_RPM * 1.02);
         break;
       case "resetTurbine":
         if (s.condenser.pressureKpa > 30) throw new Error("TURBINE RESET BLOCKED: low condenser vacuum");
@@ -353,9 +370,10 @@ export class MockSim {
 
   // --------------------------------------------------------------- scenarios
   private loadScenario(name: ScenarioName) {
-    const keepSpeed = this.s.speed;
+    const { speed: keepSpeed, paused: keepPaused } = this.s;
     const s = blankSnapshot();
     s.speed = keepSpeed;
+    s.paused = keepPaused;
     this.s = s;
     this.h.alarmState.clear();
     this.h.pressInt = 0;
@@ -407,8 +425,8 @@ export class MockSim {
       s.feedwater.rwcuRejectKgs = 0;
       if (full) {
         s.turbine.tripped = false;
-        s.turbine.speedRpm = 1800;
-        s.turbine.speedSetpointRpm = 1800;
+        s.turbine.speedRpm = RATED_RPM;
+        s.turbine.speedSetpointRpm = RATED_RPM;
         s.turbine.breakerClosed = true;
         s.turbine.slipHz = 0;
         s.vessel.steamFlowKgs = s.vessel.feedFlowKgs = 475;
@@ -541,7 +559,7 @@ export class MockSim {
     let tcvTarget = 0;
     if (!tb.tripped) {
       if (tb.breakerClosed) tcvTarget = Math.min(demand, tb.loadLimitPct / 100);
-      else tcvTarget = clamp(0.01 + (tb.speedSetpointRpm - tb.speedRpm) * 0.0005 + tb.speedRpm / 1800 * 0.04, 0, 0.1);
+      else tcvTarget = clamp(0.01 + (tb.speedSetpointRpm - tb.speedRpm) * 0.00025 + (tb.speedRpm / RATED_RPM) * 0.04, 0, 0.1);
     }
     st.tcvPos = approach(st.tcvPos, tcvTarget, 0.2, dt);
     const vacuumOk = cd.pressureKpa < 30;
@@ -559,15 +577,16 @@ export class MockSim {
 
     // Turbine-generator
     if (tb.breakerClosed) {
-      tb.speedRpm = 1800;
+      tb.speedRpm = RATED_RPM;
       tb.slipHz = 0;
       tb.syncPhaseDeg = approach(tb.syncPhaseDeg, 0, 5, dt);
     } else {
       const steamOk = st.steamToTurbineKgs > 2;
       const target = tb.tripped || !steamOk ? 0 : tb.speedSetpointRpm;
-      const rate = target > tb.speedRpm ? 8 : tb.tripped ? 6 : 8;
+      const rate = target > tb.speedRpm ? 16 : tb.tripped ? 12 : 16;
       tb.speedRpm = approach(tb.speedRpm, target, rate, dt);
-      tb.slipHz = tb.speedRpm / 30 - 60;
+      tb.slipHz = tb.speedRpm / 60 - 60; // two-pole: f = rpm / 60
+      if (tb.speedRpm > OVERSPEED_RPM) tb.tripped = true;
       this.phase = (this.phase + 360 * tb.slipHz * dt) % 360;
       tb.syncPhaseDeg = ((this.phase + 540) % 360) - 180;
     }
@@ -583,6 +602,7 @@ export class MockSim {
     // Condenser
     const nCw = cd.cwPumps.filter(Boolean).length;
     cd.heatLoadMw = (st.steamToTurbineKgs + st.steamToBypassKgs) * 2.0 - tb.grossMwe;
+    cd.cwHeatRejectionMw = nCw > 0 ? Math.max(0, cd.heatLoadMw) : 0;
     const pTarget = cd.vacuumPumpOn
       ? nCw > 0
         ? 4 + cd.heatLoadMw / (nCw * 90)
@@ -613,7 +633,10 @@ export class MockSim {
     const totalFeed = headOk ? fw.fcvPos * cap : 0;
     const condOnly = headOk && nFeed === 0 && v.pressureMpa < 1.5 ? fw.fcvPos * nCond * 60 * (1 - v.pressureMpa / 1.5) : 0;
     v.feedFlowKgs = totalFeed + condOnly;
-    for (const p of fw.pumps) p.flowKgs = p.running && nFeed > 0 ? totalFeed / nFeed : 0;
+    for (const p of fw.pumps) {
+      p.flowKgs = p.running && nFeed > 0 ? totalFeed / nFeed : 0;
+      p.speedPct = p.running ? 25 + 75 * fw.fcvPos : 0;
+    }
     const fracSteam = clamp(v.steamFlowKgs / 475, 0, 1.1);
     fw.feedTempC = approach(fw.feedTempC, fw.heatersInService ? 40 + 190 * fracSteam : 40, 1, dt);
 
@@ -667,7 +690,16 @@ export class MockSim {
     const s = this.s;
     const n = s.neutronics;
     const v = s.vessel;
+    // Equipment protection is independent of the reactor scram state.
+    if (s.condenser.pressureKpa > 30 && !s.turbine.tripped) {
+      s.turbine.tripped = true;
+      s.turbine.breakerClosed = false;
+    }
+    // Reactor scram signals: only the act of latching a new scram is gated.
     if (s.scrammed) return;
+    // The mode switch in SHUTDOWN is a persistent scram signal while selected,
+    // except for the deliberately unlatched cold-shutdown start (rods all in).
+    if (s.modeSwitch === "shutdown" && s.rods.positions.some((p) => p > 0.5)) this.scram("MODE SWITCH IN SHUTDOWN");
     if (s.modeSwitch === "run" && n.aprmPct > 118) this.scram("APRM HIGH FLUX");
     if (s.modeSwitch !== "run" && n.aprmPct > 15) this.scram("APRM HIGH FLUX (SETDOWN)");
     if (s.modeSwitch !== "run" && n.irmReadingPct > 120) this.scram("IRM HIGH-HIGH");
@@ -676,10 +708,6 @@ export class MockSim {
     if (v.levelNrCm < -150) this.scram("REACTOR LOW LEVEL (L3)");
     if (s.modeSwitch === "run" && Math.min(...s.steam.msivPos) < 0.9) this.scram("MSIV CLOSURE");
     if (s.modeSwitch === "run" && s.turbine.tripped && n.aprmPct > 40) this.scram("TURBINE TRIP");
-    if (s.condenser.pressureKpa > 30 && !s.turbine.tripped) {
-      s.turbine.tripped = true;
-      s.turbine.breakerClosed = false;
-    }
   }
 
   private updateAlarms() {

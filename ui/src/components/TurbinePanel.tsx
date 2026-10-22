@@ -7,7 +7,8 @@ import { Readout } from "./common/Readout";
 import { CommitSlider } from "./common/CommitSlider";
 import { Synchroscope } from "./Synchroscope";
 
-const SPEED_SETPOINTS = [0, 100, 500, 1500, 1800];
+// Rated is 3600 rpm (two-pole, 60 Hz); 1800 is the half-speed hold point.
+const SPEED_SETPOINTS = [0, 100, 500, 1800, 3600];
 
 export function TurbinePanel(props: { s: Snapshot; send: (c: Command) => void }) {
   const { s, send } = props;

@@ -56,6 +56,11 @@ pub struct Neutronics {
     pub xenon_rel: f64,
     pub iodine_rel: f64,
     pub fuel_temp_c: f64,
+    /// Lumped average fuel temperature has left the single-node model envelope
+    /// (`FUEL_MODEL_ENVELOPE_C`). A model-validity flag, not a damage criterion.
+    pub fuel_envelope_exceeded: bool,
+    /// Point-kinetics fault of the last step; neutron power is frozen while set.
+    pub kinetics_fault: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -85,6 +90,8 @@ pub struct Vessel {
     pub feed_flow_kgs: f64,
     pub head_vent_open: bool,
     pub heatup_rate_cph: f64,
+    /// Cumulative outflow requested of the vessel that its inventory could not supply.
+    pub inventory_shortfall_kg: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -123,6 +130,10 @@ pub struct Condenser {
     pub cw_pumps: Vec<bool>,
     pub vacuum_pump_on: bool,
     pub heat_load_mw: f64,
+    pub cw_heat_rejection_mw: f64,
+    pub hotwell_temp_c: f64,
+    pub overflow_kg: f64,
+    pub withdrawal_deficit_kg: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -130,6 +141,7 @@ pub struct Condenser {
 pub struct FeedPump {
     pub running: bool,
     pub flow_kgs: f64,
+    pub speed_pct: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -144,6 +156,7 @@ pub struct Feedwater {
     pub feed_temp_c: f64,
     pub heaters_in_service: bool,
     pub rwcu_reject_kgs: f64,
+    pub extraction_heat_mw: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -154,6 +167,9 @@ pub struct IcTrain {
     pub heat_mw: f64,
     pub pool_temp_c: f64,
     pub pool_level_pct: f64,
+    pub boiloff_kgs: f64,
+    pub condensate_return_kgs: f64,
+    pub pool_empty: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -174,6 +190,9 @@ pub struct Snapshot {
     pub mode_switch: ModeSwitch,
     pub scrammed: bool,
     pub scram_reason: Option<String>,
+    /// Set when the last step left the physics model's supported domain; the
+    /// simulator is paused on it and the state is the last accepted one.
+    pub model_error: Option<String>,
     pub neutronics: Neutronics,
     pub rods: Rods,
     pub vessel: Vessel,

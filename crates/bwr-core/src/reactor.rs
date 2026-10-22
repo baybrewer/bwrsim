@@ -6,13 +6,6 @@ use crate::params::*;
 /// Grid size of the rod map.
 pub const ROD_GRID: usize = 9;
 
-/// Full-stroke insertion time of a Select Rod Insert run-in, s. ASSUMED: an
-/// electric motor run-in at FMCRD drive speed rather than the hydraulic scram
-/// (SCRAM_TIME). With the four-rod SRI group this gives a coupled power
-/// reduction near the ~0.8 percentage point/s quoted for SCRRI in GE 005N9751
-/// Rev J section 3.2. TODO(params): migrate to params.rs next to SCRAM_TIME.
-pub const SRI_INSERT_TIME: f64 = 120.0;
-
 /// Rods closer than this to a target or to full-in count as there.
 const ROD_POS_EPS: f64 = 1e-6;
 /// A rod whose position or target is above this counts as withdrawn.

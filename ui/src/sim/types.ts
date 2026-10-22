@@ -37,6 +37,10 @@ export interface Neutronics {
   xenonRel: number;
   iodineRel: number;
   fuelTempC: number;
+  /** Lumped fuel node above its model envelope (1200 degC). Model validity, not core damage. */
+  fuelEnvelopeExceeded: boolean;
+  /** Point-kinetics fault of the last step; neutron power is frozen while set. */
+  kineticsFault: string | null;
 }
 
 export interface Rods {
@@ -69,6 +73,8 @@ export interface Vessel {
   headVentOpen: boolean;
   /** Coolant heat-up rate, degC per hour (negative = cooldown). */
   heatupRateCph: number;
+  /** Cumulative outflow requested of the vessel that its inventory could not supply. */
+  inventoryShortfallKg: number;
 }
 
 export interface Steam {
@@ -104,11 +110,16 @@ export interface Condenser {
   cwPumps: boolean[];
   vacuumPumpOn: boolean;
   heatLoadMw: number;
+  cwHeatRejectionMw: number;
+  hotwellTempC: number;
+  overflowKg: number;
+  withdrawalDeficitKg: number;
 }
 
 export interface FeedPump {
   running: boolean;
   flowKgs: number;
+  speedPct: number;
 }
 
 export interface Feedwater {
@@ -121,6 +132,7 @@ export interface Feedwater {
   feedTempC: number;
   heatersInService: boolean;
   rwcuRejectKgs: number;
+  extractionHeatMw: number;
 }
 
 export interface IcTrain {
@@ -130,6 +142,9 @@ export interface IcTrain {
   heatMw: number;
   poolTempC: number;
   poolLevelPct: number;
+  boiloffKgs: number;
+  condensateReturnKgs: number;
+  poolEmpty: boolean;
 }
 
 export interface Alarm {
@@ -146,6 +161,8 @@ export interface Snapshot {
   modeSwitch: ModeSwitch;
   scrammed: boolean;
   scramReason: string | null;
+  /** Set when the last step left the physics model's domain; the sim is paused on it. */
+  modelError: string | null;
   neutronics: Neutronics;
   rods: Rods;
   vessel: Vessel;
@@ -165,7 +182,7 @@ export type Command =
   | { type: "resetScram" }
   | { type: "setModeSwitch"; mode: ModeSwitch }
   | { type: "selectRod"; index: number | null }
-  /** Move rods to a target position (0..48, even notches). */
+  /** Move rods to a target position (0..48, any fine-motion position). */
   | { type: "rodSetTarget"; indices: number[]; target: number }
   | { type: "rodStop" }
   | { type: "setIrmRange"; range: number }

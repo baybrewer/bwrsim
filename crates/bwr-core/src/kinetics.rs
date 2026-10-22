@@ -8,8 +8,8 @@ use std::fmt;
 pub const MAX_SUBSTEP: f64 = 1.0e-3;
 /// Maximum prompt growth per substep, `(rho - beta) / Lambda * h`. The implicit
 /// denominator is singular at a growth of 1.0, so this keeps it well positive
-/// and the per-substep truncation error at the 0.1 % level.
-pub const PROMPT_GROWTH_PER_SUBSTEP: f64 = 0.05;
+/// and the accumulated backward-Euler error at the ~1 % level per e-fold.
+pub const PROMPT_GROWTH_PER_SUBSTEP: f64 = 0.02;
 /// Populations at or below this cannot support a log-rate (period) estimate;
 /// the meter holds its last value until both samples are above the floor.
 pub const PERIOD_FLOOR: f64 = 1.0e-12;

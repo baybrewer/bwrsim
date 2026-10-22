@@ -8,11 +8,13 @@ use crate::bop::{Condenser, Feedwater, LevelControlMode, SteamSystem, Turbine};
 use crate::ic::IcTrain;
 use crate::params::*;
 use crate::reactor::{Core, DecayHeat, Xenon, ROD_GRID};
-use crate::steam::{self, sat_p, P_ATM};
-use crate::vessel::{Vessel, VesselInputs};
+use crate::steam::{sat_p, P_ATM};
+use crate::vessel::{IcPorts, Vessel, VesselInputs};
 
 /// Fixed physics time step, s.
 pub const DT: f64 = 0.05;
+/// Most physics steps one `advance` call performs; the rest stays in the backlog.
+const MAX_STEPS_PER_ADVANCE: usize = 4000;
 
 #[derive(Clone, Debug)]
 pub struct Sim {
@@ -31,8 +33,13 @@ pub struct Sim {
     pub scram_reason: Option<String>,
     pub scram_time: f64,
     pub irm_range: u8,
-    pub core_damage: bool,
+    /// Latched once the lumped fuel node leaves its model envelope (not a damage criterion).
+    pub fuel_envelope_exceeded: bool,
+    /// Set when the last step was rejected because the physics model cannot
+    /// represent the resulting state; the simulator pauses on it.
+    pub model_error: Option<String>,
     pub q_core: f64,
+    kin_fault_active: bool,
     acked: HashSet<String>,
     /// Transient operator messages: id -> (text, expiry time).
     events: BTreeMap<String, (String, f64)>,
@@ -72,8 +79,10 @@ impl Sim {
             scram_reason: None,
             scram_time: -100.0,
             irm_range: 1,
-            core_damage: false,
+            fuel_envelope_exceeded: false,
+            model_error: None,
             q_core: 0.0,
+            kin_fault_active: false,
             acked: HashSet::new(),
             events: BTreeMap::new(),
             prev_msiv_open: true,
@@ -146,8 +155,7 @@ impl Sim {
         let fw = Feedwater::new(2, T_FW_RATED, LevelControlMode::ThreeElement, 0.7);
         let mut s = Self::base(core, vessel, steam, Turbine::new(true), Condenser::new(true), fw, ModeSwitch::Run);
         s.irm_range = 10;
-        s.cond.p_steam = 5.6e3;
-        s.cond.t_sat = 35.0;
+        s.cond.set_temperature(35.0);
         s.fw.flow = STEAM_FLOW_RATED;
 
         // Fuel temperature at rated power.
@@ -192,24 +200,28 @@ impl Sim {
         }
     }
 
-    /// Advance by wall-clock `real_dt` seconds scaled by the sim speed.
+    /// Advance by wall-clock `real_dt` seconds scaled by the sim speed. Work per
+    /// call is bounded; whatever is not stepped stays in the backlog instead of
+    /// being dropped. A non-finite or negative `real_dt` is ignored.
     pub fn advance(&mut self, real_dt: f64) {
-        if self.paused {
+        if self.paused || !(real_dt.is_finite() && real_dt >= 0.0) {
             return;
         }
         self.accumulator += real_dt * self.speed;
         let mut n = 0;
-        while self.accumulator >= DT && n < 4000 {
+        while self.accumulator >= DT && n < MAX_STEPS_PER_ADVANCE && !self.paused {
             self.step(DT);
             self.accumulator -= DT;
             n += 1;
         }
-        if n >= 4000 {
-            self.accumulator = 0.0;
-        }
         // Forget acknowledgements of alarms that have cleared, so they flash again if they return.
         let active: HashSet<String> = self.active_alarms().into_iter().map(|a| a.0).collect();
         self.acked.retain(|id| active.contains(id));
+    }
+
+    /// Simulated seconds owed to the clock but not yet stepped.
+    pub fn backlog_s(&self) -> f64 {
+        self.accumulator
     }
 
     pub fn msivs_open(&self) -> bool {
@@ -227,7 +239,13 @@ impl Sim {
             self.scram_time = self.time;
         }
         self.scrammed = true;
-        self.core.rods.scramming = true;
+        self.core.rods.scram();
+    }
+
+    /// Positive log-rate period shorter than `limit_s`, with the indication
+    /// treated as valid only above `PERIOD_SIGNAL_MIN_N`.
+    fn short_period(&self, limit_s: f64) -> bool {
+        self.core.kin.n > PERIOD_SIGNAL_MIN_N && self.core.kin.inv_period > 1.0 / limit_s
     }
 
     fn irm_reading(&self) -> f64 {
@@ -238,7 +256,10 @@ impl Sim {
         self.vessel.level_nr_cm()
     }
 
-    /// Active scram signals (excluding manual and mode switch).
+    /// Active scram signals (excluding manual scram). The SHUTDOWN mode switch
+    /// is a persistent signal while any rod is withdrawn, so the scram it caused
+    /// cannot be reset until another mode is selected; the deliberately
+    /// unlatched cold-shutdown start (all rods in) raises nothing.
     fn scram_signals(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
         let n = self.core.kin.n;
@@ -258,7 +279,13 @@ impl Sim {
                 if self.irm_reading() > IRM_HIGH_HIGH {
                     v.push("IRM high-high");
                 }
+                if self.short_period(PERIOD_SCRAM_S) {
+                    v.push("Short reactor period");
+                }
             }
+        }
+        if self.mode == ModeSwitch::Shutdown && !self.core.rods.all_in() {
+            v.push("Mode switch in SHUTDOWN");
         }
         if self.vessel.eos.p > SCRAM_HIGH_PRESSURE {
             v.push("Reactor high pressure");
@@ -290,12 +317,17 @@ impl Sim {
         match self.mode {
             ModeSwitch::Shutdown => return Some("mode switch in SHUTDOWN"),
             ModeSwitch::Refuel => {
-                let out = self.core.rods.pos.iter().filter(|&&p| p > 0.01).count();
-                if out > 1 {
+                if self.core.rods.n_out() > 1 {
                     return Some("REFUEL mode: one rod withdrawn");
+                }
+                if self.short_period(PERIOD_ROD_BLOCK_S) {
+                    return Some("short period");
                 }
             }
             ModeSwitch::Startup => {
+                if self.short_period(PERIOD_ROD_BLOCK_S) {
+                    return Some("short period");
+                }
                 if self.irm_reading() > 108.0 {
                     return Some("IRM upscale");
                 }
@@ -312,28 +344,54 @@ impl Sim {
         None
     }
 
-    /// One physics step.
+    /// One physics step. A non-positive or non-finite `dt` is a no-op. The step
+    /// is transactional: if the vessel cannot represent the resulting state,
+    /// every subsystem is restored, time does not advance and the simulator
+    /// pauses with `model_error` set (a later step retries).
     pub fn step(&mut self, dt: f64) {
+        if !(dt.is_finite() && dt > 0.0) {
+            return;
+        }
         let p = self.vessel.eos.p;
         let t_cool = self.vessel.eos.t;
+        let saved = (self.core.clone(), self.steam.clone(), self.ic.clone(), self.fw.clone(), self.q_core);
 
         // --- reactor core
         self.core.update_reactivity(self.vessel.alpha_core, t_cool);
         let cov = self.vessel.core_coverage();
         self.q_core = self.core.step(dt, t_cool, cov);
+        if let Some(e) = self.core.kin_error {
+            // One event per fault episode; the alarm stays up while it persists.
+            if !self.kin_fault_active {
+                self.event("kinetics_fault", format!("KINETICS FAULT: {e}; neutron power frozen"));
+            }
+            self.kin_fault_active = true;
+        } else {
+            self.kin_fault_active = false;
+        }
 
-        // --- main steam, EHC, turbine
+        // --- main steam and EHC. The bypass fast-opens on a turbine trip or a
+        // generator load rejection (breaker opening without a trip).
         let demand = self.steam.pressure_demand(p);
         let tcv_demand = self.turbine.tcv_demand(dt, demand);
         let byp_ok = self.cond.available_for_bypass();
-        self.steam.step(dt, p, tcv_demand, byp_ok, self.turbine.tripped);
-        self.steam.compute_flows(if self.vessel.eos.subcooled { P_ATM } else { p }, !self.turbine.tripped);
-        let p_cond = self.cond.pressure();
-        self.turbine.step(dt, self.steam.w_tcv, self.steam.p_chest, p_cond);
+        let gen_online = self.turbine.breaker_closed && !self.turbine.tripped;
+        let fast_open = self.turbine.tripped || (self.prev_gen_online && !gen_online);
+        self.steam.step_ext(dt, p, tcv_demand, byp_ok, self.turbine.tripped, fast_open);
+        let p_line = if self.vessel.eos.subcooled { P_ATM } else { p };
+        self.steam.compute_flows_from(p_line, self.vessel.sat().h_g, !self.turbine.tripped);
 
-        // --- isolation condensers
+        // --- isolation condensers: primary-side mass ports on the vessel
         let steam_avail = !self.vessel.eos.subcooled;
-        let q_ic: f64 = self.ic.iter_mut().map(|t| t.step(dt, t_cool, steam_avail)).sum();
+        let mut ic_ports = IcPorts::default();
+        let mut h_return_sum = 0.0;
+        for t in self.ic.iter_mut() {
+            let r = t.step_full(dt, t_cool, steam_avail);
+            ic_ports.w_steam += r.w_steam_in;
+            ic_ports.w_return += r.w_cond_return;
+            h_return_sum += r.w_cond_return * r.h_return;
+        }
+        ic_ports.h_return = if ic_ports.w_return > 0.0 { h_return_sum / ic_ports.w_return } else { 0.0 };
 
         // --- feedwater (level setpoint setdown after a scram)
         self.fw.setdown_cm = if self.scrammed { -100.0 } else { 0.0 };
@@ -351,27 +409,39 @@ impl Sim {
             self.event("fw_trip", m);
         }
 
-        // --- vessel
+        // --- vessel (IC duty enters through the mass ports, so q_ic is zero)
         let inputs = VesselInputs {
             q_core: self.q_core,
-            q_ic,
+            q_ic: 0.0,
             w_feed: self.fw.flow,
             h_feed: self.fw.h_feed(),
             w_steam: self.steam.total_flow(),
             w_liquid_out: self.fw.rwcu_reject,
         };
-        self.vessel.step(dt, &inputs);
+        self.vessel.step_with_ic(dt, &inputs, &ic_ports);
+        if let Some(err) = self.vessel.last_error.clone() {
+            let msg = format!("Physics model limit: {err}");
+            (self.core, self.steam, self.ic, self.fw, self.q_core) = saved;
+            self.model_error = Some(msg.clone());
+            self.paused = true;
+            self.event("model_limit", msg);
+            return;
+        }
+        self.model_error = None;
 
-        // --- condenser
-        let h_steam = sat_p(self.steam.p_chest.max(P_ATM)).h_g;
-        let h_hw = steam::h_liquid(self.cond.hotwell_t());
-        let w_in = self.steam.w_tcv + self.steam.w_bypass + self.fw.rwcu_reject;
-        let fw_heating = self.fw.flow * (self.fw.h_feed() - h_hw).max(0.0);
-        let q_cond = self.steam.w_tcv * h_steam - self.turbine.p_mech + self.steam.w_bypass * h_steam
-            + self.fw.rwcu_reject * self.vessel.sat().h_f
-            - w_in * h_hw
-            - fw_heating;
-        self.cond.step(dt, q_cond, w_in, self.fw.flow);
+        // --- turbine and condenser, on the outflows the vessel actually delivered
+        // (bounded by its phase inventory), not on the valve requests.
+        let f = self.vessel.flows;
+        let steam_req = self.steam.total_flow();
+        let accepted = if steam_req > 0.0 { f.w_steam / steam_req } else { 0.0 };
+        let w_tcv = self.steam.w_tcv * accepted;
+        let w_byp = self.steam.w_bypass * accepted;
+        self.turbine.step(dt, w_tcv, self.steam.p_chest, self.cond.pressure());
+        // Gross enthalpy into the condenser shell, net of turbine work and of the
+        // extraction heat the feedwater heaters actually took this step.
+        let w_in = w_tcv + w_byp + f.w_liquid;
+        let q_in = (w_tcv + w_byp) * f.h_steam - self.turbine.p_mech + f.w_liquid * f.h_liquid - self.fw.q_extraction_w;
+        self.cond.step_energy(dt, q_in, w_in, self.fw.flow);
 
         self.time += dt;
         self.protection();
@@ -407,15 +477,24 @@ impl Sim {
             }
         }
 
-        // Turbine trips.
-        if !self.turbine.tripped {
-            if self.level_cm() > L8_CM {
+        // High water level (L8): feed pumps trip regardless of the turbine state
+        // (startup, or after an earlier turbine trip); the turbine trips too if
+        // it is still running. Pump restarts are refused while L8 persists.
+        if self.level_cm() > L8_CM {
+            let turbine_running = !self.turbine.tripped;
+            let pumps_running = self.fw.pumps.iter().any(|&on| on);
+            if turbine_running {
                 self.turbine.trip("Reactor high water level (L8)");
-                self.fw.pumps = [false; N_FEED_PUMPS];
-                self.event("l8", "L8 high level: turbine and feed pumps tripped");
-            } else if self.cond.pressure() > CONDENSER_TRIP_P {
-                self.turbine.trip("Low condenser vacuum");
             }
+            if pumps_running {
+                self.fw.pumps = [false; N_FEED_PUMPS];
+            }
+            if turbine_running || pumps_running {
+                self.event("l8", "L8 high level: turbine and feed pumps tripped");
+            }
+        }
+        if !self.turbine.tripped && self.cond.pressure() > CONDENSER_TRIP_P {
+            self.turbine.trip("Low condenser vacuum");
         }
         // Select Rod Insert: on turbine trip or load rejection at high power, a
         // preselected group of rods is inserted hydraulically so the reactor can
@@ -433,19 +512,22 @@ impl Sim {
             }
         }
 
-        // Core damage.
-        if self.core.fuel_t > 1200.0 && !self.core_damage {
-            self.core_damage = true;
-            self.event("core_damage", "CORE DAMAGE: fuel temperature exceeded 1200 degC");
+        // Fuel model envelope: the lumped fuel node is only trusted below
+        // FUEL_MODEL_ENVELOPE_C. This is a model-validity flag, not core damage.
+        if self.core.fuel_t > FUEL_MODEL_ENVELOPE_C && !self.fuel_envelope_exceeded {
+            self.fuel_envelope_exceeded = true;
+            self.event(
+                "fuel_envelope",
+                format!("FUEL MODEL ENVELOPE EXCEEDED: average fuel temperature above {FUEL_MODEL_ENVELOPE_C:.0} degC; results are unsupported"),
+            );
         }
 
-        // Stop withdrawals if a rod block appears.
+        // Stop withdrawals where they are if a rod block appears (fine-motion drives).
         if self.withdraw_block().is_some() {
             let rods = &mut self.core.rods;
             for (p, t) in rods.pos.iter().zip(rods.target.iter_mut()) {
                 if *t > *p + 1e-6 {
-                    *t = (p / 2.0).ceil() * 2.0;
-                    *t = t.min(*p + 2.0).max(*p);
+                    *t = *p;
                 }
             }
         }
@@ -456,12 +538,40 @@ impl Sim {
 
     // ------------------------------------------------------------------ commands
 
+    /// The floating-point payload of a command, if it has one. Every variant is
+    /// listed so a new numeric command cannot bypass the finiteness check.
+    fn command_scalar(cmd: &Command) -> Option<f64> {
+        use Command::*;
+        match cmd {
+            SetSpeed { speed } => Some(*speed),
+            RodSetTarget { target, .. } => Some(*target),
+            SetPressureSetpoint { mpa } => Some(*mpa),
+            SetBypass { pos, .. } => Some(*pos),
+            SetSpeedSetpoint { rpm } => Some(*rpm),
+            SetLoadLimit { pct } => Some(*pct),
+            SetFcvManual { pos } => Some(*pos),
+            SetLevelSetpoint { cm } => Some(*cm),
+            SetRwcuReject { kgs } => Some(*kgs),
+            SetPaused { .. } | LoadScenario { .. } | ManualScram | ResetScram | SetModeSwitch { .. } | SelectRod { .. }
+            | RodStop | SetIrmRange { .. } | SetHeadVent { .. } | SetMsiv { .. } | ResetTurbine | TripTurbine
+            | CloseBreaker | OpenBreaker | SetCwPump { .. } | SetVacuumPump { .. } | SetFeedPump { .. }
+            | SetCondensatePump { .. } | SetLevelControl { .. } | SetHeaters { .. } | SetIcTrain { .. } | AckAlarms => None,
+        }
+    }
+
+    /// Apply an operator command. A command carrying a non-finite number is
+    /// rejected with an event and changes nothing (a clamp would pass NaN through).
     pub fn apply(&mut self, cmd: Command) {
+        if Self::command_scalar(&cmd).is_some_and(|x| !x.is_finite()) {
+            self.event("cmd_rejected", format!("Command rejected: non-finite value in {cmd:?}"));
+            return;
+        }
         match cmd {
             Command::SetPaused { paused } => self.paused = paused,
             Command::SetSpeed { speed } => self.speed = speed.clamp(0.1, 100.0),
             Command::LoadScenario { name } => {
-                let (speed, paused) = (self.speed, self.paused);
+                // A pause forced by a model halt does not carry over to the new scenario.
+                let (speed, paused) = (self.speed, self.paused && self.model_error.is_none());
                 *self = Sim::new(name);
                 self.speed = speed;
                 self.paused = paused;
@@ -473,6 +583,8 @@ impl Sim {
                 }
                 if self.time - self.scram_time < 10.0 {
                     self.event("scram_reset", "Scram reset blocked: wait 10 s after scram");
+                } else if self.mode == ModeSwitch::Shutdown {
+                    self.event("scram_reset", "Scram reset blocked: mode switch in SHUTDOWN");
                 } else if let Some(sig) = self.scram_signals().first() {
                     self.event("scram_reset", format!("Scram reset blocked: {sig}"));
                 } else {
@@ -491,20 +603,26 @@ impl Sim {
             }
             Command::SelectRod { index } => self.core.rods.selected = index.filter(|&i| i < N_RODS),
             Command::RodSetTarget { indices, target } => {
-                let target = ((target / 2.0).round() * 2.0).clamp(0.0, ROD_FULL_OUT);
-                let block = self.withdraw_block();
-                for i in indices.into_iter().filter(|&i| i < N_RODS) {
-                    let rods = &mut self.core.rods;
-                    if target > rods.pos[i] + 1e-6 {
-                        if let Some(b) = block {
-                            self.event("rod_block", format!("Rod withdrawal blocked: {b}"));
-                            continue;
-                        }
+                // Fine-motion drives: any position in [0, ROD_FULL_OUT] is valid.
+                let target = target.clamp(0.0, ROD_FULL_OUT);
+                let indices: Vec<usize> = indices.into_iter().filter(|&i| i < N_RODS).collect();
+                // The whole batch is validated before any target changes.
+                let withdraws = indices.iter().any(|&i| target > self.core.rods.pos[i] + 1e-6);
+                if withdraws {
+                    if let Some(b) = self.withdraw_block() {
+                        self.event("rod_block", format!("Rod withdrawal blocked: {b}"));
+                        return;
                     }
-                    let rods = &mut self.core.rods;
-                    if !rods.scramming {
-                        rods.target[i] = target;
+                    if self.mode == ModeSwitch::Refuel && target > 0.01 && self.core.rods.n_out_after(&indices, target) > 1 {
+                        self.event("rod_block", "Rod withdrawal blocked: REFUEL mode: one rod withdrawn");
+                        return;
                     }
+                }
+                if self.core.rods.scramming {
+                    return;
+                }
+                for i in indices {
+                    self.core.rods.target[i] = target;
                 }
             }
             Command::RodStop => self.core.rods.stop(),
@@ -552,6 +670,10 @@ impl Sim {
             Command::SetVacuumPump { on } => self.cond.vacuum_pump = on,
             Command::SetFeedPump { index, on } => {
                 if index < N_FEED_PUMPS {
+                    if on && self.level_cm() > L8_CM {
+                        self.event("fw", "Feed pump start blocked: high water level (L8)");
+                        return;
+                    }
                     if on && !self.fw.cond_pumps.iter().any(|&b| b) {
                         self.event("fw", "Feed pump start blocked: no condensate pump running");
                         return;
@@ -597,8 +719,20 @@ impl Sim {
         if self.scrammed {
             add("scram", format!("REACTOR SCRAM: {}", self.scram_reason.clone().unwrap_or_default()), Severity::Trip);
         }
-        if self.core_damage {
-            add("core_damage", "CORE DAMAGE".into(), Severity::Trip);
+        if self.fuel_envelope_exceeded {
+            add("fuel_envelope", "FUEL MODEL ENVELOPE EXCEEDED".into(), Severity::Trip);
+        }
+        if self.model_error.is_some() {
+            add("model", "PHYSICS MODEL LIMIT - SIM HALTED".into(), Severity::Alarm);
+        }
+        if self.core.kin_error.is_some() {
+            add("kin_fault", "KINETICS FAULT".into(), Severity::Alarm);
+        }
+        if self.vessel.exhausted {
+            add("inventory", "VESSEL INVENTORY EXHAUSTED".into(), Severity::Alarm);
+        }
+        if self.ic.iter().any(|t| t.last.pool_empty) {
+            add("ic_pool_dry", "IC POOL EMPTY - NO HEAT SINK".into(), Severity::Alarm);
         }
         if p > VESSEL_DESIGN_PRESSURE {
             add("overpressure", "VESSEL ABOVE DESIGN PRESSURE".into(), Severity::Trip);
@@ -695,6 +829,7 @@ impl Sim {
             mode_switch: self.mode,
             scrammed: self.scrammed,
             scram_reason: self.scram_reason.clone(),
+            model_error: self.model_error.clone(),
             neutronics: api::Neutronics {
                 power_frac: c.kin.n,
                 thermal_power_mw: c.thermal_power() / 1e6,
@@ -716,6 +851,8 @@ impl Sim {
                 xenon_rel: c.xenon.xenon,
                 iodine_rel: c.xenon.iodine,
                 fuel_temp_c: c.fuel_t,
+                fuel_envelope_exceeded: self.fuel_envelope_exceeded,
+                kinetics_fault: c.kin_error.map(|e| e.to_string()),
             },
             rods: api::Rods {
                 positions: c.rods.pos.clone(),
@@ -723,7 +860,7 @@ impl Sim {
                 layout: c.rods.layout.clone(),
                 grid_size: ROD_GRID,
                 selected: c.rods.selected,
-                scram_in_progress: c.rods.scramming,
+                scram_in_progress: c.rods.scram_in_progress(),
             },
             vessel: api::Vessel {
                 pressure_mpa: v.eos.p / 1e6,
@@ -735,10 +872,11 @@ impl Sim {
                 core_avg_void: v.alpha_core,
                 chimney_void: v.alpha_ch,
                 exit_quality: v.core.x_exit,
-                steam_flow_kgs: self.steam.total_flow() + v.vent_flow,
+                steam_flow_kgs: v.flows.w_steam + v.flows.w_vent,
                 feed_flow_kgs: self.fw.flow,
                 head_vent_open: v.head_vent_open,
                 heatup_rate_cph: v.heatup_rate,
+                inventory_shortfall_kg: v.shortfall_kg,
             },
             steam: api::Steam {
                 msiv_pos: self.steam.msiv_pos.to_vec(),
@@ -768,13 +906,18 @@ impl Sim {
                 cw_pumps: self.cond.cw_pumps.to_vec(),
                 vacuum_pump_on: self.cond.vacuum_pump,
                 heat_load_mw: self.cond.heat_load / 1e6,
+                cw_heat_rejection_mw: self.cond.q_cw_w / 1e6,
+                hotwell_temp_c: self.cond.hotwell_t(),
+                overflow_kg: self.cond.overflow_kg,
+                withdrawal_deficit_kg: self.cond.withdrawal_deficit_kg,
             },
             feedwater: api::Feedwater {
-                pumps: self
-                    .fw
-                    .pumps
-                    .iter()
-                    .map(|&r| api::FeedPump { running: r, flow_kgs: if r { self.fw.flow_per_pump() } else { 0.0 } })
+                pumps: (0..N_FEED_PUMPS)
+                    .map(|i| api::FeedPump {
+                        running: self.fw.pumps[i],
+                        flow_kgs: self.fw.pump_flow[i],
+                        speed_pct: self.fw.pump_speed[i] * 100.0,
+                    })
                     .collect(),
                 condensate_pumps: self.fw.cond_pumps.to_vec(),
                 fcv_pos: self.fw.fcv_pos,
@@ -784,6 +927,7 @@ impl Sim {
                 feed_temp_c: self.fw.t_feed,
                 heaters_in_service: self.fw.heaters_in_service,
                 rwcu_reject_kgs: self.fw.rwcu_reject,
+                extraction_heat_mw: self.fw.q_extraction_w / 1e6,
             },
             ic: self
                 .ic
@@ -794,6 +938,9 @@ impl Sim {
                     heat_mw: t.heat / 1e6,
                     pool_temp_c: t.pool_t,
                     pool_level_pct: t.pool_level_pct(),
+                    boiloff_kgs: t.last.boiloff,
+                    condensate_return_kgs: t.last.w_cond_return,
+                    pool_empty: t.last.pool_empty,
                 })
                 .collect(),
             alarms: self

@@ -25,6 +25,11 @@ pub const CORE_HEIGHT: f64 = 3.81;
 pub const ROD_SPEED: f64 = 0.4;
 /// Time for a hydraulic scram to fully insert rods, s. ASSUMED.
 pub const SCRAM_TIME: f64 = 3.0;
+/// Full-stroke insertion time of a Select Rod Insert run-in, s. ASSUMED: an
+/// electric motor run-in at about twice FMCRD drive speed, not the hydraulic
+/// scram. With the four-rod SRI group this gives a coupled power reduction near
+/// the ~0.8 percentage point/s quoted for SCRRI in GE 005N9751 Rev J section 3.2.
+pub const SRI_INSERT_TIME: f64 = 60.0;
 
 // Neutronics. ASSUMED (typical BWR, U-235 delayed neutron data from Keepin).
 pub const BETA: f64 = 0.0060;
@@ -78,6 +83,10 @@ pub const DIRECT_COOLANT_HEAT: f64 = 0.025;
 pub const FUEL_HEAT_CAP: f64 = 1.47e7;
 /// Fuel-to-coolant thermal resistance, K/W (avg fuel ~550 degC at rated). ASSUMED.
 pub const FUEL_RESISTANCE: f64 = 264.0 / (RATED_POWER_W * (1.0 - DIRECT_COOLANT_HEAT));
+/// Upper bound of the lumped single-node fuel thermal model, degC. Above this the
+/// model is outside its validated envelope; it is NOT a cladding or fuel damage
+/// criterion (there is no cladding node, peaking or damage model). ASSUMED.
+pub const FUEL_MODEL_ENVELOPE_C: f64 = 1200.0;
 
 // ---------------------------------------------------------------- vessel
 /// Nominal reactor pressure at rated power, Pa. CONFIRMED (7.2 MPa).
@@ -277,6 +286,16 @@ pub const APRM_HIGH_RUN: f64 = 1.18;
 pub const APRM_HIGH_SETDOWN: f64 = 0.15;
 pub const IRM_HIGH_HIGH: f64 = 120.0;
 pub const MSIV_LOW_PRESSURE_RUN: f64 = 5.9e6;
+/// Short-period protection outside RUN (WRNM functions described in NEDO-34169
+/// Rev B, pp. 41/44 and Table 7-5: short-period rod withdrawal block and a
+/// shorter-period scram). The public material establishes the functions, not the
+/// setpoints; these values are PROVISIONAL ASSUMPTIONS typical of BWR WRNM/IRM
+/// period trips.
+pub const PERIOD_ROD_BLOCK_S: f64 = 20.0;
+pub const PERIOD_SCRAM_S: f64 = 10.0;
+/// Lowest neutron level (relative to rated) at which the log-rate period
+/// indication is treated as valid for protection. ASSUMED.
+pub const PERIOD_SIGNAL_MIN_N: f64 = 1.0e-7;
 /// Water level setpoints, cm relative to NWL.
 pub const L8_CM: f64 = 100.0;
 pub const L7_CM: f64 = 50.0;
