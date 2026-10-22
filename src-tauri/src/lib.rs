@@ -10,6 +10,11 @@ use tauri::{Emitter, State};
 
 struct SimState(Arc<Mutex<Sim>>);
 
+/// Most wall-clock time handed to `Sim::advance` per worker iteration, s. At the
+/// maximum speed (100x) this is 50 simulated seconds, well below the step cap
+/// inside `Sim::advance`; any excess waits in the backlog for the next iteration.
+const MAX_ADVANCE_PER_ITER_S: f64 = 0.5;
+
 #[tauri::command]
 fn sim_command(state: State<'_, SimState>, cmd: Command) -> Result<(), String> {
     state.0.lock().map_err(|e| e.to_string())?.apply(cmd);
@@ -31,17 +36,28 @@ pub fn run() {
             std::thread::spawn(move || {
                 let mut last = Instant::now();
                 let mut last_emit = Instant::now();
+                // Wall-clock time not yet handed to the simulator. Work per iteration is
+                // bounded, but the remainder is carried instead of discarded so delayed
+                // wake-ups do not change the simulated duration.
+                let mut backlog = 0.0f64;
                 loop {
                     std::thread::sleep(Duration::from_millis(20));
                     let now = Instant::now();
-                    let dt = (now - last).as_secs_f64().min(0.5);
+                    backlog += (now - last).as_secs_f64();
                     last = now;
+                    let dt = backlog.min(MAX_ADVANCE_PER_ITER_S);
                     let snap = {
                         let mut s = match worker.lock() {
                             Ok(s) => s,
                             Err(p) => p.into_inner(),
                         };
-                        s.advance(dt);
+                        if s.paused {
+                            // Time spent paused is not owed to the simulation.
+                            backlog = 0.0;
+                        } else {
+                            s.advance(dt);
+                            backlog -= dt;
+                        }
                         if now - last_emit >= Duration::from_millis(100) {
                             Some(s.snapshot())
                         } else {

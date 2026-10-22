@@ -116,10 +116,10 @@ fn startup_from_hot_standby_to_30_percent() {
         }
         if stage == 0 && n > 0.035 && sim.vessel.eos.p > 6.9e6 {
             sim.apply(Command::ResetTurbine);
-            sim.apply(Command::SetSpeedSetpoint { rpm: 1800.0 });
+            sim.apply(Command::SetSpeedSetpoint { rpm: RATED_RPM });
             stage = 1;
         }
-        if stage == 1 && (sim.turbine.speed_rpm - 1800.0).abs() < 5.0 && sim.turbine.phase_deg.abs() < 5.0 {
+        if stage == 1 && (sim.turbine.speed_rpm - RATED_RPM).abs() < 5.0 && sim.turbine.phase_deg.abs() < 5.0 {
             sim.apply(Command::CloseBreaker);
             if sim.turbine.breaker_closed {
                 sim.apply(Command::SetModeSwitch { mode: ModeSwitch::Run });

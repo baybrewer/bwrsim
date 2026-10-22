@@ -255,6 +255,8 @@ pub const FW_HEATER_HEAT_CAP: f64 = 3.5e8;
 pub const FW_EXTRACTION_HEAT_PER_KG: f64 = 0.85e6;
 /// Feed pump temperature rise from pumping work, degC. ASSUMED.
 pub const FW_PUMP_TEMP_RISE: f64 = 2.0;
+/// Heater train ambient heat loss conductance, W/K. ASSUMED (~1 MW at rated).
+pub const FW_HEATER_LOSS_UA: f64 = 5.0e3;
 /// Feedwater control valve coefficient at full open, kg/s per sqrt(Pa) (equal-percentage trim).
 pub const C_FCV: f64 = 1.75;
 
