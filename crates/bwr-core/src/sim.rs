@@ -437,11 +437,12 @@ impl Sim {
         // The flow transmitter reads what last left the vessel (committed below),
         // not this step's hydraulic request, which the vessel may not supply (R6).
         let w_steam_measured = self.steam.total_flow();
-        // The line carries what the vessel debits (displaced liquid when
-        // water-solid) at that fluid's density, driven by total mechanical
-        // pressure at any temperature (R2/R3).
-        let (h_line, rho_line) = (self.vessel.steam_line_enthalpy(), self.vessel.steam_line_density());
-        self.steam.compute_flows_from(p, h_line, rho_line, !self.turbine.tripped);
+        // The line carries dome gas (vapour plus any noncondensables) at its
+        // density, driven by total dome pressure into the condenser, the
+        // receiver of both turbine and bypass paths (round-5 R4/Astra R3). A
+        // water-solid vessel supplies none (`Vessel::step_with_ic`).
+        let (h_line, rho_line) = (self.vessel.steam_port_enthalpy(), self.vessel.steam_line_density());
+        self.steam.compute_flows_from(p, h_line, rho_line, self.cond.pressure(), !self.turbine.tripped);
 
         // --- isolation condensers: requests only; nothing is committed until
         // the vessel has decided how much IC steam it can supply. `t_cool` (not
@@ -500,8 +501,13 @@ impl Sim {
         // protection and next step's level control must see flow that left (R6).
         // The request is rebuilt from valve positions every step, so nothing is lost.
         // Chest pressure is re-solved with the flow so both stay one hydraulic state (R2).
-        self.steam.limit_to_delivered(f.w_steam);
-        let (w_tcv, w_byp) = (self.steam.w_tcv, self.steam.w_bypass);
+        let w_line = f.w_steam + f.w_steam_gas;
+        self.steam.limit_to_delivered(w_line);
+        // The line flow is a mixture: water vapour and the noncondensables it
+        // carried out of the dome. Only the water does work and condenses; the
+        // gas goes to the condenser shell air (below).
+        let water_frac = if w_line > 0.0 { f.w_steam / w_line } else { 1.0 };
+        let (w_tcv, w_byp) = (self.steam.w_tcv * water_frac, self.steam.w_bypass * water_frac);
         // Work and extraction come only from the vapour the turbine received, out
         // of one available-energy budget (Sol N2, R1).
         let inlet = TurbineInlet::new(w_tcv, f.h_steam, self.steam.p_chest, self.cond.pressure());
@@ -515,6 +521,8 @@ impl Sim {
         if let Err(err) = self.cond.step_energy(dt, q_in, w_in, w_feed) {
             return self.reject_step(saved, err);
         }
+        // After the condenser accepted the step, so a rejected step moves no gas.
+        self.cond.receive_noncondensable(f.w_steam_gas * dt);
         self.model_error = None;
         debug_assert!((self.cond.w_out_accepted - w_feed).abs() <= 1e-9 * w_feed.max(1.0));
 

@@ -148,6 +148,25 @@ fn level_from_volume(v_l: f64, a_core: f64, a_ch: f64) -> f64 {
     0.5 * (lo + hi)
 }
 
+/// Static pressure at the core mid-plane, Pa: dome total pressure plus the
+/// in-shroud column above it up to the mixture level `level_z` (upper half of
+/// the core at the core-average void, the chimney at its void, liquid above
+/// the chimney top, where the separators stand in the downcomer pool).
+/// Liquid and vapour densities are those of the bulk inventory. Flow losses
+/// are left out (a few kPa at rated flow, zero in the stagnant cold states
+/// where the head matters most). Boiling is evaluated at this one elevation
+/// for the whole axial core, chimney and loop: the core-average void and the
+/// chimney exit share one saturation state, so their energy balances agree.
+pub fn core_midplane_pressure(p_dome: f64, level_z: f64, alpha_core: f64, alpha_ch: f64, rho_l: f64, rho_g: f64) -> f64 {
+    let span = |lo: f64, hi: f64| (level_z.min(hi) - lo).max(0.0);
+    let mix = |a: f64| a * rho_g + (1.0 - a) * rho_l;
+    let z_mid = Z_CORE_BOTTOM + 0.5 * CORE_HEIGHT;
+    let column = mix(alpha_core) * span(z_mid, Z_TAF)
+        + mix(alpha_ch) * span(Z_TAF, Z_CHIMNEY_TOP)
+        + rho_l * span(Z_CHIMNEY_TOP, f64::INFINITY);
+    p_dome + G * column
+}
+
 /// Highest pressure the compressed-liquid closure accepts, Pa (upper bound
 /// of IAPWS-IF97 Region 1).
 pub const EOS_P_MAX: f64 = 100.0e6;
@@ -437,10 +456,12 @@ pub struct IcPorts {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VesselFlows {
     pub w_feed: f64,
-    /// Main steam line flow, kg/s, and the enthalpy it carries (saturated
-    /// liquid when the vessel is water-solid and liquid is displaced).
+    /// Main steam line water-vapour flow, kg/s, and its enthalpy (dome
+    /// vapour; zero flow when the vessel is water-solid).
     pub w_steam: f64,
     pub h_steam: f64,
+    /// Noncondensable gas carried with it at the dome composition, kg/s.
+    pub w_steam_gas: f64,
     /// RWCU reject flow and enthalpy.
     pub w_liquid: f64,
     pub h_liquid: f64,
@@ -529,11 +550,15 @@ impl Vessel {
             shortfall_kg: 0.0,
         };
         // Iterate flow, voids and inventory to a consistent state. Core boiling
-        // uses the initial total pressure (`core_sat`): 1 atm below 100 degC,
-        // where air fills the head space, the vapour pressure above it.
-        let s = if t < 100.0 { sat_p(P_ATM) } else { sat_t(t) };
+        // uses the initial total pressure plus the column above the core
+        // (`core_sat`): 1 atm in the head space below 100 degC, where air fills
+        // it, the vapour pressure above it.
+        let s_bulk = sat_t(t);
+        let p_dome = if t < 100.0 { P_ATM } else { s_bulk.p };
+        let rho_bulk = if t < 100.0 { steam::rho_liquid(t) } else { s_bulk.rho_f };
         let h_fw = steam::h_liquid(t_feed);
         for _ in 0..200 {
+            let s = sat_p(core_midplane_pressure(p_dome, level_z, v.alpha_core, v.alpha_ch, rho_bulk, s_bulk.rho_g));
             let w_rec = (v.core_flow - w_feed).max(0.0);
             // Liquid returning to the downcomer is at the bulk vessel temperature.
             let h_ret = steam::h_liquid(t.min(s.t));
@@ -552,7 +577,7 @@ impl Vessel {
         }
         // Inventory: liquid volume to reach the requested level, plus dome steam.
         let v_l = liquid_volume_below(level_z, v.alpha_core, v.alpha_ch);
-        let rho_l = if t < 100.0 { steam::rho_liquid(t) } else { s.rho_f };
+        let rho_l = rho_bulk;
         let v_g = V_VESSEL_FLUID - v_l;
         // Head space holds equilibrium vapour at every temperature (partial
         // pressure below 100 degC), matching the EOS closure.
@@ -568,11 +593,19 @@ impl Vessel {
     }
 
     fn calibrate_friction() -> f64 {
-        // Rated state: 7.2 MPa, 870 MW, rated feed at 215 degC, level at NWL.
-        let s = sat_p(P_RATED);
+        // Rated state: 7.2 MPa dome, 870 MW, rated feed at 215 degC, level at
+        // NWL. Boiling at the core mid-plane pressure, as in `Vessel::step`;
+        // recirculated liquid returns at the dome saturation enthalpy.
+        let dome = sat_p(P_RATED);
         let w = CORE_FLOW_RATED;
         let h_fw = steam::h_liquid(T_FW_RATED);
-        let h_in = (s.h_f * (w - STEAM_FLOW_RATED) + h_fw * STEAM_FLOW_RATED) / w;
+        let h_in = (dome.h_f * (w - STEAM_FLOW_RATED) + h_fw * STEAM_FLOW_RATED) / w;
+        let mut s = dome;
+        for _ in 0..50 {
+            let core = core_th(&s, w, RATED_POWER_W, h_in);
+            let (a_ch, _) = chimney_th(&s, w, &core);
+            s = sat_p(core_midplane_pressure(P_RATED, Z_NWL, core.alpha_avg, a_ch, dome.rho_f, dome.rho_g));
+        }
         let core = core_th(&s, w, RATED_POWER_W, h_in);
         let (_, rho_ch) = chimney_th(&s, w, &core);
         let rho_dc = steam::rho_liquid(steam::t_from_h_liquid(h_in));
@@ -628,16 +661,6 @@ impl Vessel {
         }
     }
 
-    /// Enthalpy (J/kg) the main steam lines carry: displaced liquid when the
-    /// vessel is water-solid, vapour otherwise.
-    pub fn steam_line_enthalpy(&self) -> f64 {
-        if self.eos.solid {
-            self.liquid_port_enthalpy()
-        } else {
-            self.steam_port_enthalpy()
-        }
-    }
-
     /// Fraction of the active fuel covered by two-phase mixture. `level_z` is
     /// already the mixture-surface elevation (void swell is in
     /// `liquid_volume_below`), so coverage is purely geometric.
@@ -684,19 +707,28 @@ impl Vessel {
         } else {
             0.0
         };
-        // Steam lines carry vapour when a steam space exists, displaced liquid
-        // when solid; the line hydraulics already set the request from total
-        // pressure, and the phase-inventory bound below limits what leaves (R2).
-        let steam_req = inp.w_steam;
-        let (h_steam_port, h_vent_port) = if solid { (h_liq, h_liq) } else { (h_steam, h_steam) };
+        // The main steam lines draw dome gas only. A water-solid vessel has no
+        // steam space and delivers nothing to them: the plant trips turbine and
+        // feed at L8 long before carryover, so no liquid line path is modelled.
+        // The request (`inp.w_steam`) is the line's total mass flow of dome gas,
+        // which leaves at the dome composition: noncondensables go with the
+        // vapour in the dome's mass ratio (no selective separator), so a sealed
+        // vessel purges its air through an open line. A head vent only flows
+        // with no air in the dome (at or above 100 degC, or above 1 atm when
+        // vented), so its stream is vapour alone.
+        let m_vap = self.mass * x;
+        let m_liq = self.mass - m_vap;
+        let line_req = if solid { 0.0 } else { inp.w_steam };
+        let gas_frac = if line_req > 0.0 && self.gas_mass > 0.0 { self.gas_mass / (self.gas_mass + m_vap) } else { 0.0 };
+        let steam_req = line_req * (1.0 - gas_frac);
+        let line_gas_req = line_req * gas_frac;
+        let h_vent_port = if solid { h_liq } else { h_steam };
         let ic_steam_req = if solid { 0.0 } else { ic.w_steam };
 
         // Bound each phase port by the phase inventory, then the total by the
         // smallest inventory the EOS can represent.
-        let m_vap = self.mass * x;
-        let m_liq = self.mass - m_vap;
         let (vap_req, liq_req) = if solid {
-            (0.0, inp.w_liquid_out + steam_req + vent_req)
+            (0.0, inp.w_liquid_out + vent_req)
         } else {
             (steam_req + vent_req + ic_steam_req, inp.w_liquid_out)
         };
@@ -709,7 +741,7 @@ impl Vessel {
         let avail_total = (self.mass + inp.w_feed * dt - 1.001 * self.min_mass()).max(0.0);
         let f_tot = scale(out_phase, avail_total);
         let (f_v, f_l) = (f_vap * f_tot, f_liq * f_tot);
-        let (f_steam, f_vent) = if solid { (f_l, f_l) } else { (f_v, f_v) };
+        let f_vent = if solid { f_l } else { f_v };
         // IC acceptance: the condenser loop runs only as fast as the vessel
         // supplies its steam (none when water-solid), and the condensate
         // return is scaled with it so the trains can commit one ratio.
@@ -717,8 +749,10 @@ impl Vessel {
         let w_ic_return = ic.w_return * ic_ratio;
         let flows = VesselFlows {
             w_feed: inp.w_feed,
-            w_steam: steam_req * f_steam,
-            h_steam: h_steam_port,
+            w_steam: steam_req * f_v,
+            // The line keeps the dome composition at the accepted rate.
+            w_steam_gas: (line_gas_req * f_v).min(self.gas_mass / dt),
+            h_steam,
             w_liquid: inp.w_liquid_out * f_l,
             h_liquid: h_liq,
             w_vent: vent_req * f_vent,
@@ -741,7 +775,10 @@ impl Vessel {
             - flows.w_liquid * flows.h_liquid;
         let mass = self.mass + dm * dt;
         let energy = self.energy + de * dt;
-        let head = if self.head_vent_open { HeadSpace::Vented } else { HeadSpace::Sealed { gas_mass: self.gas_mass } };
+        // Noncondensables carry no energy here (heat capacity neglected, see
+        // `HeadSpace::Sealed`); only their inventory moves.
+        let gas_after_line = (self.gas_mass - flows.w_steam_gas * dt).max(0.0);
+        let head = if self.head_vent_open { HeadSpace::Vented } else { HeadSpace::Sealed { gas_mass: gas_after_line } };
         let mut flows = flows;
         match solve_eos_with(mass, energy, head) {
             Ok(eos) => {
@@ -751,8 +788,10 @@ impl Vessel {
                 self.last_error = None;
                 if self.head_vent_open {
                     let gas = vented_gas_mass(&eos, mass);
-                    flows.w_vent_gas = (self.gas_mass - gas) / dt;
+                    flows.w_vent_gas = (gas_after_line - gas) / dt;
                     self.gas_mass = gas;
+                } else {
+                    self.gas_mass = gas_after_line;
                 }
             }
             Err(e) => {
@@ -803,13 +842,19 @@ impl Vessel {
         self.heatup_rate += (rate - self.heatup_rate) * (dt / 30.0).min(1.0);
     }
 
-    /// Saturation state for core boiling: bubbles nucleate against the total
-    /// (mechanical) pressure, including trapped gas, throughout the EOS domain.
-    /// A vented vessel sits at 1 atm (so boils at 100 degC); a sealed one with
-    /// trapped air boils above its bulk temperature; a gas-free one at its own
-    /// vapour pressure (R2).
+    /// Saturation state for core boiling: bubbles nucleate against the local
+    /// mechanical pressure, dome total pressure (including trapped gas) plus
+    /// the column above the core mid-plane (`core_midplane_pressure`). In a cold
+    /// stagnant vessel that head (~1.1 bar) dominates; at rated pressure it is
+    /// under 1 % (round-5 R3/R5). Uses the lagged voids and the current level.
     pub fn core_sat(&self) -> Sat {
-        sat_p(self.eos.p)
+        sat_p(self.core_pressure())
+    }
+
+    /// Core mid-plane pressure, Pa; see `core_midplane_pressure`.
+    pub fn core_pressure(&self) -> f64 {
+        let s = self.sat();
+        core_midplane_pressure(self.eos.p, self.level_z, self.alpha_core, self.alpha_ch, s.rho_f, s.rho_g)
     }
 
     /// Vapour the steam ports (main steam, IC) can draw: present at any
@@ -818,15 +863,13 @@ impl Vessel {
         !self.eos.solid && self.eos.x > 0.0
     }
 
-    /// Density (kg/m3) of the fluid entering the main steam lines, from the
-    /// same phase `steam_line_enthalpy` selects: the vessel's own compressed
-    /// liquid (it fills the vessel) when water-solid, the dome vapour otherwise.
+    /// Density (kg/m3) of the dome gas entering the main steam lines: the
+    /// vapour plus the noncondensables sharing the head space. Unused when
+    /// water-solid (the vessel delivers nothing to the lines then).
     pub fn steam_line_density(&self) -> f64 {
-        if self.eos.solid {
-            self.mass / V_VESSEL_FLUID
-        } else {
-            self.sat().rho_g
-        }
+        let v_space = head_space_volume(self.eos.t, self.mass, self.eos.x);
+        let rho_gas = if v_space > 0.0 { self.gas_mass / v_space } else { 0.0 };
+        self.sat().rho_g + rho_gas
     }
 }
 
@@ -1255,18 +1298,19 @@ mod tests {
         assert!((v.mass - m0 + 10.0 * dt).abs() < 1e-9);
         assert!((v.energy - e0 + 10.0 * dt * v.flows.h_liquid + loss).abs() < 1e-3);
 
-        // Hot water-solid vessel: displaced liquid on the steam lines and RWCU
-        // both carry the compressed enthalpy, above saturated h_f(T).
+        // Hot water-solid vessel: RWCU carries the compressed enthalpy, above
+        // saturated h_f(T); the main steam lines receive nothing (no steam space).
         let mut v = vessel_at(200.0, 1.002 * V_VESSEL_FLUID * sat_t(200.0).rho_f);
         assert!(v.eos.solid);
+        let m0 = v.mass;
         let h_c = steam::compressed_liquid_h(v.eos.t, v.eos.p);
-        assert_eq!(v.steam_line_enthalpy(), h_c);
         assert!(h_c - sat_t(v.eos.t).h_f > 500.0, "dh {}", h_c - sat_t(v.eos.t).h_f);
         let inp = VesselInputs { w_steam: 5.0, ..inp };
         v.step(dt, &inp);
         assert!(v.last_error.is_none(), "{:?}", v.last_error);
-        assert_eq!((v.flows.h_steam, v.flows.h_liquid), (h_c, h_c));
-        assert!(v.flows.w_steam == 5.0 && v.flows.w_liquid == 10.0);
+        assert_eq!(v.flows.h_liquid, h_c);
+        assert!(v.flows.w_steam == 0.0 && v.flows.w_steam_gas == 0.0 && v.flows.w_liquid == 10.0);
+        assert!((v.mass - m0 + 10.0 * dt).abs() < 1e-9);
     }
 
     /// Astra 19: accepted IC condensate return mixes into the downcomer with
@@ -1311,7 +1355,9 @@ mod tests {
         let mut v = sealed_at(90.0, 180_000.0, 100.0);
         assert!(v.eos.subcooled && !v.eos.solid);
         assert!((v.eos.p - 229_956.46).abs() < 1.0e-3 * 229_956.46, "p {}", v.eos.p);
-        assert!((v.core_sat().t - 124.681).abs() < 0.3, "core T_sat {}", v.core_sat().t);
+        assert!((sat_p(v.eos.p).t - 124.681).abs() < 0.3, "dome T_sat {}", sat_p(v.eos.p).t);
+        // The core sits below ~12 m of water on top of that (R5).
+        assert!(v.core_sat().t > sat_p(v.eos.p).t + 10.0, "core T_sat {}", v.core_sat().t);
         let h_in = steam::h_liquid(90.0);
         assert!(core_th(&sat_p(P_ATM), 500.0, 30.0e6, h_in).alpha_avg > 0.2, "fixture must discriminate");
         v.core_flow = 500.0;
@@ -1322,42 +1368,68 @@ mod tests {
         assert_eq!((v.core.alpha_avg, v.core.x_exit), (0.0, 0.0), "{:?}", v.core);
     }
 
-    /// R2: an open-vent vessel sits at 1 atm and still boils at ~100 degC on
-    /// both sides of it (cold heatup and the startup path are unchanged).
+    /// Round-5 R3/R5: core boiling uses dome pressure plus the static column
+    /// above the core mid-plane. Void-free vessels at 1 atm (vented, 99.5 degC)
+    /// and at their own vapour pressure (100.5 degC) are checked against an
+    /// independent liquid-column sum; both boil near 120 degC, not 100 degC.
     #[test]
-    fn vented_vessel_core_boils_at_atmospheric_saturation() {
-        let below = vessel_at(99.5, 180_000.0);
-        assert!(below.head_vent_open || below.gas_mass > 0.0);
-        let mut vented = below.clone();
+    fn core_boils_at_dome_pressure_plus_liquid_head() {
+        let mut vented = vessel_at(99.5, 180_000.0);
         vented.head_vent_open = true;
         vented.eos = solve_eos(vented.mass, vented.energy).unwrap();
         assert_eq!(vented.eos.p, P_ATM);
-        assert!((vented.core_sat().t - 100.0).abs() < 0.05, "{}", vented.core_sat().t);
         let above = vessel_at(100.5, 180_000.0);
-        assert!((above.core_sat().t - 100.5).abs() < 0.05, "{}", above.core_sat().t);
+        for v in [&vented, &above] {
+            assert_eq!((v.alpha_core, v.alpha_ch), (0.0, 0.0));
+            let z_mid = Z_CORE_BOTTOM + 0.5 * CORE_HEIGHT;
+            let p_mid = v.eos.p + sat_t(v.eos.t).rho_f * G * (v.level_z - z_mid);
+            assert!((v.core_pressure() - p_mid).abs() < 1e-6 * p_mid, "{} vs {p_mid}", v.core_pressure());
+            assert!(v.core_sat().t > 115.0, "core T_sat {}", v.core_sat().t);
+        }
     }
 
-    /// R2: cold compressed liquid (water-solid 40 degC, several MPa) is far
-    /// from boiling, and an open main line discharges its liquid at the
-    /// pressure-driven rate instead of being suppressed below 100 degC.
+    /// Astra R5 / Sol R3: sealed, gas-free 90 degC, 180 t (dome 70.18 kPa). The
+    /// core mid-plane sees ~1.9 bar, so 8.7 MW into 500 kg/s of 90 degC water
+    /// (exit ~394 kJ/kg) stays subcooled: no void, no exit quality, in the core
+    /// model and in accepted vessel steps.
     #[test]
-    fn cold_compressed_liquid_does_not_boil_and_discharges_liquid() {
+    fn gas_free_cold_core_is_subcooled_under_its_water_head() {
+        let mut v = sealed_at(90.0, 180_000.0, 0.0);
+        assert!((v.eos.p - 70_182.36).abs() < 1.0e-3 * 70_182.36, "p {}", v.eos.p);
+        let h_in = steam::h_liquid(90.0);
+        assert!(core_th(&sat_p(v.eos.p), 500.0, 8.7e6, h_in).alpha_avg > 0.3, "fixture must discriminate");
+        assert!(v.core_sat().t > 116.0, "core T_sat {}", v.core_sat().t);
+        assert_eq!(core_th(&v.core_sat(), 500.0, 8.7e6, h_in).alpha_avg, 0.0);
+        v.core_flow = 500.0;
+        v.h_in = h_in;
+        let inp = VesselInputs { q_core: 8.7e6, q_ic: 0.0, w_feed: 0.0, h_feed: 0.0, w_steam: 0.0, w_liquid_out: 0.0 };
+        for _ in 0..20 {
+            v.step(0.05, &inp);
+            assert!(v.last_error.is_none(), "{:?}", v.last_error);
+            assert_eq!((v.core.alpha_avg, v.core.x_exit), (0.0, 0.0), "{:?}", v.core);
+        }
+        assert!(v.alpha_core.abs() < 1e-12 && v.alpha_ch.abs() < 1e-12);
+    }
+
+    /// Cold compressed liquid (water-solid 40 degC, several MPa) is far from
+    /// boiling, and an open main line takes nothing from it: the lines carry
+    /// dome gas only, so mass and energy change by the heat loss alone.
+    #[test]
+    fn cold_compressed_liquid_does_not_boil_and_supplies_no_main_line_flow() {
         let m = V_VESSEL_FLUID * sat_t(40.0).rho_f * 1.001;
         let mut v = sealed_at(40.0, m, 0.0);
         assert!(v.eos.solid && v.eos.subcooled && v.eos.p > 1.0e6, "{:?}", v.eos);
         assert!(v.core_sat().t > 150.0, "core T_sat {}", v.core_sat().t);
         assert_eq!(core_th(&v.core_sat(), 500.0, 30.0e6, steam::h_liquid(40.0)).alpha_avg, 0.0);
-        assert!((v.steam_line_density() - m / V_VESSEL_FLUID).abs() < 1e-9);
-        let mut line = crate::bop::SteamSystem::new(true);
-        line.tcv_pos = 0.05;
-        line.compute_flows_from(v.eos.p, v.steam_line_enthalpy(), v.steam_line_density(), true);
-        let w = line.total_flow();
-        assert!(w > 1.0 && line.p_chest > P_ATM, "w {w}, chest {}", line.p_chest);
-        let inp = VesselInputs { q_core: 0.0, q_ic: 0.0, w_feed: 0.0, h_feed: 0.0, w_steam: w, w_liquid_out: 0.0 };
-        v.step(0.01, &inp);
+        let (m0, e0, dt) = (v.mass, v.energy, 0.05);
+        let inp = VesselInputs { q_core: 0.0, q_ic: 0.0, w_feed: 0.0, h_feed: 0.0, w_steam: 500.0, w_liquid_out: 0.0 };
+        v.step(dt, &inp);
         assert!(v.last_error.is_none(), "{:?}", v.last_error);
-        assert!((v.flows.w_steam - w).abs() < 1e-9 * w, "delivered {} of {w}", v.flows.w_steam);
-        assert!(v.flows.h_steam < sat_t(100.0).h_f, "liquid enthalpy {}", v.flows.h_steam);
+        assert_eq!((v.flows.w_steam, v.flows.w_steam_gas), (0.0, 0.0));
+        assert!(v.eos.solid);
+        let loss = HEAT_LOSS_HOT * ((40.0 - 20.0) / 268.0) * dt;
+        assert_eq!(v.mass, m0);
+        assert!((v.energy - e0 + loss).abs() < 1e-12 * e0, "energy residual {}", v.energy - e0 + loss);
     }
 
     /// R2: sealed, gas-bearing pressure/temperature sweep across 100 degC.
@@ -1374,7 +1446,7 @@ mod tests {
             let void = core_th(&s, w_core, q, steam::h_liquid(t).min(s.h_f)).alpha_avg;
             let mut line = crate::bop::SteamSystem::new(true);
             line.tcv_pos = 0.1;
-            line.compute_flows_from(v.eos.p, v.steam_line_enthalpy(), v.steam_line_density(), true);
+            line.compute_flows_from(v.eos.p, v.steam_port_enthalpy(), v.steam_line_density(), 5.6e3, true);
             let now = [v.eos.p, s.t, void, line.total_flow()];
             assert!(now[3] > 0.0, "pressurized line must flow at {t} degC");
             if let Some(p) = prev {

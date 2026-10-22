@@ -1,13 +1,14 @@
-//! Limiting-state fixtures for the 2026-10-22 round-3 findings: liquid in the
-//! main steam line (R1), supply-limited steam delivery (R2) and isolation
-//! condenser duty across 100 C (Astra R4). These are valid thermodynamic
-//! boundary states, not claimed reachable operator sequences.
+//! Limiting-state fixtures for the 2026-10-22 round-3 and round-5 findings: a
+//! water-solid vessel and the main steam line, supply-limited steam delivery,
+//! isolation condenser duty across 100 C, discharge into condenser vacuum and
+//! noncondensable transport. These are valid thermodynamic boundary states,
+//! not claimed reachable operator sequences.
 
 use bwr_core::api::ScenarioName;
-use bwr_core::bop::{Feedwater, LevelControlMode};
+use bwr_core::bop::{valve_flow, Condenser, Feedwater, LevelControlMode};
 use bwr_core::params::*;
 use bwr_core::sim::DT;
-use bwr_core::steam::{isentropic_drop, sat_p, sat_t, P_ATM};
+use bwr_core::steam::{isentropic_drop, sat_p, sat_t};
 use bwr_core::vessel::{energy_for, solve_eos_with, HeadSpace};
 use bwr_core::Sim;
 
@@ -20,67 +21,162 @@ fn run(sim: &mut Sim, seconds: f64) {
 /// Replace only the vessel inventory with a consistent sealed, gas-free state
 /// of mass `m` at temperature `t` (M, U and EOS agree).
 fn set_sealed_vessel(sim: &mut Sim, m: f64, t: f64) {
-    sim.vessel.head_vent_open = false;
-    sim.vessel.gas_mass = 0.0;
-    sim.vessel.mass = m;
-    sim.vessel.energy = energy_for(m, t).unwrap();
-    sim.vessel.eos = solve_eos_with(m, sim.vessel.energy, HeadSpace::Sealed { gas_mass: 0.0 }).expect("eos");
+    set_sealed_vessel_with_gas(sim, m, t, 0.0);
 }
 
-/// R1: a water-solid vessel discharging compressed liquid into the main steam
-/// line. The turbine may extract no more than the reversible (isentropic)
-/// work of that liquid, the exhaust stays between saturated liquid at the
-/// condenser and the inlet enthalpy, and the condenser inlet energy is >= 0.
-fn liquid_main_line_fixture(t: f64) {
+/// As `set_sealed_vessel`, with `gas` kg of trapped air in the head space.
+fn set_sealed_vessel_with_gas(sim: &mut Sim, m: f64, t: f64, gas: f64) {
+    sim.vessel.head_vent_open = false;
+    sim.vessel.gas_mass = gas;
+    sim.vessel.mass = m;
+    sim.vessel.energy = energy_for(m, t).unwrap();
+    sim.vessel.eos = solve_eos_with(m, sim.vessel.energy, HeadSpace::Sealed { gas_mass: gas }).expect("eos");
+}
+
+/// Accepted vessel water transfers of the last step, kg/s (in minus out).
+fn vessel_net_water(sim: &Sim) -> f64 {
+    let f = sim.vessel.flows;
+    f.w_feed + f.w_ic_return - f.w_steam - f.w_liquid - f.w_vent - f.w_ic_steam
+}
+
+/// A cold-shutdown plant at `t` with the given sealed inventory, MSIVs open,
+/// the bypass manually full open, feed off and an evacuated 35 C condenser.
+fn open_line_cold_fixture(t: f64, m: f64, gas: f64) -> Sim {
+    let mut sim = Sim::new(ScenarioName::ColdShutdown);
+    set_sealed_vessel_with_gas(&mut sim, m, t, gas);
+    sim.steam.msiv_cmd = [true; N_STEAM_LINES];
+    sim.steam.msiv_pos = [1.0; N_STEAM_LINES];
+    sim.steam.bypass_auto = false;
+    sim.steam.bypass_manual_pos = 1.0;
+    sim.steam.bypass_pos = 1.0;
+    sim.cond = Condenser::new(true);
+    sim.cond.set_temperature(35.0);
+    sim.fw = Feedwater::new(0, t, LevelControlMode::Manual, 0.0);
+    sim.core.fuel_t = t;
+    sim
+}
+
+/// Round-5 decision (Sol R1, Astra R1/R2): the main steam line carries dome
+/// gas only. A water-solid vessel at power conditions with MSIVs and TCVs open
+/// delivers nothing to it: the turbine gets no inlet and does no work, the
+/// condenser receives no line flow, and vessel mass and energy close on the
+/// remaining ports.
+fn water_solid_main_line_fixture(t: f64) {
     let mut sim = Sim::new(ScenarioName::FullPower);
     run(&mut sim, 1.0);
     let m = 1.002 * V_VESSEL_FLUID * sat_t(t).rho_f;
     set_sealed_vessel(&mut sim, m, t);
     assert!(sim.vessel.eos.solid, "fixture must be water-solid: {:?}", sim.vessel.eos);
-    let (p_dome, p_cond, e0) = (sim.vessel.eos.p, sim.cond.pressure(), sim.vessel.energy);
+    assert!(sim.steam.tcv_pos > 0.1 && !sim.turbine.tripped, "line must be open to the turbine");
+    let (m0, e0) = (sim.vessel.mass, sim.vessel.energy);
     let heat_loss = HEAT_LOSS_HOT * ((sim.vessel.eos.t - 20.0) / 268.0).max(0.0);
     sim.step(DT);
     assert!(sim.model_error.is_none(), "{:?}", sim.model_error);
 
     let f = sim.vessel.flows;
-    let (w_tcv, w_byp) = (sim.steam.w_tcv, sim.steam.w_bypass);
-    assert!(w_tcv > 10.0, "fixture must pass liquid to the turbine, w_tcv {w_tcv}");
-    assert!((f.w_steam - (w_tcv + w_byp)).abs() <= 1e-9 * f.w_steam);
-    let h = f.h_steam;
-    let (p_mech, q_ext) = (sim.turbine.p_mech, sim.fw.q_extraction_w);
-
-    // Independent reversible limit from the dome state (the chest is lower,
-    // so the model's own bound is tighter still).
-    let reversible = w_tcv * isentropic_drop(h, p_dome, p_cond);
-    assert!(p_mech <= reversible + 1.0, "{t} C: work {p_mech} W > isentropic {reversible} W");
-    assert!(p_mech <= w_tcv * TURBINE_ETA_IS * isentropic_drop(h, sim.steam.p_chest, p_cond) + 1.0);
-
-    // Turbine-side exhaust (after work and extraction) is an admissible state.
-    let h_exhaust = h - (p_mech + q_ext) / w_tcv;
-    let h_floor = sat_p(p_cond).h_f;
-    assert!(h_exhaust >= h_floor - 1e-6 && h_exhaust <= h + 1e-6, "{t} C: exhaust {h_exhaust} J/kg (floor {h_floor})");
-
-    // Condenser inlet: non-negative and exactly the delivered energy net of work and extraction.
-    let q_in = (w_tcv + w_byp) * h + f.w_liquid * f.h_liquid - p_mech - q_ext;
-    assert!(sim.cond.q_in_w >= 0.0, "{t} C: condenser inlet energy {}", sim.cond.q_in_w);
-    assert!((sim.cond.q_in_w - q_in).abs() <= 1e-9 * q_in.abs().max(1.0), "{} vs {q_in}", sim.cond.q_in_w);
-
-    // Vessel energy closes on the same port enthalpy the turbine received.
+    assert_eq!((f.w_steam, f.w_steam_gas), (0.0, 0.0), "{t} C: water-solid main-line delivery");
+    assert_eq!(sim.steam.total_flow(), 0.0);
+    assert_eq!(sim.turbine.p_mech, 0.0);
     let ic_in: f64 = sim.ic.iter().map(|tr| tr.last.w_steam_in).sum();
     assert_eq!(ic_in, 0.0, "a water-solid vessel supplies no IC steam");
-    let de = sim.q_core - heat_loss + sim.fw.flow * sim.fw.h_feed() - f.w_steam * h - f.w_vent * f.h_vent - f.w_liquid * f.h_liquid;
+    // The condenser receives only the RWCU reject, net of extraction.
+    let q_in = f.w_liquid * f.h_liquid - sim.fw.q_extraction_w;
+    assert!((sim.cond.q_in_w - q_in).abs() <= 1e-9 * q_in.abs().max(1.0), "{} vs {q_in}", sim.cond.q_in_w);
+
+    let res_m = sim.vessel.mass - m0 - vessel_net_water(&sim) * DT;
+    assert!(res_m.abs() <= 1e-9 * m0, "{t} C: vessel mass residual {res_m} kg");
+    let de = sim.q_core - heat_loss + f.w_feed * sim.fw.h_feed() - f.w_vent * f.h_vent - f.w_liquid * f.h_liquid;
     let res = sim.vessel.energy - e0 - de * DT;
     assert!(res.abs() <= 1e-9 * e0.abs(), "{t} C: vessel energy residual {res} J");
 }
 
 #[test]
-fn liquid_main_line_at_110c_gets_no_steam_work() {
-    liquid_main_line_fixture(110.0);
+fn water_solid_vessel_at_110c_delivers_no_main_line_flow() {
+    water_solid_main_line_fixture(110.0);
 }
 
 #[test]
-fn liquid_main_line_at_200c_gets_no_steam_work() {
-    liquid_main_line_fixture(200.0);
+fn water_solid_vessel_at_200c_delivers_no_main_line_flow() {
+    water_solid_main_line_fixture(200.0);
+}
+
+/// Astra round-5 R2: sealed, gas-free, water-solid 40 C vessel (~250 t,
+/// ~2.28 MPa) with the bypass open into a working condenser. It used to drain
+/// 292.5 kg in 1 s at dt = 0.05 s against 234.6 kg at 0.001 s and flash to a
+/// steam space; now nothing leaves through the line at any step size, the
+/// vessel stays water-solid and the end state does not depend on dt.
+#[test]
+fn cold_water_solid_vessel_does_not_drain_through_open_bypass() {
+    let t = 40.0;
+    let m = 1.001 * V_VESSEL_FLUID * sat_t(t).rho_f;
+    let mut ends = Vec::new();
+    for dt in [0.05_f64, 0.025, 0.0125] {
+        let mut sim = open_line_cold_fixture(t, m, 0.0);
+        assert!(sim.vessel.eos.solid && sim.vessel.eos.p > 2.0e6, "{:?}", sim.vessel.eos);
+        for _ in 0..(1.0 / dt).round() as usize {
+            let m0 = sim.vessel.mass;
+            assert!(sim.step(dt), "{:?}", sim.model_error);
+            assert_eq!(sim.steam.total_flow(), 0.0);
+            assert_eq!(sim.vessel.flows.w_steam, 0.0);
+            let res = sim.vessel.mass - m0 - vessel_net_water(&sim) * dt;
+            assert!(res.abs() <= 1e-9 * m0, "dt {dt}: mass residual {res}");
+        }
+        assert!(sim.vessel.eos.solid, "dt {dt}: vessel flashed {:?}", sim.vessel.eos);
+        ends.push((sim.vessel.mass, sim.vessel.eos.p));
+    }
+    for &(m_end, p_end) in &ends[1..] {
+        assert!((m_end - ends[0].0).abs() <= 1e-6 * m_end, "mass {m_end} vs {}", ends[0].0);
+        assert!((p_end - ends[0].1).abs() <= 1e-3 * p_end, "pressure {p_end} vs {}", ends[0].1);
+    }
+}
+
+/// Sol R4 / Astra R3: a sealed, gas-free 90 C vessel (dome ~70.18 kPa) with
+/// the bypass open discharges into the ~5.9 kPa condenser instead of stopping
+/// at atmospheric pressure; the line solve uses the condenser as its receiver.
+#[test]
+fn sub_atmospheric_vessel_discharges_into_condenser_vacuum() {
+    let probe = Sim::new(ScenarioName::ColdShutdown);
+    for dt in [0.05_f64, 0.025, 0.0125] {
+        let mut sim = open_line_cold_fixture(90.0, probe.vessel.mass, 0.0);
+        let (p0, p_cond) = (sim.vessel.eos.p, sim.cond.pressure());
+        assert!((p0 - 70_182.36).abs() < 1e-3 * p0 && p_cond < 7.0e3, "dome {p0}, condenser {p_cond}");
+        assert!(sim.step(dt), "{:?}", sim.model_error);
+        let st = &sim.steam;
+        assert!(st.w_bypass > 1.0, "dt {dt}: bypass flow {}", st.w_bypass);
+        assert_eq!(st.p_down, p_cond);
+        assert!(st.p_chest > p_cond && st.p_chest < p0, "chest {}", st.p_chest);
+        assert!((st.total_flow() - sim.vessel.flows.w_steam).abs() <= 1e-9 * st.total_flow());
+    }
+}
+
+/// Sol R2 / Astra R4: sealed 90 C, 180 t water with 100 kg air, line open into
+/// the condenser. The line takes air with the vapour at the dome mass ratio,
+/// the vessel gas inventory falls, the condenser books exactly that gas, and
+/// the vessel water + gas balance closes.
+#[test]
+fn gas_bearing_main_line_flow_purges_air_to_the_condenser() {
+    for dt in [0.05_f64, 0.025, 0.0125] {
+        let mut sim = open_line_cold_fixture(90.0, 180_000.0, 100.0);
+        let v = &sim.vessel;
+        let ratio0 = v.gas_mass / (v.mass * v.eos.x);
+        assert!((ratio0 - 3.615915).abs() < 1e-3 * ratio0, "initial air/vapour {ratio0}");
+        let (mut first, mut water_out) = (None, 0.0);
+        for _ in 0..(1.0 / dt).round() as usize {
+            let (m0, g0) = (sim.vessel.mass, sim.vessel.gas_mass);
+            assert!(sim.step(dt), "{:?}", sim.model_error);
+            let f = sim.vessel.flows;
+            first.get_or_insert(f.w_steam_gas / f.w_steam);
+            water_out += f.w_steam * dt;
+            assert!((sim.steam.total_flow() - (f.w_steam + f.w_steam_gas)).abs() <= 1e-9 * sim.steam.total_flow());
+            let res = (sim.vessel.mass + sim.vessel.gas_mass) - (m0 + g0) - (vessel_net_water(&sim) - f.w_steam_gas) * dt;
+            assert!(res.abs() <= 1e-9 * m0, "dt {dt}: water + gas residual {res} kg");
+        }
+        let first = first.unwrap();
+        assert!((first - ratio0).abs() <= 1e-9 * ratio0, "line air/vapour {first} vs dome {ratio0}");
+        let gas_out = 100.0 - sim.vessel.gas_mass;
+        assert!(gas_out > 0.1 && water_out > 0.0, "dt {dt}: gas out {gas_out}, water out {water_out}");
+        assert!((sim.cond.noncondensable_in_kg - gas_out).abs() <= 1e-9 * 100.0, "booked {} vs {gas_out}", sim.cond.noncondensable_in_kg);
+    }
 }
 
 /// R1, two-phase inlet: wet steam at the chest expands only its vapour. Work
@@ -125,10 +221,11 @@ fn vapour_limited_chest_pressure_matches_delivered_flow() {
     let st = &sim.steam;
     let w = st.total_flow();
     assert!((w - f.w_steam).abs() <= 1e-12 * w.max(1.0), "committed {w} vs delivered {}", f.w_steam);
-    // Valve relation at the delivered flow (areas fixed for the step).
-    let dp_valve = st.p_chest - P_ATM;
-    assert!((st.w_tcv - C_TCV * st.tcv_pos * dp_valve).abs() <= 1e-9 * st.w_tcv.max(1e-6), "TCV {} vs {}", st.w_tcv, C_TCV * st.tcv_pos * dp_valve);
-    assert!((st.w_bypass - C_BYPASS * st.bypass_pos * dp_valve).abs() <= 1e-9 * st.w_bypass.max(1e-6));
+    // Valve relation into the condenser at the delivered flow (areas fixed for the step).
+    assert_eq!(st.p_down, p_cond);
+    let w_tcv = valve_flow(C_TCV * st.tcv_pos, st.p_chest, p_cond);
+    assert!((st.w_tcv - w_tcv).abs() <= 1e-9 * st.w_tcv.max(1e-6), "TCV {} vs {w_tcv}", st.w_tcv);
+    assert!((st.w_bypass - valve_flow(C_BYPASS * st.bypass_pos, st.p_chest, p_cond)).abs() <= 1e-9 * st.w_bypass.max(1e-6));
     // Line relation at the delivered flow, from the inlet boundary.
     let m_open = st.msiv_pos.iter().sum::<f64>() / N_STEAM_LINES as f64;
     let k = STEAM_LINE_DP / (STEAM_FLOW_RATED * STEAM_FLOW_RATED) / (m_open * m_open);

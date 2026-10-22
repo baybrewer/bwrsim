@@ -933,7 +933,9 @@ fn port_balance_step(sim: &mut Sim) -> (f64, f64) {
     let ic_ret_e: f64 = sim.ic.iter().map(|t| t.last.w_cond_return * t.last.h_return).sum();
     let f = sim.vessel.flows;
     // RWCU is the flow the vessel accepted (phase-limited), not the fw.rwcu_reject request.
-    let (w_steam, w_feed, w_rwcu) = (sim.steam.total_flow(), sim.fw.flow, f.w_liquid);
+    // The committed line flow carries any dome noncondensables with the vapour;
+    // only the water is vessel inventory.
+    let (w_steam, w_feed, w_rwcu) = (sim.steam.total_flow() - f.w_steam_gas, sim.fw.flow, f.w_liquid);
     let dm = w_feed + ic_ret_m - w_steam - w_rwcu - f.w_vent - ic_in;
     let de = sim.q_core - heat_loss + w_feed * sim.fw.h_feed() + ic_ret_e
         - w_steam * sim.steam.h_steam
