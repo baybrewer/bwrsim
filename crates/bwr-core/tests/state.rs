@@ -81,7 +81,9 @@ fn busy_plant() -> Sim {
     let snap = sim.snapshot();
     assert!(sim.backlog_s() > 0.0 && sim.backlog_s() < DT, "accumulator {}", sim.backlog_s());
     assert!(sim.core.rods.pos.iter().zip(&sim.core.rods.target).any(|(p, t)| (p - t).abs() > 1e-6), "no pending rod motion");
-    assert!(sim.turbine.tripped && sim.turbine.gov_integral != 0.0, "turbine trip / governor integral");
+    assert!(sim.turbine.tripped, "turbine trip");
+    let level_integral = sim.to_state_json()["sim"]["fw"]["integral"].as_f64().unwrap();
+    assert!(level_integral != 0.0, "level controller integral");
     assert!(snap.alarms.iter().any(|a| a.acked) && snap.alarms.iter().any(|a| !a.acked), "acks");
     assert!(snap.alarms.iter().any(|a| a.id == "cmd_rejected"), "operator event");
     assert!(snap.ann_head > 0);
@@ -268,8 +270,7 @@ fn condition_and_event_with_the_same_legacy_id_stay_distinct() {
     let ev = events_after(&sim, head);
     assert_eq!(count(&ev, AnnKind::Onset, "cond:rod_block"), 1, "{ev:?}");
     assert_eq!(count(&ev, AnnKind::Onset, "evt:rod_block"), 1, "{ev:?}");
-    let ids: Vec<&str> = sim.snapshot().alarms.iter().map(|a| a.id.as_str()).filter(|&id| id == "rod_block").collect();
-    assert_eq!(ids.len(), 2);
+    assert_eq!(sim.snapshot().alarms.iter().filter(|a| a.id == "rod_block").count(), 2);
 }
 
 #[test]

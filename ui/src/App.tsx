@@ -6,12 +6,10 @@ import { ReactorPanel } from "./components/ReactorPanel";
 import { TopBar } from "./components/TopBar";
 import { TrendPanel } from "./components/TrendPanel";
 import { TurbinePanel } from "./components/TurbinePanel";
-import { useTrendHistory } from "./sim/history";
 import { useSim } from "./sim/bridge";
 
 export default function App() {
-  const { snapshot: s, send, lastError, backendKind } = useSim();
-  const samples = useTrendHistory(s);
+  const { snapshot: s, send, lastError, backendKind, store } = useSim();
 
   if (!s) {
     return (
@@ -34,7 +32,7 @@ export default function App() {
           <Panel title="PLANT MIMIC · NUCLEAR STEAM SUPPLY & POWER CONVERSION" className="mimic-panel">
             <PlantMimic s={s} send={send} />
           </Panel>
-          <TrendPanel samples={samples} />
+          <TrendPanel s={s} history={store.history} />
         </div>
         <div className="col col-right">
           <FeedwaterPanel s={s} send={send} />

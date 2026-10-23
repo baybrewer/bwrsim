@@ -2,6 +2,7 @@
 
 use crate::kinetics::{Kinetics, KineticsError, MAX_SUBSTEP};
 use crate::params::*;
+use serde::{Deserialize, Serialize};
 
 /// Grid size of the rod map.
 pub const ROD_GRID: usize = 9;
@@ -63,7 +64,7 @@ fn s_curve(f: f64) -> f64 {
     f - (2.0 * std::f64::consts::PI * f).sin() / (2.0 * std::f64::consts::PI)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Rods {
     pub layout: Vec<(usize, usize)>,
     pub weights: Vec<f64>,
@@ -215,7 +216,7 @@ impl Rods {
 }
 
 /// Xenon-135 / iodine-135, normalised to 100 % power equilibrium.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Xenon {
     pub iodine: f64,
     pub xenon: f64,
@@ -243,7 +244,7 @@ impl Xenon {
 }
 
 /// Fission product decay heat groups, relative to rated power.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DecayHeat {
     pub d: [f64; 9],
 }
@@ -295,7 +296,7 @@ impl DecayHeat {
 }
 
 /// Everything in the reactor core except thermal-hydraulics.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Core {
     pub kin: Kinetics,
     pub rods: Rods,

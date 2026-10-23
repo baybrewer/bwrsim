@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 // ------------------------------------------------------------------ main steam & EHC
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SteamSystem {
     pub msiv_pos: [f64; N_STEAM_LINES],
     pub msiv_cmd: [bool; N_STEAM_LINES],
@@ -67,7 +67,7 @@ fn ideal_choked_flux(gamma: f64, r_gas: f64) -> f64 {
 /// pressure and temperature (which cancel in the ratio), using the mixture gas
 /// constant and heat-capacity ratio (round-6 R3). Pure steam is exactly the
 /// calibration, so its flows are unchanged bit for bit.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LineGas {
     /// Noncondensable (air) mass fraction.
     pub x_gas: f64,
@@ -373,7 +373,7 @@ impl SteamSystem {
 
 // ------------------------------------------------------------------ turbine-generator
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Turbine {
     pub speed_rpm: f64,
     /// Ramped speed reference.
@@ -687,7 +687,7 @@ fn cw_trajectory(t0: f64, rate: f64, a: f64, dt: f64, t_cw: f64, t_cap: f64) -> 
 /// conserved total mass and energy. Cooling water removes heat from the node,
 /// the shell relief vents saturated steam (mass and enthalpy) at its set
 /// pressure, and every mass transfer across the boundary is reported explicitly.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Condenser {
     pub m_air: f64,
     /// Steam partial pressure in the shell, Pa (saturation at the node temperature).
@@ -1049,7 +1049,7 @@ pub enum LevelControlMode {
 /// the low-flow control valve directly and sets the pump speed demand from
 /// `FW_PUMP_MIN_SPEED` to full speed, so the valve dominates at low flow and the
 /// drives at power.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Feedwater {
     pub pumps: [bool; N_FEED_PUMPS],
     /// Actual pump speed, per unit of rated.

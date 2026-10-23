@@ -1,6 +1,7 @@
 //! Point reactor kinetics with six delayed neutron groups.
 
 use crate::params::{BETA, BETA_FRAC, GEN_TIME, LAMBDA_DN};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Largest kinetics substep, s. Resolves the fastest delayed group and keeps the
@@ -26,7 +27,7 @@ const PERIOD_TAU: f64 = 1.0;
 
 /// Why a kinetics advance could not be completed. The state is always left at
 /// the last accepted substep, never at a clamped or extrapolated value.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum KineticsError {
     /// Reactivity was NaN or infinite.
     NonFiniteReactivity,
@@ -54,7 +55,7 @@ impl fmt::Display for KineticsError {
 
 impl std::error::Error for KineticsError {}
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Kinetics {
     /// Neutron population relative to rated power.
     pub n: f64,

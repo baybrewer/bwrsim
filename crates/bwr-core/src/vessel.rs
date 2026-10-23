@@ -12,6 +12,7 @@
 //! difference between the downcomer and the core + chimney.
 
 use crate::params::*;
+use serde::{Deserialize, Serialize};
 use crate::steam::{self, sat_p, sat_t, Sat, P_ATM};
 
 /// Head vent line flow coefficient, kg/s per Pa above atmospheric.
@@ -19,7 +20,7 @@ const C_HEAD_VENT: f64 = 5.0 / 7.0e6;
 /// Minimum core flow (local recirculation inside the shroud), kg/s.
 const W_MIN: f64 = 5.0;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CoreTh {
     pub alpha_avg: f64,
     pub rho_avg: f64,
@@ -178,7 +179,7 @@ pub const EOS_T_MAX: f64 = 349.5;
 pub const R_AIR: f64 = 287.05;
 
 /// Phase domain the vessel inventory occupies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EosRegime {
     /// Liquid fills the whole vessel; pressure comes from liquid compression.
     CompressedLiquid,
@@ -200,7 +201,7 @@ pub enum HeadSpace {
 }
 
 /// Reasons the EOS cannot represent a (mass, energy) pair.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum EosError {
     /// Mass or energy is not a finite positive number.
     NonFinite,
@@ -249,7 +250,7 @@ impl std::fmt::Display for EosError {
 impl std::error::Error for EosError {}
 
 /// Equilibrium state of the vessel fluid.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Eos {
     pub t: f64,
     /// Total head-space (or liquid, when water-solid) pressure, Pa.
@@ -453,7 +454,7 @@ pub struct IcPorts {
 
 /// Port transfers actually applied in the last `Vessel::step`, after bounding
 /// by phase inventory. Connected systems must use these, not their requests.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct VesselFlows {
     pub w_feed: f64,
     /// Main steam line water-vapour flow, kg/s, and its enthalpy (dome
@@ -483,7 +484,7 @@ pub struct VesselFlows {
     pub shortfall: f64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Vessel {
     pub mass: f64,
     pub energy: f64,

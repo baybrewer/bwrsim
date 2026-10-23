@@ -1,38 +1,38 @@
-import type { TrendSample } from "../sim/history";
-import { TREND_WINDOW_S } from "../sim/history";
+import type { Snapshot } from "../sim/types";
+import type { History } from "../sim/logic/history.ts";
+import { MINI_CHARTS, channelById, readChannel } from "../sim/logic/channels.ts";
+import type { Channel } from "../sim/logic/channels.ts";
 import { Panel } from "./common/Panel";
 import { StripChart } from "./StripChart";
 
-const C = {
-  green: "#3ee07a",
-  amber: "#ffb43a",
-  cyan: "#4cc9f0",
-  red: "#ff5a4e",
-  violet: "#b48cff",
-  white: "#dfe6e2",
-};
+const WINDOW_S = 600;
 
-/** Re-renders with every snapshot; the canvases redraw from the shared sample buffer. */
-export function TrendPanel(props: { samples: TrendSample[] }) {
-  const common = { samples: props.samples, windowS: TREND_WINDOW_S };
+/** Mini charts only have room for a word: the first word of the registry label. */
+const shortName = (c: Channel) => c.label.split(" ")[0].toUpperCase();
+
+/** Re-renders with every store change; the canvases redraw from the run history. */
+export function TrendPanel(props: { s: Snapshot; history: History }) {
+  const { s, history } = props;
+  const query = (t0: number, t1: number, px: number) => history.query(t0, t1, px);
   return (
     <Panel title="TRENDS · LAST 10 MIN" className="trend-panel">
       <div className="trend-grid">
-        <StripChart {...common} title="THERMAL POWER" unit="%" series={[{ name: "P", color: C.green, get: (s) => s.powerPct }]} />
-        <StripChart {...common} title="RX PRESSURE" unit="MPa" digits={2} series={[{ name: "P", color: C.amber, get: (s) => s.pressureMpa }]} />
-        <StripChart {...common} title="LEVEL NR" unit="cm" digits={0} series={[{ name: "L", color: C.cyan, get: (s) => s.levelNrCm }]} />
-        <StripChart {...common} title="CORE FLOW" unit="kg/s" digits={0} series={[{ name: "W", color: C.violet, get: (s) => s.coreFlowKgs }]} />
-        <StripChart
-          {...common}
-          title="STEAM / FEED"
-          unit="kg/s"
-          digits={0}
-          series={[
-            { name: "STM", color: C.red, get: (s) => s.steamFlowKgs },
-            { name: "FW", color: C.cyan, get: (s) => s.feedFlowKgs },
-          ]}
-        />
-        <StripChart {...common} title="GENERATOR" unit="MWe" digits={0} series={[{ name: "G", color: C.white, get: (s) => s.grossMwe }]} />
+        {MINI_CHARTS.map((chart) => {
+          const channels = chart.channelIds.map((id) => channelById(id)).filter((c): c is Channel => c !== undefined);
+          return (
+            <StripChart
+              key={chart.title}
+              title={chart.title}
+              unit={chart.unit}
+              digits={chart.digits}
+              series={channels.map((c) => ({ id: c.id, name: shortName(c), color: c.color }))}
+              values={channels.map((c) => readChannel(c, s))}
+              query={query}
+              tNow={s.timeS}
+              windowS={WINDOW_S}
+            />
+          );
+        })}
       </div>
     </Panel>
   );

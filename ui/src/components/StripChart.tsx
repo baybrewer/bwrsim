@@ -1,27 +1,35 @@
 import { useEffect, useRef } from "react";
-import type { TrendSample } from "../sim/history";
+import type { HistoryQueryResult } from "../sim/logic/history.ts";
 import { noNegZero } from "../util/format";
 
 export interface Series {
+  /** History channel id. */
+  id: string;
   name: string;
   color: string;
-  get: (s: TrendSample) => number;
 }
 
-/** Dependency-free canvas strip chart. Auto-scales Y unless fixed bounds are given. */
+/**
+ * Dependency-free canvas strip chart over the run history. Auto-scales Y unless fixed
+ * bounds are given. The history is queried per draw at the canvas width, so cost is
+ * bounded by pixels, not by run length.
+ */
 export function StripChart(props: {
   title: string;
   unit: string;
-  samples: TrendSample[];
   series: Series[];
+  /** Current readout per series (null = no value). */
+  values: (number | null)[];
+  query: (t0: number, t1: number, pixels: number) => HistoryQueryResult;
+  /** Sim time at the right edge of the window. */
+  tNow: number;
   windowS: number;
   yMin?: number;
   yMax?: number;
   digits?: number;
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
-  const { samples, series, windowS } = props;
-  const last = samples[samples.length - 1];
+  const { series, windowS } = props;
 
   useEffect(() => {
     const cv = ref.current;
@@ -45,20 +53,24 @@ export function StripChart(props: {
     const pw = w - padL - padR;
     const ph = h - padT - padB;
 
-    const tEnd = last ? Math.max(last.t, windowS) : windowS;
+    const tEnd = Math.max(props.tNow, windowS);
     const tStart = tEnd - windowS;
+    const data = props.query(tStart, tEnd, Math.max(1, Math.round(pw)));
 
     // y range
     let lo = props.yMin ?? Infinity;
     let hi = props.yMax ?? -Infinity;
     if (props.yMin === undefined || props.yMax === undefined) {
-      for (const smp of samples)
-        for (const se of series) {
-          const v = se.get(smp);
-          if (!Number.isFinite(v)) continue;
-          if (props.yMin === undefined) lo = Math.min(lo, v);
-          if (props.yMax === undefined) hi = Math.max(hi, v);
+      for (const se of series) {
+        const cols = data.series[se.id];
+        if (!cols) continue;
+        for (let i = 0; i < data.t.length; i++) {
+          const mn = cols.min[i];
+          const mx = cols.max[i];
+          if (props.yMin === undefined && mn !== null) lo = Math.min(lo, mn);
+          if (props.yMax === undefined && mx !== null) hi = Math.max(hi, mx);
         }
+      }
       if (!Number.isFinite(lo) || !Number.isFinite(hi)) {
         lo = 0;
         hi = 1;
@@ -112,14 +124,20 @@ export function StripChart(props: {
     ctx.rect(padL, padT, pw, ph);
     ctx.clip();
     for (const se of series) {
+      const cols = data.series[se.id];
+      if (!cols) continue;
       ctx.strokeStyle = se.color;
       ctx.lineWidth = 1.6;
       ctx.beginPath();
       let started = false;
-      for (const smp of samples) {
-        const v = se.get(smp);
-        if (!Number.isFinite(v)) continue;
-        const x = X(smp.t);
+      for (let i = 0; i < data.t.length; i++) {
+        const v = cols.last[i];
+        // A missing value breaks the line rather than bridging the gap.
+        if (v === null || cols.gap[i]) {
+          started = false;
+          if (v === null) continue;
+        }
+        const x = X(data.t[i]);
         const y = Y(v);
         if (!started) {
           ctx.moveTo(x, y);
@@ -136,12 +154,15 @@ export function StripChart(props: {
       <div className="strip-head">
         <span className="strip-title">{props.title}</span>
         <span className="strip-vals">
-          {series.map((se) => (
-            <span key={se.name} style={{ color: se.color }}>
-              {series.length > 1 ? `${se.name} ` : ""}
-              {last ? noNegZero(se.get(last).toFixed(props.digits ?? 1)) : "---"}
-            </span>
-          ))}
+          {series.map((se, i) => {
+            const v = props.values[i];
+            return (
+              <span key={se.id} style={{ color: se.color }}>
+                {series.length > 1 ? `${se.name} ` : ""}
+                {v === null || v === undefined ? "---" : noNegZero(v.toFixed(props.digits ?? 1))}
+              </span>
+            );
+          })}
           <span className="strip-unit">{props.unit}</span>
         </span>
       </div>

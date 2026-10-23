@@ -142,6 +142,25 @@ command handlers are thin.
 - The token uses the engine's `rev` (C1), so any mutation between prepare and
   write is detected.
 
+### C2a. Exact invoke signatures (Tauri; the mock implements the same in-process)
+
+Argument keys are camelCase (Tauri converts to snake_case Rust params). Errors
+are strings; `RunChanged` is the exact error string `"RunChanged"`.
+
+| command | args | returns |
+|---|---|---|
+| `sim_events_since` | `{ runId, seq }` | `AnnEventsSince` |
+| `save_list` | `{}` | `SaveList` |
+| `save_prepare` | `{ runId, sinceSeq }` | `{ token: string, snapshot: Snapshot, events: AnnEvent[], wasPaused: boolean }` |
+| `save_write` | `{ token, id: string \| null, name, ui: RunRecord }` | `SaveMeta` |
+| `load_prepare` | `{ id }` | `{ token: string, ui: unknown, snapshot: Snapshot }` |
+| `load_commit` | `{ token }` | `Snapshot` (first snapshot of the restored run) |
+| `load_abort` | `{ token }` | `null` |
+| `save_delete` | `{ id }` | `null` |
+
+`ui` from `load_prepare` is unvalidated JSON; the UI runs `validateRunRecord`
+before `load_commit`. Tokens are opaque strings.
+
 ### C3. Tauri worker clock reset
 
 - The worker remembers the `run_id` it last advanced. Under the sim lock, before
@@ -280,7 +299,8 @@ All UI work goes through the mandatory `frontend-design-audit` before done.
 - Logic modules under `ui/src/sim/logic/` are pure (no React, no DOM) and use
   explicit `.ts` runtime import specifiers within their graph.
 - Tests are `ui/src/sim/logic/*.test.mjs` importing the `.ts` modules.
-- Script: `"test": "node --experimental-strip-types --test src/sim/logic/"`
+- Script: `"test": "node --experimental-strip-types --test \"src/sim/logic/*.test.mjs\""`
+  (Node 22 treats a bare directory argument as one file; the glob is required)
   in `ui/package.json`. Every task's completion check = `cargo test
   --workspace`, `npm --prefix ui test`, `npm --prefix ui run build`.
 

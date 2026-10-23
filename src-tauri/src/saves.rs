@@ -323,7 +323,7 @@ impl SaveStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
 

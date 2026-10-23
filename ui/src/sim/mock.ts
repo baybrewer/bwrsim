@@ -4,12 +4,15 @@
 
 import type {
   Alarm,
+  AnnEvent,
+  AnnEventsSince,
   Command,
   ModeSwitch,
   ScenarioName,
   Severity,
   Snapshot,
 } from "./types";
+import { RUN_CHANGED } from "./logic/protocol.ts";
 
 const RATED_MWT = 870;
 const BETA = 650; // pcm
@@ -51,6 +54,17 @@ const EXTRACTION_STEAM_CAP_KGS = 520; // bounds the extraction budget above rate
 const FEED_TEMP_MAX_C = 230; // top heater outlet limit
 const HEATER_TAU_S = 120; // heater shell/tube storage time constant
 const EFFECTIVE_SPEED_TAU_S = 1; // smoothing of the achieved-speed readout
+// Annunciator event ring and published tail (same sizes as the engine, plan C1).
+const ANN_RING_LEN = 1024;
+const ANN_TAIL_LEN = 64;
+/** Version of the exported mock state; bump when Hidden or the state payload changes shape or meaning. */
+export const MOCK_STATE_VERSION = 1;
+
+// Run ids are never reused within a page (the run store orders runs by id).
+let nextRunId = 1;
+export function allocateRunId(): number {
+  return nextRunId++;
+}
 
 /** 57 rods on a 9x9 grid: drop a 3+2+1 triangle from every corner. */
 function buildLayout(): [number, number][] {
@@ -93,10 +107,74 @@ interface Hidden {
   alarmState: Map<string, Alarm>;
   prevPower: number;
   omega: number;
+  /** Latest annunciator seq issued (0 = none yet). */
+  annSeq: number;
+  annRing: AnnEvent[];
+  /** Visible alarms at the last diff (the comparison baseline), keyed `cond:<id>`. */
+  annPrev: Map<string, { text: string; severity: Severity }>;
+  /** Instrument-noise generator state, saved so a restored state continues identically. */
+  rng: number;
+}
+
+type HiddenJson = Omit<Hidden, "alarmState" | "annPrev"> & {
+  alarmState: [string, Alarm][];
+  annPrev: [string, { text: string; severity: Severity }][];
+};
+
+/** Exported mock engine state (plan C5); listeners and timers are not part of it. */
+export interface MockState {
+  mockVersion: number;
+  snapshot: Snapshot;
+  hidden: HiddenJson;
+  phase: number;
+}
+
+const HIDDEN_NUMBERS = ["precursor", "decayFrac", "rhoBias", "pressInt", "levelInt", "massLevelM", "prevPower", "omega", "annSeq", "rng"] as const;
+
+function isObj(x: unknown): x is Record<string, unknown> {
+  return typeof x === "object" && x !== null && !Array.isArray(x);
+}
+
+/** Shape check for an untrusted exported state (save files). */
+export function parseMockState(x: unknown): MockState | Error {
+  if (!isObj(x)) return new Error("mock state: not an object");
+  if (x.mockVersion !== MOCK_STATE_VERSION) return new Error(`mock state: unsupported version ${String(x.mockVersion)}`);
+  const { snapshot: s, hidden: h } = x;
+  if (!Number.isFinite(x.phase)) return new Error("mock state: phase not finite");
+  if (!isObj(s) || !Number.isFinite(s.timeS) || !Number.isFinite(s.rev) || !Number.isFinite(s.speed)) return new Error("mock state: bad snapshot");
+  const rods = s.rods as Record<string, unknown> | undefined;
+  const fw = s.feedwater as Record<string, unknown> | undefined;
+  if (!isObj(rods) || !Array.isArray(rods.positions) || rods.positions.length !== LAYOUT.length || !Array.isArray(rods.targets) || rods.targets.length !== LAYOUT.length)
+    return new Error("mock state: rod vectors do not match the core layout");
+  if (!isObj(fw) || !Array.isArray(fw.pumps) || fw.pumps.length !== N_FEED || !Array.isArray(s.ic) || s.ic.length !== 3 || !Array.isArray(s.alarms))
+    return new Error("mock state: equipment counts do not match");
+  if (!isObj(h)) return new Error("mock state: hidden state missing");
+  for (const k of HIDDEN_NUMBERS) if (!Number.isFinite(h[k])) return new Error(`mock state: hidden.${k} not finite`);
+  const pairs = (v: unknown) => Array.isArray(v) && v.every((e) => Array.isArray(e) && e.length === 2 && typeof e[0] === "string" && isObj(e[1]));
+  if (!pairs(h.alarmState) || !pairs(h.annPrev) || !Array.isArray(h.annRing)) return new Error("mock state: alarm state malformed");
+  return x as unknown as MockState;
+}
+
+/** The snapshot a restored state publishes: paused, a new run id, no wall-clock readouts. */
+export function restoredSnapshot(state: MockState, runId: number): Snapshot {
+  const s = structuredClone(state.snapshot);
+  s.runId = runId;
+  s.paused = true;
+  s.effectiveSpeed = 0;
+  s.clockBacklogS = 0;
+  s.annHead = state.hidden.annSeq;
+  s.annTail = state.hidden.annRing.slice(-ANN_TAIL_LEN);
+  return s;
 }
 
 function blankSnapshot(): Snapshot {
   return {
+    // Run identity and annunciator events are set by loadScenario / importState.
+    scenario: "hotStandby",
+    runId: 0,
+    rev: 0,
+    annHead: 0,
+    annTail: [],
     timeS: 0,
     speed: 1,
     effectiveSpeed: 0,
@@ -220,6 +298,10 @@ export class MockSim {
     alarmState: new Map(),
     prevPower: 0,
     omega: 0,
+    annSeq: 0,
+    annRing: [],
+    annPrev: new Map(),
+    rng: (Math.random() * 2 ** 32) | 0,
   };
   // Wall-clock time of the previous timer tick, for the achieved-speed readout.
   private lastWallMs: number | null = null;
@@ -255,6 +337,79 @@ export class MockSim {
   private publish(): Snapshot {
     // Hand out a deep copy so React sees a new object each tick.
     return structuredClone(this.s);
+  }
+
+  /** The current published state (a copy). */
+  snapshot(): Snapshot {
+    return this.publish();
+  }
+
+  get runId(): number {
+    return this.s.runId;
+  }
+
+  get rev(): number {
+    return this.s.rev;
+  }
+
+  /** Annunciator events of `runId` after `seq` (engine `ann_events_since`). */
+  eventsSince(runId: number, seq: number): AnnEventsSince {
+    if (runId !== this.s.runId) throw new Error(RUN_CHANGED);
+    const ring = this.h.annRing;
+    const truncated = seq < this.h.annSeq && (ring.length === 0 || ring[0].seq > seq + 1);
+    return { runId, events: ring.filter((e) => e.seq > seq).map((e) => ({ ...e })), truncated };
+  }
+
+  exportState(): MockState {
+    const { alarmState, annPrev, ...rest } = this.h;
+    return structuredClone({
+      mockVersion: MOCK_STATE_VERSION,
+      snapshot: this.s,
+      hidden: { ...rest, alarmState: [...alarmState], annPrev: [...annPrev] },
+      phase: this.phase,
+    });
+  }
+
+  /**
+   * Restores an exported state into this instance (listeners and timer stay), as a new
+   * run that is paused; the wall-clock anchor restarts so no elapsed time is charged.
+   */
+  importState(state: MockState, runId = allocateRunId()): Snapshot {
+    const st = structuredClone(state);
+    this.s = restoredSnapshot(st, runId);
+    this.h = { ...st.hidden, alarmState: new Map(st.hidden.alarmState), annPrev: new Map(st.hidden.annPrev) };
+    this.phase = st.phase;
+    this.lastWallMs = null;
+    this.emit();
+    return this.publish();
+  }
+
+  /** Seeded instrument noise in [0, 1) (mulberry32), so restored runs replay identically. */
+  private random(): number {
+    let t = (this.h.rng = (this.h.rng + 0x6d2b79f5) | 0);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+
+  /** Engine semantics: diff the visible alarm list against the baseline and sequence the transitions. */
+  private recordAnnunciator() {
+    const s = this.s;
+    const h = this.h;
+    const cur: Hidden["annPrev"] = new Map(s.alarms.map((a) => [`cond:${a.id}`, { text: a.text, severity: a.severity }]));
+    const push = (kind: AnnEvent["kind"], key: string, a: { text: string; severity: Severity }) => {
+      h.annRing.push({ seq: ++h.annSeq, timeS: s.timeS, kind, key, text: a.text, severity: a.severity });
+      if (h.annRing.length > ANN_RING_LEN) h.annRing.shift();
+    };
+    for (const [key, p] of h.annPrev) if (!cur.has(key)) push("clear", key, p);
+    for (const [key, c] of cur) {
+      const p = h.annPrev.get(key);
+      if (!p) push("onset", key, c);
+      else if (p.text !== c.text || p.severity !== c.severity) push("changed", key, c);
+    }
+    h.annPrev = cur;
+    s.annHead = h.annSeq;
+    s.annTail = h.annRing.slice(-ANN_TAIL_LEN);
   }
 
   // ---------------------------------------------------------------- commands
@@ -384,6 +539,10 @@ export class MockSim {
         s.alarms = [...this.h.alarmState.values()].map((a) => ({ ...a }));
         break;
     }
+    // Engine apply: one revision per command, then the annunciator diff (this.s may be a new run).
+    this.s.rev++;
+    this.updateAlarms();
+    this.recordAnnunciator();
     this.emit();
   }
 
@@ -410,6 +569,7 @@ export class MockSim {
   private loadScenario(name: ScenarioName) {
     const { speed: keepSpeed, paused: keepPaused, effectiveSpeed: keepEffective } = this.s;
     const s = blankSnapshot();
+    s.scenario = name;
     s.speed = keepSpeed;
     s.paused = keepPaused;
     s.effectiveSpeed = keepEffective;
@@ -495,14 +655,23 @@ export class MockSim {
     this.h.prevPower = s.neutronics.powerFrac;
     this.h.omega = 0;
     this.derive();
-    this.emit();
+    // Initialization boundary (C1): a fresh run whose visible alarms are onsets at time 0.
+    s.runId = allocateRunId();
+    s.rev = 0;
+    this.h.annSeq = 0;
+    this.h.annRing = [];
+    this.h.annPrev = new Map();
+    this.recordAnnunciator();
   }
 
   // ----------------------------------------------------------------- physics
-  private tick(realDt: number) {
+  /** Timer callback (public so tests can drive the mock without timers). */
+  tick(realDt: number) {
     const s = this.s;
     const t0 = s.timeS;
-    if (!s.paused) {
+    // A paused tick changes no engine state: no revision and no annunciator diff.
+    const stepped = !s.paused;
+    if (stepped) {
       let remaining = realDt * s.speed;
       while (remaining > 1e-9) {
         const dt = Math.min(0.05, remaining);
@@ -521,7 +690,11 @@ export class MockSim {
     // The first sample after start or resume seeds the filter instead of ramping from zero.
     const alpha = s.effectiveSpeed === 0 ? 1 : Math.min(1, wallDt / EFFECTIVE_SPEED_TAU_S);
     s.effectiveSpeed = s.paused ? 0 : s.effectiveSpeed + (rate - s.effectiveSpeed) * alpha;
-    this.updateAlarms();
+    if (stepped) {
+      s.rev++;
+      this.updateAlarms();
+      this.recordAnnunciator();
+    }
     this.emit();
   }
 
@@ -755,11 +928,11 @@ export class MockSim {
     v.levelNrCm = (v.levelAboveTafM - NWL_ABOVE_TAF_M) * 100;
 
     // Instruments
-    const noise = () => 1 + (Math.random() - 0.5) * 0.04;
+    const noise = () => 1 + (this.random() - 0.5) * 0.04;
     n.srmCps = Math.min(1e6, 5e10 * n.powerFrac * noise() + 0.5);
     const fs = Math.pow(10, -6 + 0.5 * (n.irmRange - 1));
     n.irmReadingPct = clamp((n.powerFrac / fs) * 100 * noise(), 0, 125);
-    n.aprmPct = (n.thermalPowerMw / RATED_MWT) * 100 * (1 + (Math.random() - 0.5) * 0.004);
+    n.aprmPct = (n.thermalPowerMw / RATED_MWT) * 100 * (1 + (this.random() - 0.5) * 0.004);
 
     // Leaving the mock's modeled range pauses the sim, as the engine does on a model-domain error.
     const finite = [v.pressureMpa, v.coolantTempC, n.powerFrac, n.fuelTempC, this.h.massLevelM].every(Number.isFinite);

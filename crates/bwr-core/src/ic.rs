@@ -5,6 +5,7 @@
 //! condensate return valve opens. No pumps or AC power are needed.
 
 use crate::params::*;
+use serde::{Deserialize, Serialize};
 use crate::steam::{self, sat_t};
 
 /// Pool water specific heat, J/kgK.
@@ -30,7 +31,7 @@ fn ua() -> f64 {
 /// Boundary quantities of one IC step. The vessel loses `w_steam_in` at
 /// `h_steam_in` and gains `w_cond_return` at `h_return`; their difference
 /// equals `q_pool` plus the change in stored primary-side energy.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct IcStep {
     /// Heat accepted by the pool (sensible + latent), W.
     pub q_pool: f64,
@@ -90,7 +91,7 @@ impl IcRequest {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IcTrain {
     pub valve_pos: f64,
     pub cmd_open: bool,

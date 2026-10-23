@@ -1,9 +1,13 @@
 //! The plant simulator: ties all systems together, runs protection logic,
 //! raises alarms and applies operator commands.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::api::{self, Command, ModeSwitch, ScenarioName, Severity, Snapshot};
+use serde::{Deserialize, Serialize, Serializer};
+use serde_json::Value;
+
+use crate::api::{self, AnnEvent, AnnEventsSince, AnnKind, Command, ModeSwitch, RunChanged, RunSummary, ScenarioName, Severity, Snapshot};
 use crate::bop::{Condenser, Feedwater, LevelControlMode, LineGas, SteamSystem, Turbine, TurbineInlet};
 use crate::ic::IcTrain;
 use crate::params::*;
@@ -16,8 +20,98 @@ pub const DT: f64 = 0.05;
 /// Most physics steps one `advance` call performs; the rest stays in the backlog.
 const MAX_STEPS_PER_ADVANCE: usize = 4000;
 
-#[derive(Clone, Debug)]
+/// Version of the saved engine state; bump when any saved struct changes shape or meaning.
+pub const ENGINE_STATE_VERSION: u32 = 1;
+/// Annunciator events the engine retains for `ann_events_since`.
+pub const ANN_RING_LEN: usize = 1024;
+/// Annunciator events carried in every snapshot.
+pub const ANN_TAIL_LEN: usize = 64;
+/// Alarms whose text embeds a continuously varying number: compared on their
+/// non-numeric template, or every step would log a `Changed`.
+const ANN_NUMERIC_TEXT_KEYS: &[&str] = &["cond:period"];
+
+/// Run identities are never reused within a process, so a consumer holding an
+/// old run's id can always tell that the run changed.
+static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_run_id() -> u64 {
+    NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Saved files must be deterministic, and `HashSet` iteration order is not.
+fn serialize_sorted<S: Serializer>(set: &HashSet<String>, ser: S) -> Result<S::Ok, S::Error> {
+    let mut v: Vec<&String> = set.iter().collect();
+    v.sort();
+    v.serialize(ser)
+}
+
+/// One visible alarm as the annunciator diff sees it: (key, text, severity).
+type AnnEntry = (String, String, Severity);
+
+/// Engine-sequenced annunciator transitions. Alarms are condition-based and
+/// can appear and clear between publishes, so only the engine sees them all.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct Annunciator {
+    /// Latest sequence number issued (0 = none yet).
+    seq: u64,
+    ring: VecDeque<AnnEvent>,
+    /// Visible alarms at the last diff (the comparison baseline).
+    prev: Vec<AnnEntry>,
+}
+
+impl Annunciator {
+    fn same_text(key: &str, a: &str, b: &str) -> bool {
+        if !ANN_NUMERIC_TEXT_KEYS.contains(&key) {
+            return a == b;
+        }
+        let template = |s: &str| s.chars().filter(|c| !c.is_ascii_digit() && *c != '.').collect::<String>();
+        template(a) == template(b)
+    }
+
+    fn push(&mut self, time_s: f64, kind: AnnKind, (key, text, severity): AnnEntry) {
+        self.seq += 1;
+        self.ring.push_back(AnnEvent { seq: self.seq, time_s, kind, key, text, severity });
+        if self.ring.len() > ANN_RING_LEN {
+            self.ring.pop_front();
+        }
+    }
+
+    /// Append the transitions from the baseline to `current`, which becomes the new baseline.
+    fn record(&mut self, time_s: f64, current: Vec<AnnEntry>) {
+        let prev = std::mem::take(&mut self.prev);
+        for p in prev.iter().filter(|p| !current.iter().any(|c| c.0 == p.0)) {
+            self.push(time_s, AnnKind::Clear, p.clone());
+        }
+        for c in &current {
+            match prev.iter().find(|p| p.0 == c.0) {
+                None => self.push(time_s, AnnKind::Onset, c.clone()),
+                Some(p) if p.2 != c.2 || !Self::same_text(&c.0, &p.1, &c.1) => self.push(time_s, AnnKind::Changed, c.clone()),
+                Some(_) => {}
+            }
+        }
+        self.prev = current;
+    }
+
+    fn tail(&self) -> Vec<AnnEvent> {
+        self.ring.iter().skip(self.ring.len().saturating_sub(ANN_TAIL_LEN)).cloned().collect()
+    }
+
+    /// Events after `seq`, and whether some of them have already left the ring.
+    fn since(&self, seq: u64) -> (Vec<AnnEvent>, bool) {
+        let truncated = seq < self.seq && self.ring.front().map_or(true, |e| e.seq > seq + 1);
+        (self.ring.iter().filter(|e| e.seq > seq).cloned().collect(), truncated)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Sim {
+    /// Origin scenario of the current run.
+    pub scenario: ScenarioName,
+    /// Identity of the current run: new on every scenario load and restore.
+    pub run_id: u64,
+    /// Incremented on every `apply` and every `step` outcome, so a host can
+    /// detect any change between two observations of one run.
+    pub rev: u64,
     pub time: f64,
     pub paused: bool,
     pub speed: f64,
@@ -40,12 +134,14 @@ pub struct Sim {
     pub model_error: Option<String>,
     pub q_core: f64,
     kin_fault_active: bool,
+    #[serde(serialize_with = "serialize_sorted")]
     acked: HashSet<String>,
     /// Transient operator messages: id -> (text, expiry time).
     events: BTreeMap<String, (String, f64)>,
     prev_msiv_open: bool,
     prev_gen_online: bool,
     accumulator: f64,
+    ann: Annunciator,
 }
 
 /// IRM full scale for a range (relative power).
@@ -79,6 +175,10 @@ impl Sim {
 
     fn base(core: Core, vessel: Vessel, steam: SteamSystem, turbine: Turbine, cond: Condenser, fw: Feedwater, mode: ModeSwitch) -> Self {
         let mut s = Self {
+            // Placeholders until `begin_run` at the end of construction.
+            scenario: ScenarioName::ColdShutdown,
+            run_id: 0,
+            rev: 0,
             time: 0.0,
             paused: false,
             speed: 1.0,
@@ -103,6 +203,7 @@ impl Sim {
             prev_msiv_open: true,
             prev_gen_online: false,
             accumulator: 0.0,
+            ann: Annunciator::default(),
         };
         s.prev_msiv_open = s.msivs_open();
         s.prev_gen_online = s.turbine.breaker_closed && !s.turbine.tripped;
@@ -129,6 +230,7 @@ impl Sim {
         );
         s.set_source_equilibrium();
         s.irm_range = 1;
+        s.begin_run(ScenarioName::ColdShutdown);
         s
     }
 
@@ -157,6 +259,7 @@ impl Sim {
             ModeSwitch::Startup,
         );
         s.set_source_equilibrium();
+        s.begin_run(ScenarioName::HotStandby);
         s
     }
 
@@ -196,7 +299,19 @@ impl Sim {
         s.time = 0.0;
         s.acked.clear();
         s.events.clear();
+        s.begin_run(ScenarioName::FullPower);
         s
+    }
+
+    /// Initialization boundary: construction warm-up is not part of the run, so
+    /// the run starts with a fresh identity and its visible alarms as onsets at
+    /// the current (zero) time.
+    fn begin_run(&mut self, scenario: ScenarioName) {
+        self.scenario = scenario;
+        self.run_id = next_run_id();
+        self.rev = 0;
+        self.ann = Annunciator::default();
+        self.record_annunciator();
     }
 
     fn set_source_equilibrium(&mut self) {
@@ -408,6 +523,16 @@ impl Sim {
         if !(dt.is_finite() && dt > 0.0) {
             return false;
         }
+        let advanced = self.step_physics(dt);
+        // After a rejection this diffs the rolled-back state plus the
+        // `model_limit` event, so rolled-back intermediate alarms never appear.
+        self.rev += 1;
+        self.record_annunciator();
+        advanced
+    }
+
+    /// The physics of one [`Self::step`] (`dt` already validated).
+    fn step_physics(&mut self, dt: f64) -> bool {
         let p = self.vessel.eos.p;
         let t_cool = self.vessel.eos.t;
         let saved = self.checkpoint();
@@ -655,6 +780,12 @@ impl Sim {
     /// Apply an operator command. A command carrying a non-finite number is
     /// rejected with an event and changes nothing (a clamp would pass NaN through).
     pub fn apply(&mut self, cmd: Command) {
+        self.apply_command(cmd);
+        self.rev += 1;
+        self.record_annunciator();
+    }
+
+    fn apply_command(&mut self, cmd: Command) {
         if Self::command_scalar(&cmd).is_some_and(|x| !x.is_finite()) {
             self.event("cmd_rejected", format!("Command rejected: non-finite value in {cmd:?}"));
             return;
@@ -809,7 +940,31 @@ impl Sim {
         self.vessel.dome_gas_mass_fraction() > TURBINE_ADMISSION_MAX_GAS_FRACTION
     }
 
+    /// Visible alarms: condition alarms, then operator events.
     fn active_alarms(&self) -> Vec<(String, String, Severity)> {
+        let mut v = self.condition_alarms();
+        v.extend(self.event_alarms());
+        v
+    }
+
+    fn event_alarms(&self) -> impl Iterator<Item = (String, String, Severity)> + '_ {
+        self.events.iter().map(|(id, (text, _))| (id.clone(), text.clone(), Severity::Info))
+    }
+
+    /// The visible alarm list keyed so condition alarms and operator events
+    /// never collide where they share a legacy id.
+    fn ann_entries(&self) -> Vec<AnnEntry> {
+        let cond = self.condition_alarms().into_iter().map(|(id, t, s)| (format!("cond:{id}"), t, s));
+        let evt = self.event_alarms().map(|(id, t, s)| (format!("evt:{id}"), t, s));
+        cond.chain(evt).collect()
+    }
+
+    fn record_annunciator(&mut self) {
+        let current = self.ann_entries();
+        self.ann.record(self.time, current);
+    }
+
+    fn condition_alarms(&self) -> Vec<(String, String, Severity)> {
         let mut v: Vec<(String, String, Severity)> = Vec::new();
         let mut add = |id: &str, text: String, sev: Severity| v.push((id.to_string(), text, sev));
         let n = self.core.kin.n;
@@ -910,9 +1065,6 @@ impl Sim {
         if self.core.fuel_t > 1000.0 {
             add("fuel_hot", "FUEL TEMPERATURE HIGH".into(), Severity::Alarm);
         }
-        for (id, (text, _)) in &self.events {
-            add(id, text.clone(), Severity::Info);
-        }
         v
     }
 
@@ -931,6 +1083,11 @@ impl Sim {
             + self.cond.cw_pumps.iter().filter(|&&b| b).count() as f64 * CW_PUMP_POWER;
         let gross = self.turbine.p_elec.max(0.0);
         Snapshot {
+            scenario: self.scenario,
+            run_id: self.run_id,
+            rev: self.rev,
+            ann_head: self.ann.seq,
+            ann_tail: self.ann.tail(),
             time_s: self.time,
             speed: self.speed,
             // Nominal values; the desktop host overwrites both with measured ones.
@@ -1067,5 +1224,92 @@ impl Sim {
                 })
                 .collect(),
         }
+    }
+}
+
+// ------------------------------------------------------------------ run identity, events, save/restore
+
+impl Sim {
+    /// Annunciator events of run `run_id` after sequence number `seq`.
+    pub fn ann_events_since(&self, run_id: u64, seq: u64) -> Result<AnnEventsSince, RunChanged> {
+        if run_id != self.run_id {
+            return Err(RunChanged { current_run_id: self.run_id });
+        }
+        let (events, truncated) = self.ann.since(seq);
+        Ok(AnnEventsSince { run_id, events, truncated })
+    }
+
+    /// Headline plant state for a save listing, on the snapshot's definitions.
+    pub fn summary(&self) -> RunSummary {
+        let s = self.snapshot();
+        RunSummary { mode: s.mode_switch, power_pct: s.neutronics.aprm_pct, pressure_mpa: s.vessel.pressure_mpa, scrammed: s.scrammed }
+    }
+
+    /// The complete engine state, versioned. A non-finite number would be
+    /// written as null and the state then refused by `from_state_json`.
+    pub fn to_state_json(&self) -> Value {
+        serde_json::json!({ "version": ENGINE_STATE_VERSION, "sim": self })
+    }
+
+    /// Restore a state written by `to_state_json`. The restored sim is paused
+    /// and starts a new run identity; speed, clock accumulator, annunciator
+    /// sequence and revision continue from the file.
+    pub fn from_state_json(state: &Value) -> Result<Sim, String> {
+        let version = state.get("version").and_then(Value::as_u64).ok_or("engine state: missing version")?;
+        if version != u64::from(ENGINE_STATE_VERSION) {
+            return Err(format!("engine state version {version}, this build reads {ENGINE_STATE_VERSION}"));
+        }
+        let body = state.get("sim").ok_or("engine state: missing sim")?;
+        let mut sim = Sim::deserialize(body).map_err(|e| format!("engine state: {e}"))?;
+        sim.validate()?;
+        sim.paused = true;
+        sim.run_id = next_run_id();
+        Ok(sim)
+    }
+
+    /// Structural checks a deserialized state must pass before it may run.
+    pub fn validate(&self) -> Result<(), String> {
+        let rods = &self.core.rods;
+        let rod_vectors =
+            [("layout", rods.layout.len()), ("weights", rods.weights.len()), ("pos", rods.pos.len()), ("target", rods.target.len()), ("fast_insert", rods.fast_insert.len())];
+        for (name, len) in rod_vectors {
+            if len != N_RODS {
+                return Err(format!("rods.{name}: {len} entries, expected {N_RODS}"));
+            }
+        }
+        if rods.layout.iter().any(|&(r, c)| r >= ROD_GRID || c >= ROD_GRID) {
+            return Err("rods.layout: position outside the core grid".into());
+        }
+        if rods.pos.iter().chain(&rods.target).any(|x| !(0.0..=ROD_FULL_OUT).contains(x)) {
+            return Err("rods: position or target outside the travel".into());
+        }
+        if rods.selected.is_some_and(|i| i >= N_RODS) {
+            return Err("rods.selected: index out of range".into());
+        }
+        if self.ic.len() != N_IC_TRAINS {
+            return Err(format!("ic: {} trains, expected {N_IC_TRAINS}", self.ic.len()));
+        }
+        if !(1..=10).contains(&self.irm_range) {
+            return Err(format!("irm_range {} outside 1..=10", self.irm_range));
+        }
+        if !(0.1..=100.0).contains(&self.speed) {
+            return Err(format!("speed {} outside 0.1..=100", self.speed));
+        }
+        if !(self.accumulator >= 0.0) {
+            return Err("clock accumulator negative".into());
+        }
+        if self.scrammed != self.scram_reason.is_some() {
+            return Err("scram latch and scram reason disagree".into());
+        }
+        let ring = &self.ann.ring;
+        let contiguous = ring.iter().zip(ring.iter().skip(1)).all(|(a, b)| b.seq == a.seq + 1);
+        if ring.len() > ANN_RING_LEN || !contiguous || ring.back().is_some_and(|e| e.seq != self.ann.seq) {
+            return Err("annunciator ring inconsistent with its sequence".into());
+        }
+        // serde_json writes a non-finite f64 as null, which a required f64
+        // rejects; one round trip therefore proves every float finite.
+        let probe = serde_json::to_value(self).map_err(|e| e.to_string())?;
+        Sim::deserialize(&probe).map_err(|e| format!("non-finite value in engine state: {e}"))?;
+        Ok(())
     }
 }

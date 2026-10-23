@@ -158,7 +158,35 @@ export interface Alarm {
   acked: boolean;
 }
 
+/** Annunciator transition recorded by the engine (plan C1). `key` is `cond:<id>` for condition alarms, `evt:<id>` for operator events. */
+export interface AnnEvent {
+  seq: number;
+  timeS: number;
+  kind: "onset" | "clear" | "changed";
+  key: string;
+  text: string;
+  severity: Severity;
+}
+
+/** Result of pulling annunciator events older than a snapshot's tail (plan C1). */
+export interface AnnEventsSince {
+  runId: number;
+  events: AnnEvent[];
+  /** The engine ring no longer holds every requested event. */
+  truncated: boolean;
+}
+
 export interface Snapshot {
+  /** Origin scenario of the current run. */
+  scenario: ScenarioName;
+  /** Identity of the current run; changes on scenario load and save restore. */
+  runId: number;
+  /** Engine revision; increments on every command and step outcome. */
+  rev: number;
+  /** Latest annunciator event sequence number (0 = none yet). */
+  annHead: number;
+  /** The most recent annunciator events (at most 64), oldest first. */
+  annTail: AnnEvent[];
   timeS: number;
   /** Requested sim-speed multiplier (simulated seconds per wall-clock second). */
   speed: number;
@@ -216,3 +244,23 @@ export type Command =
   | { type: "setRwcuReject"; kgs: number }
   | { type: "setIcTrain"; index: number; open: boolean }
   | { type: "ackAlarms" };
+
+/** One save file's metadata (plan C2); everything except the engine state and run record. */
+export interface SaveMeta {
+  id: string;
+  name: string;
+  savedAtMs: number;
+  simTimeS: number;
+  scenario: ScenarioName;
+  runSummary: { mode: ModeSwitch; powerPct: number; pressureMpa: number; scrammed: boolean };
+  /** Engine and file versions match this build. */
+  loadable: boolean;
+  /** Why the save cannot be read or loaded. */
+  error: string | null;
+}
+
+export interface SaveList {
+  /** Maximum number of saves (defined once, by the host). */
+  max: number;
+  saves: SaveMeta[];
+}

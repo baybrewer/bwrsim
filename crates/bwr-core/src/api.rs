@@ -186,9 +186,79 @@ pub struct Alarm {
     pub acked: bool,
 }
 
+/// Annunciator transition kind (plan C1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnnKind {
+    Onset,
+    Clear,
+    /// Same key, different text or severity.
+    Changed,
+}
+
+/// Annunciator transition recorded by the engine. `key` is `cond:<id>` for
+/// condition alarms and `evt:<id>` for transient operator events, so the two
+/// never collide even where they share a legacy alarm id.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnEvent {
+    pub seq: u64,
+    pub time_s: f64,
+    pub kind: AnnKind,
+    pub key: String,
+    pub text: String,
+    pub severity: Severity,
+}
+
+/// Annunciator events after a given sequence number of one run.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnEventsSince {
+    pub run_id: u64,
+    pub events: Vec<AnnEvent>,
+    /// The engine ring no longer holds every requested event.
+    pub truncated: bool,
+}
+
+/// The requested run is no longer the current one (scenario load or restore
+/// happened); the caller discards its pull and waits for the new run's snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunChanged {
+    pub current_run_id: u64,
+}
+
+impl std::fmt::Display for RunChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "run changed (current run {})", self.current_run_id)
+    }
+}
+
+impl std::error::Error for RunChanged {}
+
+/// Headline plant state for a save slot listing (plan C2 `runSummary`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunSummary {
+    pub mode: ModeSwitch,
+    pub power_pct: f64,
+    pub pressure_mpa: f64,
+    pub scrammed: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
+    /// Origin scenario of the current run.
+    pub scenario: ScenarioName,
+    /// Identity of the current run; changes on scenario load and state restore.
+    pub run_id: u64,
+    /// Engine revision; increments on every command and step outcome.
+    pub rev: u64,
+    /// Latest annunciator event sequence number (0 = none yet).
+    pub ann_head: u64,
+    /// The most recent annunciator events (at most `ANN_TAIL_LEN`), oldest first.
+    pub ann_tail: Vec<AnnEvent>,
     pub time_s: f64,
     /// Requested sim-speed multiplier (simulated s per wall-clock s).
     pub speed: f64,

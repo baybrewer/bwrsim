@@ -7,6 +7,5 @@ license.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-
-[dev-dependencies]
-serde_json = "1"
+# Saved engine state must restore bit-exactly; the default float parser is not round-trip exact.
+serde_json = { version = "1", features = ["float_roundtrip"] }

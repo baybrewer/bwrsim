@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use bwr_core::api::{Command, ModeSwitch, ScenarioName, Severity, Snapshot};
+use bwr_core::api::{AnnEventsSince, AnnKind, Command, ModeSwitch, ScenarioName, Severity, Snapshot};
 use bwr_core::bop::LevelControlMode;
 use bwr_core::params::*;
 use bwr_core::sim::{irm_full_scale, DT};
@@ -253,6 +253,11 @@ fn parse_ts(src: &str) -> TsContract {
     c
 }
 
+/// Members of an inline string-literal union type (`"a" | "b"`), if `ty` is one.
+fn inline_union(ty: &str) -> Option<Vec<String>> {
+    ty.starts_with('"').then(|| ty.split('|').map(|v| v.trim().trim_matches('"').to_string()).collect())
+}
+
 /// Validate `v` against TypeScript type `ty`, recursing through interfaces.
 fn check_value(c: &TsContract, path: &str, ty: &str, v: &Value) -> Result<(), String> {
     let ty = ty.trim();
@@ -287,6 +292,10 @@ fn check_value(c: &TsContract, path: &str, ty: &str, v: &Value) -> Result<(), St
         }
         "string" => v.as_str().map(|_| ()).ok_or_else(|| format!("{path}: expected string, got {v}")),
         "boolean" => v.as_bool().map(|_| ()).ok_or_else(|| format!("{path}: expected boolean, got {v}")),
+        union if inline_union(union).is_some() => {
+            let s = v.as_str().ok_or_else(|| format!("{path}: expected {union}, got {v}"))?;
+            if inline_union(union).unwrap().iter().any(|x| x == s) { Ok(()) } else { Err(format!("{path}: '{s}' is not in {union}")) }
+        }
         name => {
             if let Some(vals) = c.enums.get(name) {
                 let s = v.as_str().ok_or_else(|| format!("{path}: expected {name} string, got {v}"))?;
@@ -312,12 +321,14 @@ fn check_value(c: &TsContract, path: &str, ty: &str, v: &Value) -> Result<(), St
     }
 }
 
-const UNIT_SUFFIXES: &[&str] = &["S", "Mw", "Mwe", "Kpa", "Mpa", "C", "Cm", "M", "Kgs", "Kg", "Rpm", "Hz", "Deg", "Pct", "Cps", "KjKg", "Cph"];
+const UNIT_SUFFIXES: &[&str] = &["S", "Ms", "Mw", "Mwe", "Kpa", "Mpa", "C", "Cm", "M", "Kgs", "Kg", "Rpm", "Hz", "Deg", "Pct", "Cps", "KjKg", "Cph"];
 /// Numeric fields that are genuinely dimensionless (fractions, counts, indices, pcm).
 const DIMENSIONLESS: &[&str] = &[
     "speed", "effectiveSpeed", "total", "rods", "doppler", "void", "moderator", "xenon", "kEff", "irmRange", "gridSize", "selected",
     "positions", "targets", "layout", "powerFrac", "xenonRel", "iodineRel", "coreAvgVoid", "chimneyVoid", "exitQuality",
     "msivPos", "tcvPos", "bypassPos", "bypassManualPos", "fcvPos", "fcvManualPos", "valvePos",
+    // Identities, counters and limits.
+    "runId", "rev", "annHead", "seq", "max",
 ];
 
 fn has_unit_suffix(key: &str) -> bool {
@@ -498,7 +509,7 @@ fn probe_non_null(c: &TsContract, root: &Value, ptr: &str, label: &str, ty: &str
             expect_accepts(root, ptr, label, Value::from(false), deser)
         }
         name => {
-            if let Some(vals) = c.enums.get(name) {
+            if let Some(vals) = c.enums.get(name).cloned().or_else(|| inline_union(name)) {
                 for m in vals {
                     expect_accepts(root, ptr, label, Value::from(m.as_str()), deser)?;
                 }
@@ -551,6 +562,14 @@ fn all_severities() -> Vec<Severity> {
     });
     v
 }
+fn all_ann_kinds() -> Vec<AnnKind> {
+    use AnnKind::*;
+    let v = vec![Onset, Clear, Changed];
+    v.iter().for_each(|m| match m {
+        Onset | Clear | Changed => {}
+    });
+    v
+}
 fn all_scenarios() -> Vec<ScenarioName> {
     use ScenarioName::*;
     let v = vec![ColdShutdown, HotStandby, FullPower];
@@ -563,6 +582,10 @@ fn all_scenarios() -> Vec<ScenarioName> {
 /// The Rust enum and the TypeScript union must have identical wire members.
 fn check_enum<E: serde::Serialize + serde::de::DeserializeOwned>(c: &TsContract, ts_name: &str, all: &[E]) -> Result<(), String> {
     let ts = c.enums.get(ts_name).ok_or_else(|| format!("TypeScript enum {ts_name} missing"))?;
+    check_enum_members(ts_name, ts, all)
+}
+
+fn check_enum_members<E: serde::Serialize + serde::de::DeserializeOwned>(ts_name: &str, ts: &[String], all: &[E]) -> Result<(), String> {
     let rust: Vec<String> = all
         .iter()
         .map(|e| serde_json::to_value(e).unwrap().as_str().expect("unit enum serialises as a string").to_string())
@@ -585,6 +608,9 @@ fn check_enums(c: &TsContract) -> Result<(), String> {
     check_enum(c, "LevelControlMode", &all_level_control_modes())?;
     check_enum(c, "Severity", &all_severities())?;
     check_enum(c, "ScenarioName", &all_scenarios())?;
+    let kind_ty = c.interfaces.get("AnnEvent").and_then(|f| f.iter().find(|(k, _)| k == "kind")).map(|(_, t)| t.as_str());
+    let kinds = kind_ty.and_then(inline_union).ok_or("TypeScript AnnEvent.kind is not a string union")?;
+    check_enum_members("AnnEvent.kind", &kinds, &all_ann_kinds())?;
     let mapped: HashSet<&str> = ["ModeSwitch", "LevelControlMode", "Severity", "ScenarioName"].into();
     match c.enums.keys().find(|k| !mapped.contains(k.as_str())) {
         Some(k) => Err(format!("TypeScript enum {k} has no Rust enum mapped in check_enums")),
@@ -620,6 +646,16 @@ fn json_contract_matches_ui() {
         check_snapshot(&c, &v).unwrap_or_else(|e| panic!("{label}: {e}"));
         check_snapshot_ts_authoritative(&c, &v).unwrap_or_else(|e| panic!("{label}: {e}"));
     }
+    // The event pull result (not part of a snapshot); cold shutdown starts with an alarm.
+    let sim = Sim::new(ScenarioName::ColdShutdown);
+    let pulled = serde_json::to_value(sim.ann_events_since(sim.run_id, 0).unwrap()).unwrap();
+    assert!(!pulled["events"].as_array().unwrap().is_empty());
+    check_value(&c, "pull", "AnnEventsSince", &pulled).unwrap();
+    let deser = |m: &Value| -> Result<Value, String> {
+        let s: AnnEventsSince = serde_json::from_value(m.clone()).map_err(|e| e.to_string())?;
+        serde_json::to_value(s).map_err(|e| e.to_string())
+    };
+    probe_ts(&c, &pulled, "", "pull", "AnnEventsSince", &deser).unwrap();
 }
 
 #[test]
@@ -866,6 +902,10 @@ fn non_finite_commands_and_steps_are_rejected_without_side_effects() {
     let mut sim = Sim::new(ScenarioName::ColdShutdown);
     let strip_alarms = |mut v: Value| {
         v["alarms"] = Value::Null;
+        // The rejection events themselves (and the revision count) are expected changes.
+        for k in ["annHead", "annTail", "rev"] {
+            v[k] = Value::Null;
+        }
         v
     };
     let before = strip_alarms(serde_json::to_value(sim.snapshot()).unwrap());
