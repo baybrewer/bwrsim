@@ -13,6 +13,8 @@ import type {
   Snapshot,
 } from "./types";
 import { RUN_CHANGED } from "./logic/protocol.ts";
+import { LEVEL_MODE_LABELS, MODE_LABELS, SCENARIO_LABELS } from "./logic/labels.ts";
+import { SEVERITIES } from "./logic/log.ts";
 
 const RATED_MWT = 870;
 const BETA = 650; // pcm
@@ -135,23 +137,101 @@ function isObj(x: unknown): x is Record<string, unknown> {
   return typeof x === "object" && x !== null && !Array.isArray(x);
 }
 
-/** Shape check for an untrusted exported state (save files). */
+const ANN_KINDS: readonly string[] = ["onset", "clear", "changed"];
+/** Snapshot fields that are null in the blank template, with the type they carry when set. */
+const NULLABLE: Record<string, "number" | "string"> = {
+  scramReason: "string",
+  modelError: "string",
+  "neutronics.periodS": "number",
+  "neutronics.kineticsFault": "string",
+  "rods.selected": "number",
+};
+const ENUMS: Record<string, readonly string[]> = {
+  scenario: Object.keys(SCENARIO_LABELS),
+  modeSwitch: Object.keys(MODE_LABELS),
+  "feedwater.levelControlMode": Object.keys(LEVEL_MODE_LABELS),
+};
+
+function isAlarm(x: unknown): x is Alarm {
+  return isObj(x) && typeof x.id === "string" && typeof x.text === "string" && SEVERITIES.includes(x.severity as Severity) && typeof x.acked === "boolean";
+}
+
+function isAnnEvent(x: unknown): x is AnnEvent {
+  return (
+    isObj(x) &&
+    Number.isInteger(x.seq) &&
+    (x.seq as number) > 0 &&
+    Number.isFinite(x.timeS) &&
+    ANN_KINDS.includes(x.kind as string) &&
+    typeof x.key === "string" &&
+    typeof x.text === "string" &&
+    SEVERITIES.includes(x.severity as Severity)
+  );
+}
+
+/** Snapshot lists whose length varies; every other array has the template's fixed length. */
+const VARIABLE_LISTS: Record<string, (x: unknown) => boolean> = { alarms: isAlarm, annTail: isAnnEvent };
+
+/**
+ * First path where `x` departs from the blank-snapshot template (types, nested objects,
+ * fixed array lengths, enums), or null. The template is the SSOT for the Snapshot shape
+ * the mock publishes, so a restored state can be stepped and rendered like a fresh one.
+ */
+function shapeError(tpl: unknown, x: unknown, path: string): string | null {
+  const bad = path || "snapshot";
+  if (path in ENUMS) return typeof x === "string" && ENUMS[path].includes(x) ? null : bad;
+  if (path in VARIABLE_LISTS) return Array.isArray(x) && x.every(VARIABLE_LISTS[path]) ? null : bad;
+  if (tpl === null) {
+    const kind = NULLABLE[path];
+    return x === null || (kind === "number" ? Number.isFinite(x) : typeof x === kind) ? null : bad;
+  }
+  if (typeof tpl === "number") return Number.isFinite(x) ? null : bad;
+  if (typeof tpl !== "object") return typeof x === typeof tpl ? null : bad;
+  if (Array.isArray(tpl)) {
+    if (!Array.isArray(x) || x.length !== tpl.length) return bad;
+    for (let i = 0; i < tpl.length; i++) {
+      const err = shapeError(tpl[i], x[i], path);
+      if (err) return `${err}[${i}]`;
+    }
+    return null;
+  }
+  if (!isObj(x)) return bad;
+  for (const [k, v] of Object.entries(tpl)) {
+    const err = shapeError(v, x[k], path ? `${path}.${k}` : k);
+    if (err) return err;
+  }
+  return null;
+}
+
+/**
+ * Full check of an untrusted exported state (save files): the snapshot against the
+ * template, every Hidden field, and the annunciator ring. Run before staging a load so a
+ * damaged state is rejected while the active sim is untouched (C2/C5).
+ */
 export function parseMockState(x: unknown): MockState | Error {
   if (!isObj(x)) return new Error("mock state: not an object");
   if (x.mockVersion !== MOCK_STATE_VERSION) return new Error(`mock state: unsupported version ${String(x.mockVersion)}`);
   const { snapshot: s, hidden: h } = x;
   if (!Number.isFinite(x.phase)) return new Error("mock state: phase not finite");
-  if (!isObj(s) || !Number.isFinite(s.timeS) || !Number.isFinite(s.rev) || !Number.isFinite(s.speed)) return new Error("mock state: bad snapshot");
-  const rods = s.rods as Record<string, unknown> | undefined;
-  const fw = s.feedwater as Record<string, unknown> | undefined;
-  if (!isObj(rods) || !Array.isArray(rods.positions) || rods.positions.length !== LAYOUT.length || !Array.isArray(rods.targets) || rods.targets.length !== LAYOUT.length)
-    return new Error("mock state: rod vectors do not match the core layout");
-  if (!isObj(fw) || !Array.isArray(fw.pumps) || fw.pumps.length !== N_FEED || !Array.isArray(s.ic) || s.ic.length !== 3 || !Array.isArray(s.alarms))
-    return new Error("mock state: equipment counts do not match");
+  const bad = shapeError(blankSnapshot(), s, "");
+  if (bad) return new Error(`mock state: bad snapshot field ${bad}`);
   if (!isObj(h)) return new Error("mock state: hidden state missing");
   for (const k of HIDDEN_NUMBERS) if (!Number.isFinite(h[k])) return new Error(`mock state: hidden.${k} not finite`);
-  const pairs = (v: unknown) => Array.isArray(v) && v.every((e) => Array.isArray(e) && e.length === 2 && typeof e[0] === "string" && isObj(e[1]));
-  if (!pairs(h.alarmState) || !pairs(h.annPrev) || !Array.isArray(h.annRing)) return new Error("mock state: alarm state malformed");
+  const pairs = (v: unknown, ok: (key: string, val: unknown) => boolean) =>
+    Array.isArray(v) && v.every((e) => Array.isArray(e) && e.length === 2 && typeof e[0] === "string" && ok(e[0], e[1]));
+  if (!pairs(h.alarmState, (id, a) => isAlarm(a) && a.id === id)) return new Error("mock state: alarm state malformed");
+  const visible = (_: string, v: unknown) => isObj(v) && typeof v.text === "string" && SEVERITIES.includes(v.severity as Severity);
+  if (!pairs(h.annPrev, visible)) return new Error("mock state: annunciator baseline malformed");
+  // The ring is the engine's: ascending seqs, at most ANN_RING_LEN, none beyond the issued head.
+  const ring = h.annRing;
+  const annSeq = h.annSeq as number;
+  if (!Number.isInteger(annSeq) || annSeq < 0) return new Error("mock state: hidden.annSeq not a sequence number");
+  if (
+    !Array.isArray(ring) ||
+    ring.length > ANN_RING_LEN ||
+    !ring.every((e, i) => isAnnEvent(e) && (i === 0 || e.seq > (ring[i - 1] as AnnEvent).seq) && e.seq <= annSeq)
+  )
+    return new Error("mock state: annunciator ring malformed");
   return x as unknown as MockState;
 }
 
@@ -535,14 +615,12 @@ export class MockSim {
         if (s.ic[cmd.index]) s.ic[cmd.index].commandOpen = cmd.open;
         break;
       case "ackAlarms":
+        // Acknowledges the active alarms (the only ones listed); updateAlarms republishes them.
         for (const a of this.h.alarmState.values()) a.acked = true;
-        s.alarms = [...this.h.alarmState.values()].map((a) => ({ ...a }));
         break;
     }
     // Engine apply: one revision per command, then the annunciator diff (this.s may be a new run).
-    this.s.rev++;
-    this.updateAlarms();
-    this.recordAnnunciator();
+    this.stepOutcome();
     this.emit();
   }
 
@@ -677,7 +755,10 @@ export class MockSim {
         const dt = Math.min(0.05, remaining);
         this.step(dt);
         remaining -= dt;
-        if (s.paused) break; // a model-domain error pauses mid-tick
+        // One engine step outcome per substep (C1/C5): its own revision and annunciator diff,
+        // so an alarm that comes and goes between publishes is still sequenced, at its own time.
+        this.stepOutcome();
+        if (s.paused) break; // a model-domain error pauses mid-tick, after its outcome is recorded
       }
     }
     // The mock steps each tick's time synchronously and drops late timer time rather
@@ -690,12 +771,15 @@ export class MockSim {
     // The first sample after start or resume seeds the filter instead of ramping from zero.
     const alpha = s.effectiveSpeed === 0 ? 1 : Math.min(1, wallDt / EFFECTIVE_SPEED_TAU_S);
     s.effectiveSpeed = s.paused ? 0 : s.effectiveSpeed + (rate - s.effectiveSpeed) * alpha;
-    if (stepped) {
-      s.rev++;
-      this.updateAlarms();
-      this.recordAnnunciator();
-    }
+    // Published once per timer tick, like the host's fixed publish rate.
     this.emit();
+  }
+
+  /** Engine apply bookkeeping after a command or a step: one revision, then the annunciator diff. */
+  private stepOutcome() {
+    this.s.rev++;
+    this.updateAlarms();
+    this.recordAnnunciator();
   }
 
   private computeReactivity() {
@@ -997,18 +1081,18 @@ export class MockSim {
       ["genOff", "GENERATOR BREAKER OPEN", "info", !s.turbine.breakerClosed],
       ["vent", "RPV HEAD VENT OPEN", "info", v.headVentOpen && v.pressureMpa > 0.11],
       ["modeShut", "MODE SWITCH IN SHUTDOWN", "info", s.modeSwitch === "shutdown"],
+      ["model", "PHYSICS MODEL LIMIT - SIM HALTED", "alarm", s.modelError !== null],
     ];
-    const st = this.h.alarmState;
+    // Engine semantics: the visible list is the active conditions only. A cleared alarm drops
+    // out whether or not it was acknowledged, so its clear is an event and a recurrence is a
+    // fresh, unacknowledged onset; an acknowledgement lasts while the condition stays active.
+    const prev = this.h.alarmState;
+    const next: Hidden["alarmState"] = new Map();
     for (const [id, text, severity, active] of cond) {
-      const existing = st.get(id);
-      if (active) {
-        if (existing) existing.text = text;
-        else st.set(id, { id, text, severity, acked: false });
-      } else if (existing && existing.acked) {
-        st.delete(id);
-      }
+      if (active) next.set(id, { id, text, severity, acked: prev.get(id)?.acked ?? false });
     }
-    s.alarms = [...st.values()].map((a) => ({ ...a }));
+    this.h.alarmState = next;
+    s.alarms = [...next.values()].map((a) => ({ ...a }));
   }
 
   /** Head-space volume above the inventory, shrinking as the level rises. */

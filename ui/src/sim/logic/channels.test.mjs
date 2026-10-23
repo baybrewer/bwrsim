@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CHANNELS, CHANNEL_GROUPS, MINI_CHARTS, channelById, readChannel } from "./channels.ts";
+import { CHANNELS, CHANNEL_GROUPS, MINI_CHARTS, channelById, readChannel, shortLabel } from "./channels.ts";
 import { fakeSnapshot } from "./testkit.mjs";
 
 test("registry ids are unique and every group is used", () => {
@@ -35,4 +35,10 @@ test("null and non-finite readings are missing", () => {
   const n = fakeSnapshot().neutronics;
   assert.equal(readChannel(period, fakeSnapshot({ neutronics: { ...n, periodS: 42 } })), 42);
   assert.equal(readChannel(channelById("fuelTempC"), fakeSnapshot({ neutronics: { ...n, fuelTempC: NaN } })), null);
+});
+
+test("short labels: registry tag, else the label's first word", () => {
+  assert.equal(shortLabel(channelById("steamFlowKgs")), "STM");
+  assert.equal(shortLabel(channelById("feedFlowKgs")), "FW");
+  assert.equal(shortLabel(channelById("pressureMpa")), "RX");
 });

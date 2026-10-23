@@ -12,7 +12,7 @@ import { EventLog, LOG_CAP } from "./log.ts";
 import { SCENARIO_LABELS } from "./labels.ts";
 import type { RunRecord } from "./runRecord.ts";
 import { RUN_RECORD_VERSION, validateRunRecord } from "./runRecord.ts";
-import type { SimBackend } from "./protocol.ts";
+import type { LoadPrepared, SimBackend } from "./protocol.ts";
 import { RUN_CHANGED, isRunChanged, toError } from "./protocol.ts";
 
 /** Immutable view handed to React; replaced on every change. */
@@ -53,6 +53,23 @@ interface PendingLoad {
   runId: number;
   record: RunRecord;
   name: string;
+  /** Built from the record before commit, so installing the restored run cannot fail on it. */
+  hist: History;
+  log: EventLog;
+}
+
+/** An action sent while a scenario load is in flight: it executes in the new run, so it is logged there. */
+interface BufferedAction {
+  cmd: Command;
+  wallMs: number;
+  rejected: string | null;
+}
+
+/** A sent loadScenario not yet seen as a new run, with the actions queued behind it. */
+interface ScenarioTicket {
+  actions: BufferedAction[];
+  /** The backend has applied this load (its send resolved). */
+  done: boolean;
 }
 
 /** True when `events` (plus nothing older) continue the log right after `consumed`. */
@@ -75,7 +92,8 @@ export class RunStore {
   private queue: Item[] = [];
   private blocked = false;
 
-  private expectedScenarioLoads = 0;
+  /** Scenario loads in flight, oldest first (the backend applies commands in send order). */
+  private scenarioTickets: ScenarioTicket[] = [];
   private pendingLoad: PendingLoad | null = null;
   /** A run the engine reported as replaced (RunChanged): its late snapshots are dropped. */
   private goneRunId: number | null = null;
@@ -158,6 +176,10 @@ export class RunStore {
   private processSnapshot(s: Snapshot): Promise<void> | null {
     const cur = this.view.runId;
     if (cur === null || s.runId !== cur) {
+      // Checked before anything is replaced: a snapshot the store cannot ingest must not
+      // leave a half-installed run (or consume the pending load's record).
+      if (cur !== null && s.runId < cur) return null;
+      this.probe(s);
       if (!this.acceptRun(s)) return null;
     } else if (s.runId === this.goneRunId || s.rev < this.lastRev) {
       return null;
@@ -187,9 +209,27 @@ export class RunStore {
       this.startRun(s, `Run start: ${SCENARIO_LABELS[s.scenario]}`);
       return true;
     }
-    if (this.expectedScenarioLoads > 0) {
-      this.expectedScenarioLoads--;
+    if (this.scenarioTickets.length > 0) {
+      // Several loads can complete between two desktop publishes (10 Hz): the run on
+      // screen is the latest *applied* one; earlier applied loads were superseded before
+      // they ever published. If none has resolved yet, the snapshot raced its invoke
+      // reply and belongs to the oldest load.
+      const lastDone = this.scenarioTickets.map((t) => t.done).lastIndexOf(true);
+      const idx = Math.max(0, lastDone);
+      const superseded = this.scenarioTickets.splice(0, idx);
+      const ticket = this.scenarioTickets.shift()!;
       this.startRun(s, `Scenario ${SCENARIO_LABELS[s.scenario]} loaded`);
+      const lost = superseded.reduce((n, t) => n + t.actions.length, 0);
+      if (superseded.length > 0) {
+        // Those actions ran in a run that never published; there is no log to put them in.
+        this.eventLog.logSystem(
+          `${superseded.length} earlier scenario load(s) replaced before display` + (lost ? `; ${lost} action(s) taken in them are not logged` : ""),
+          s.timeS,
+          this.now(),
+          "warning",
+        );
+      }
+      for (const a of ticket.actions) this.logBuffered(a, s);
       return true;
     }
     if (this.goneRunId === cur) {
@@ -214,12 +254,25 @@ export class RunStore {
 
   private installLoaded(load: PendingLoad, s: Snapshot): void {
     const rec = load.record;
-    this.hist = History.fromJSON(rec.history, this.channels);
+    this.hist = load.hist;
     // The restored engine keeps its event sequence under the new runId.
-    this.eventLog = EventLog.fromEntries(rec.log, s.runId, rec.annConsumed, this.logCap);
+    this.eventLog = load.log;
+    this.eventLog.bindRun(s.runId, rec.annConsumed);
     this.eventLog.seedBaseline(s);
     this.eventLog.logSystem(`Loaded save "${load.name}"`, s.timeS, this.now());
     this.beginRunState(s.runId, rec.runScenario);
+  }
+
+  /**
+   * Feeds `s` through the store's consumers on throwaway copies; throws where a real
+   * ingest would. Only run changes pay for it (they replace the run, which cannot be undone).
+   */
+  private probe(s: Snapshot): void {
+    new History(this.channels).ingest(s, true);
+    const log = new EventLog(this.logCap);
+    log.logAnnEvents(s.runId, s.annTail, 0);
+    log.observeSnapshot(s, 0);
+    continues(s.annTail, 0, s.annHead);
   }
 
   private beginRunState(runId: number, scenario: ScenarioName): void {
@@ -284,20 +337,57 @@ export class RunStore {
   /** Logs the action and sends it through the ordered queue. Rejections are logged and rethrown. */
   send(cmd: Command): Promise<void> {
     // A scenario load starts a new run whose first entry records it; nothing goes into the old log.
-    if (cmd.type === "loadScenario") this.expectedScenarioLoads++;
-    else if (this.view.runId !== null) {
+    // Commands sent behind it execute in that new run, so they wait for it to be installed.
+    const ticket: ScenarioTicket | null = cmd.type === "loadScenario" ? { actions: [], done: false } : null;
+    const pendingTicket = this.scenarioTickets.at(-1);
+    let buffered: BufferedAction | null = null;
+    if (ticket) this.scenarioTickets.push(ticket);
+    else if (pendingTicket) {
+      buffered = { cmd, wallMs: this.now(), rejected: null };
+      pendingTicket.actions.push(buffered);
+    } else if (this.view.runId !== null) {
       this.eventLog.logAction(cmd, this.view.snapshot, this.now());
       this.touch();
     }
-    return this.backend.send(cmd).catch((e: unknown) => {
+    return this.backend.send(cmd).then(() => {
+      if (ticket) ticket.done = true;
+    }, (e: unknown) => {
       const err = toError(e);
-      if (cmd.type === "loadScenario") this.expectedScenarioLoads = Math.max(0, this.expectedScenarioLoads - 1);
-      if (this.view.runId !== null) {
+      if (ticket) this.dropTicket(ticket);
+      if (buffered && this.isBuffered(buffered)) {
+        // Still waiting for its run: the note follows the action when the action is logged.
+        buffered.rejected = err.message;
+      } else if (this.view.runId !== null) {
         this.eventLog.logSystem(`Command rejected: ${err.message}`, this.view.snapshot?.timeS ?? 0, this.now(), "warning");
         this.touch();
       }
       throw err;
     });
+  }
+
+  /**
+   * A scenario load failed: the commands queued behind it ran in the run before it, which
+   * is the previous in-flight load's new run, or else the current run.
+   */
+  private dropTicket(ticket: ScenarioTicket): void {
+    const i = this.scenarioTickets.indexOf(ticket);
+    if (i < 0) return;
+    this.scenarioTickets.splice(i, 1);
+    const previous = i > 0 ? this.scenarioTickets[i - 1] : null;
+    if (previous) previous.actions.push(...ticket.actions);
+    else if (this.view.runId !== null) {
+      for (const a of ticket.actions) this.logBuffered(a, this.view.snapshot);
+      this.touch();
+    }
+  }
+
+  private isBuffered(a: BufferedAction): boolean {
+    return this.scenarioTickets.some((t) => t.actions.includes(a));
+  }
+
+  private logBuffered(a: BufferedAction, s: Snapshot | null): void {
+    this.eventLog.logAction(a.cmd, s, a.wallMs);
+    if (a.rejected !== null) this.eventLog.logSystem(`Command rejected: ${a.rejected}`, s?.timeS ?? 0, a.wallMs, "warning");
   }
 
   listSaves(): Promise<SaveList> {
@@ -342,24 +432,36 @@ export class RunStore {
   async load(id: string, name: string): Promise<Snapshot> {
     const saves = this.backend.saves;
     const prep = await saves.loadPrepare(id);
-    const record = validateRunRecord(prep.ui);
-    if (record instanceof Error) {
-      await saves.loadAbort(prep.token).catch(() => undefined);
-      throw record;
-    }
-    this.pendingLoad = { runId: prep.snapshot.runId, record, name };
-    let snap: Snapshot;
+    // Everything that can reject the restored run is checked before commit (C2/C5): after
+    // it the engine has dropped the current run, so a later failure could only lose it.
+    let pending: PendingLoad;
     try {
-      snap = await saves.loadCommit(prep.token);
+      pending = this.prepareLoad(prep, name);
     } catch (e) {
-      this.pendingLoad = null;
+      await saves.loadAbort(prep.token).catch(() => undefined);
       throw toError(e);
     }
+    this.pendingLoad = pending;
+    // A failed commit keeps pendingLoad: if the engine did switch, its run still installs
+    // with the record instead of being adopted later as an unexpected run without it.
+    const snap = await saves.loadCommit(prep.token).catch((e: unknown) => {
+      throw toError(e);
+    });
     // The subscription may not have delivered the restored run yet; install from the commit result.
     if (this.view.runId !== snap.runId) {
       if (this.pendingLoad) this.pendingLoad.runId = snap.runId;
       this.ingest(snap);
     }
     return snap;
+  }
+
+  private prepareLoad(prep: LoadPrepared, name: string): PendingLoad {
+    const record = validateRunRecord(prep.ui);
+    if (record instanceof Error) throw record;
+    const s = prep.snapshot;
+    this.probe(s);
+    const hist = History.fromJSON(record.history, this.channels);
+    const log = EventLog.fromEntries(record.log, s.runId, record.annConsumed, this.logCap);
+    return { runId: s.runId, record, name, hist, log };
   }
 }

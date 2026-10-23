@@ -292,3 +292,82 @@ test("serial queue: jobs run in order and a failure does not block the next", as
   await fast;
   assert.deepEqual(order, [1, 2, 3]);
 });
+
+test("run store: actions sent behind a scenario load are logged in the new run; a failed load keeps them in the current one", async () => {
+  const { be, store } = setup();
+  be.publish(snap(1, 1, 5));
+  const plain = be.send;
+  be.send = async (cmd) => {
+    await plain(cmd);
+    if (cmd.type === "rodStop") throw new Error("ROD BLOCK");
+  };
+  // START, then commands before the new run's first (10 Hz) publish: they execute in the new run.
+  await store.send({ type: "loadScenario", name: "fullPower" });
+  await store.send({ type: "setSpeed", speed: 10 });
+  await assert.rejects(store.send({ type: "rodStop" }), /ROD BLOCK/);
+  assert.ok(!store.log.entries.some((e) => e.kind === "action" || /rejected/.test(e.text)), "nothing in the old run");
+  be.publish(snap(2, 1, 0, 0, { scenario: "fullPower" }));
+  assert.deepEqual(
+    store.log.entries.map((e) => [e.kind, e.text, e.simTimeS]),
+    [
+      ["system", "Scenario FULL POWER loaded", 0],
+      ["action", "Sim speed 10x", 0],
+      ["action", "Rod motion stop", 0],
+      ["system", "Command rejected: ROD BLOCK", 0],
+    ],
+  );
+
+  // A rejected scenario load: what was queued behind it ran in the current run.
+  let fail;
+  be.send = (cmd) => (cmd.type === "loadScenario" ? new Promise((_, reject) => (fail = reject)) : plain(cmd));
+  const failing = store.send({ type: "loadScenario", name: "coldShutdown" });
+  await store.send({ type: "manualScram" });
+  assert.ok(!store.log.entries.some((e) => e.text === "Manual scram"));
+  fail(new Error("load refused"));
+  await assert.rejects(failing, /load refused/);
+  assert.deepEqual(store.log.entries.slice(-2).map((e) => [e.kind, e.text]), [
+    ["action", "Manual scram"],
+    ["system", "Command rejected: load refused"],
+  ]);
+  be.publish(snap(3, 1, 0));
+  assert.equal(store.getSnapshot().runId, 2, "no scenario load is expected any more");
+});
+
+test("run store: two scenario loads applied before one publish install the latest; no ticket is left buffering", async () => {
+  const { be, store } = setup();
+  be.publish(snap(1, 1, 5));
+  // Both loads complete between two desktop publishes; only the second run ever publishes.
+  await store.send({ type: "loadScenario", name: "fullPower" });
+  await store.send({ type: "setSpeed", speed: 10 });
+  await store.send({ type: "loadScenario", name: "coldShutdown" });
+  await store.send({ type: "manualScram" });
+  be.publish(snap(3, 1, 0, 0, { scenario: "coldShutdown" }));
+  const texts = store.log.entries.map((e) => [e.kind, e.text]);
+  assert.deepEqual(texts[0], ["system", "Scenario COLD SHUTDOWN loaded"]);
+  assert.ok(texts.some(([k, x]) => k === "system" && /1 earlier scenario load\(s\) replaced before display; 1 action/.test(x)));
+  assert.ok(texts.some(([k, x]) => k === "action" && x === "Manual scram"), "the final run's action is logged");
+  assert.ok(!texts.some(([, x]) => x === "Sim speed 10x"), "the superseded run's action is not put in this run");
+  // Nothing is left buffering: a later action is logged straight away.
+  await store.send({ type: "rodStop" });
+  assert.equal(store.log.entries.at(-1).text, "Rod motion stop");
+});
+
+test("run store: a staged snapshot the store cannot ingest aborts the load before commit; the run is intact", async () => {
+  const { be, store } = setup();
+  for (let t = 0; t <= 3; t++) be.publish(snap(1, t + 1, t, 1));
+  const before = { runId: store.getSnapshot().runId, record: JSON.stringify(store.buildRecord()) };
+  const damaged = snap(2, 40, 50, 3, { paused: true });
+  delete damaged.neutronics;
+  const aborted = [];
+  be.saves = {
+    loadPrepare: async () => ({ token: "t", ui: savedRecord(), snapshot: damaged }),
+    loadCommit: async () => assert.fail("must not commit"),
+    loadAbort: async (t) => void aborted.push(t),
+  };
+  await assert.rejects(store.load("s_0123456789abcdef", "x"));
+  assert.deepEqual(aborted, ["t"]);
+  // Even if such a snapshot is published, it neither installs nor consumes anything.
+  assert.throws(() => be.publish(damaged));
+  assert.equal(store.getSnapshot().runId, before.runId);
+  assert.equal(JSON.stringify(store.buildRecord()), before.record);
+});

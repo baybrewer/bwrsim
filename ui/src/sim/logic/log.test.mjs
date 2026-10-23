@@ -137,3 +137,19 @@ test("cap drops the oldest entries behind a single truncation note", () => {
   assert.equal(dropped + e.length - 1, 250);
   assert.ok(!(validateLogEntries(log.toJSON()) instanceof Error), "seq stays increasing");
 });
+
+test("byTime orders entries by (simTimeS, seq) across out-of-order appends, restore and truncation", () => {
+  const log = new EventLog(20);
+  log.logSystem("start", 10, 0);
+  log.logAnnEvents(1, [{ seq: 1, timeS: 0, kind: "onset", key: "cond:a", text: "A", severity: "alarm" }], 0);
+  log.logSystem("later", 10, 0);
+  log.logSystem("mid", 5, 0);
+  const order = (l) => l.byTime.map((e) => [e.simTimeS, e.seq]);
+  assert.deepEqual(order(log), [[0, 2], [5, 4], [10, 1], [10, 3]]);
+  assert.deepEqual(log.entries.map((e) => e.seq), [1, 2, 3, 4], "log order untouched");
+  assert.deepEqual(order(EventLog.fromEntries(log.toJSON(), 1, 1, 20)), order(log));
+  for (let i = 0; i < 40; i++) log.logSystem(`n${i}`, 40 - i, 0);
+  const idx = log.byTime;
+  assert.equal(idx.length, log.entries.length);
+  assert.ok(idx.every((e, i) => i === 0 || idx[i - 1].simTimeS < e.simTimeS || (idx[i - 1].simTimeS === e.simTimeS && idx[i - 1].seq < e.seq)));
+});

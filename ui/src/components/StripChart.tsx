@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import type React from "react";
 import type { HistoryQueryResult } from "../sim/logic/history.ts";
 import { noNegZero } from "../util/format";
 
@@ -27,6 +28,9 @@ export function StripChart(props: {
   yMin?: number;
   yMax?: number;
   digits?: number;
+  /** Makes the whole chart a button (e.g. open the full trend page). */
+  onOpen?: () => void;
+  openLabel?: string;
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const { series, windowS } = props;
@@ -76,7 +80,9 @@ export function StripChart(props: {
         hi = 1;
       }
       const span = hi - lo;
-      const minSpan = Math.max(Math.abs(hi) * 0.02, 1e-3);
+      // Same 1-unit floor as the TRENDS page (trends/axis.ts fitRange): a flat zero
+      // signal otherwise gets a +/-5e-4 axis.
+      const minSpan = Math.max(Math.abs(hi) * 0.02, Math.abs(lo) * 0.02, 1);
       if (span < minSpan) {
         const mid = (hi + lo) / 2;
         lo = props.yMin ?? mid - minSpan / 2;
@@ -150,7 +156,22 @@ export function StripChart(props: {
   });
 
   return (
-    <div className="strip">
+    <div
+      className={`strip${props.onOpen ? " strip-link" : ""}`}
+      {...(props.onOpen && {
+        role: "button",
+        tabIndex: 0,
+        title: props.openLabel,
+        "aria-label": props.openLabel ?? props.title,
+        onClick: props.onOpen,
+        onKeyDown: (e: React.KeyboardEvent) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            props.onOpen?.();
+          }
+        },
+      })}
+    >
       <div className="strip-head">
         <span className="strip-title">{props.title}</span>
         <span className="strip-vals">

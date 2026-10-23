@@ -9,6 +9,8 @@ export type ChannelGroup = "Reactor" | "Vessel" | "Steam/Feed" | "Turbine" | "Co
 export interface Channel {
   id: string;
   label: string;
+  /** Few-letter tag for tight spaces (the mini charts); defaults to the label's first word. */
+  short?: string;
   unit: string;
   digits: number;
   color: string;
@@ -44,8 +46,8 @@ export const CHANNELS: readonly Channel[] = [
   // Saturation temperature at vessel pressure is the steam dome temperature.
   { id: "domeTempC", label: "Dome temp", unit: "°C", digits: 1, color: COLOR.pink, group: "Vessel", get: (s) => s.vessel.coolantTempC },
 
-  { id: "steamFlowKgs", label: "Steam flow", unit: "kg/s", digits: 0, color: COLOR.red, group: "Steam/Feed", get: (s) => s.vessel.steamFlowKgs },
-  { id: "feedFlowKgs", label: "Feed flow", unit: "kg/s", digits: 0, color: COLOR.cyan, group: "Steam/Feed", get: (s) => s.vessel.feedFlowKgs },
+  { id: "steamFlowKgs", label: "Steam flow", short: "STM", unit: "kg/s", digits: 0, color: COLOR.red, group: "Steam/Feed", get: (s) => s.vessel.steamFlowKgs },
+  { id: "feedFlowKgs", label: "Feed flow", short: "FW", unit: "kg/s", digits: 0, color: COLOR.cyan, group: "Steam/Feed", get: (s) => s.vessel.feedFlowKgs },
   { id: "feedTempC", label: "Feed temp", unit: "°C", digits: 0, color: COLOR.amber, group: "Steam/Feed", get: (s) => s.feedwater.feedTempC },
 
   { id: "turbineSpeedRpm", label: "Turbine speed", unit: "rpm", digits: 0, color: COLOR.lime, group: "Turbine", get: (s) => s.turbine.speedRpm },
@@ -56,6 +58,11 @@ export const CHANNELS: readonly Channel[] = [
 ];
 
 const BY_ID = new Map(CHANNELS.map((c) => [c.id, c]));
+
+/** Tag for tight spaces: the registry `short`, else the first word of the label. */
+export function shortLabel(c: Channel): string {
+  return c.short ?? c.label.split(" ")[0].toUpperCase();
+}
 
 export function channelById(id: string): Channel | undefined {
   return BY_ID.get(id);

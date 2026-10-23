@@ -21,7 +21,7 @@ export const LOG_CAP = 20_000;
 export const GROUP_WINDOW_MS = 2000;
 
 const LOG_KINDS: readonly LogKind[] = ["action", "alarm", "clear", "changed", "system"];
-const SEVERITIES: readonly Severity[] = ["info", "warning", "alarm", "trip"];
+export const SEVERITIES: readonly Severity[] = ["info", "warning", "alarm", "trip"];
 
 function onOff(on: boolean, onText: string, offText: string): string {
   return on ? onText : offText;
@@ -167,8 +167,15 @@ export function summarizeGroup(entries: readonly LogEntry[]): string {
  * The log of one run. Owns entry numbering, action grouping, annunciator dedup
  * (by run id + event seq) and scram/model-error edge detection.
  */
+/** (simTimeS, seq) order: the trend markers' time axis. */
+function byTimeThenSeq(a: LogEntry, b: LogEntry): number {
+  return a.simTimeS - b.simTimeS || a.seq - b.seq;
+}
+
 export class EventLog {
   private items: LogEntry[] = [];
+  /** The same entries sorted by (simTimeS, seq): log order is not time order (see `byTime`). */
+  private timeIndex: LogEntry[] = [];
   private nextSeq = 1;
   private droppedCount = 0;
   private lastAction: { key: string | null; entry: LogEntry } | null = null;
@@ -185,6 +192,7 @@ export class EventLog {
   static fromEntries(entries: readonly LogEntry[], annRunId: number | null, annConsumed: number, cap = LOG_CAP): EventLog {
     const log = new EventLog(cap);
     log.items = entries.map((e) => ({ ...e }));
+    log.timeIndex = [...log.items].sort(byTimeThenSeq);
     log.nextSeq = entries.reduce((m, e) => Math.max(m, e.seq), 0) + 1;
     log.bindRun(annRunId, annConsumed);
     return log;
@@ -192,6 +200,15 @@ export class EventLog {
 
   get entries(): readonly LogEntry[] {
     return this.items;
+  }
+
+  /**
+   * Entries sorted by (simTimeS, seq), for time-range search. Log (seq) order is not
+   * monotonic in sim time: a run-start note carries the first snapshot's time before the
+   * t=0 initial alarms, and pulled events can be newer than a later system note.
+   */
+  get byTime(): readonly LogEntry[] {
+    return this.timeIndex;
   }
 
   /** Last annunciator seq logged for the bound run (saved in the RunRecord). */
@@ -282,8 +299,26 @@ export class EventLog {
   private push(fields: Omit<LogEntry, "seq">): LogEntry {
     const entry: LogEntry = { seq: this.nextSeq++, ...fields };
     this.items.push(entry);
+    this.indexByTime(entry);
     if (this.items.length > this.cap) this.truncate();
     return entry;
+  }
+
+  /** Inserts a new entry (highest seq) after every entry at or before its time; usually an append. */
+  private indexByTime(entry: LogEntry): void {
+    const idx = this.timeIndex;
+    let lo = 0;
+    let hi = idx.length;
+    if (hi === 0 || idx[hi - 1].simTimeS <= entry.simTimeS) {
+      idx.push(entry);
+      return;
+    }
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (idx[mid].simTimeS <= entry.simTimeS) lo = mid + 1;
+      else hi = mid;
+    }
+    idx.splice(lo, 0, entry);
   }
 
   // Drops a batch (5 % of the cap) at once so a long run does not shift 20 000 entries per event;
@@ -306,6 +341,8 @@ export class EventLog {
       severity: "info",
       text: `Log truncated: ${this.droppedCount} oldest entries dropped (limit ${this.cap})`,
     });
+    // Rare (one batch per cap / 20 entries), so a full rebuild is cheap amortized.
+    this.timeIndex = [...this.items].sort(byTimeThenSeq);
   }
 }
 

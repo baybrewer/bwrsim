@@ -1,7 +1,8 @@
 // Browser mock parity (plan C5): runs the real MockSim and mock save store under Node.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MockSim, MOCK_STATE_VERSION } from "../mock.ts";
+import { MockSim, MOCK_STATE_VERSION, parseMockState } from "../mock.ts";
+import { RunStore } from "./runStore.ts";
 import { createMockSaveStore, memoryStorage, MOCK_SAVES_KEY, STATE_CHANGED } from "../mockSaves.ts";
 
 /** Engine state without the fields a restore is documented to change or that follow wall time. */
@@ -182,4 +183,137 @@ test("mock saves: a storage quota failure fails the write with a clear message",
   const { saves } = makeStore(sim, storage);
   await assert.rejects(save(saves, sim, null, "big"), /browser storage is full .*delete a save/);
   assert.equal((await saves.list()).saves.length, 0);
+});
+
+const annOf = (sim, key) => sim.eventsSince(sim.runId, 0).events.filter((e) => e.key === key);
+
+test("mock: every substep is an engine step outcome; a transient between publishes is sequenced at its own times", () => {
+  const sim = new MockSim();
+  sim.command({ type: "loadScenario", name: "fullPower" });
+  const published = [];
+  const off = sim.subscribe((s) => published.push(s));
+  sim.stop(); // drive ticks by hand
+  const t0 = sim.snapshot().timeS;
+  const rev0 = sim.rev;
+  // Pressure above 7.5 MPa in the first of two 0.05 s substeps only.
+  let n = 0;
+  sim.step = function (dt) {
+    this.s.timeS += dt;
+    this.s.vessel.pressureMpa = n++ === 0 ? 7.6 : 7.2;
+  };
+  published.length = 0;
+  sim.tick(0.1);
+  assert.equal(published.length, 1, "one publish per timer tick");
+  assert.equal(sim.rev, rev0 + 2, "one revision per substep");
+  const ev = annOf(sim, "cond:pressHi");
+  assert.deepEqual(ev.map((e) => e.kind), ["onset", "clear"]);
+  assert.ok(Math.abs(ev[0].timeS - (t0 + 0.05)) < 1e-9 && Math.abs(ev[1].timeS - (t0 + 0.1)) < 1e-9, "substep times");
+
+  // A model halt mid-tick: its outcome is recorded, later substeps do not run.
+  sim.command({ type: "setSpeed", speed: 10 });
+  n = 0;
+  sim.step = function (dt) {
+    this.s.timeS += dt;
+    if (++n === 3) {
+      this.s.modelError = "test halt";
+      this.s.paused = true;
+    }
+  };
+  const before = sim.rev;
+  sim.tick(0.1);
+  assert.equal(n, 3);
+  assert.equal(sim.rev, before + 3);
+  const halt = annOf(sim, "cond:model");
+  assert.equal(halt.length, 1);
+  assert.equal(halt[0].kind, "onset");
+  assert.equal(sim.snapshot().annHead, halt[0].seq, "published head includes the halting substep");
+  off();
+});
+
+test("mock: alarms follow active conditions regardless of ACK; onset/clear/onset without ACK; ACK resets on recurrence", () => {
+  const sim = new MockSim(); // hot standby: pressurized, head vent closed
+  const vent = (open) => sim.command({ type: "setHeadVent", open });
+  const listed = () => sim.snapshot().alarms.find((a) => a.id === "vent");
+  vent(true);
+  vent(false);
+  assert.equal(listed(), undefined, "a cleared, unacknowledged alarm drops out");
+  vent(true);
+  assert.deepEqual(annOf(sim, "cond:vent").map((e) => e.kind), ["onset", "clear", "onset"]);
+  sim.command({ type: "ackAlarms" });
+  assert.equal(listed().acked, true);
+  vent(false);
+  vent(true);
+  assert.equal(listed().acked, false, "a recurrence flashes again");
+  assert.deepEqual(annOf(sim, "cond:vent").map((e) => e.kind), ["onset", "clear", "onset", "clear", "onset"]);
+  // Acknowledging never stamps a clear: only a condition change does.
+  const head = sim.snapshot().annHead;
+  sim.command({ type: "ackAlarms" });
+  assert.equal(sim.snapshot().annHead, head);
+});
+
+test("mock state validation rejects damaged engines: snapshot fields, nested enums, hidden state, annunciator ring", () => {
+  const sim = new MockSim();
+  sim.command({ type: "manualScram" });
+  const good = () => JSON.parse(JSON.stringify(sim.exportState()));
+  assert.ok(!(parseMockState(good()) instanceof Error));
+  const damage = [
+    [(st) => delete st.snapshot.neutronics, /neutronics/],
+    [(st) => (st.snapshot.neutronics.reactivity.xenon = "x"), /neutronics\.reactivity\.xenon/],
+    [(st) => (st.snapshot.modeSwitch = "bogus"), /modeSwitch/],
+    [(st) => (st.snapshot.feedwater.levelControlMode = "auto"), /levelControlMode/],
+    [(st) => (st.snapshot.neutronics.periodS = "fast"), /periodS/],
+    [(st) => (st.snapshot.steam.msivPos = [1]), /msivPos/],
+    [(st) => delete st.snapshot.ic[1].poolEmpty, /ic\.poolEmpty/],
+    [(st) => (st.snapshot.alarms[0].severity = "loud"), /alarms/],
+    [(st) => (st.snapshot.annTail[0].kind = "boom"), /annTail/],
+    [(st) => delete st.hidden.omega, /hidden\.omega/],
+    [(st) => (st.hidden.alarmState[0][1].acked = "yes"), /alarm state/],
+    [(st) => (st.hidden.annPrev[0][1] = null), /baseline/],
+    [(st) => st.hidden.annRing.reverse(), /ring/],
+    [(st) => (st.hidden.annSeq = 1), /ring/],
+  ];
+  for (const [hurt, msg] of damage) {
+    const st = good();
+    hurt(st);
+    const r = parseMockState(st);
+    assert.ok(r instanceof Error, `rejected: ${msg}`);
+    assert.match(r.message, msg);
+  }
+});
+
+test("mock saves: a damaged engine save is rejected before commit; the run store keeps the original run", async () => {
+  const sim = new MockSim();
+  const { saves, storage } = makeStore(sim);
+  const backend = {
+    kind: "mock",
+    subscribe: (cb) => sim.subscribe(cb),
+    send: async (cmd) => sim.command(cmd),
+    eventsSince: async (runId, seq) => sim.eventsSince(runId, seq),
+    saves,
+  };
+  const store = new RunStore(backend);
+  const off = store.connect();
+  sim.stop(); // drive ticks by hand
+  try {
+    run(sim, 30);
+    const session = await store.beginSave();
+    const meta = await store.commitSave(session, null, "good");
+    await store.finishSave(session);
+    run(sim, 30);
+    const raw = JSON.parse(storage.getItem(MOCK_SAVES_KEY));
+    delete raw.slots[meta.id].engine.snapshot.neutronics;
+    storage.setItem(MOCK_SAVES_KEY, JSON.stringify(raw));
+
+    const view = store.getSnapshot();
+    const before = { runId: view.runId, simRun: sim.runId, timeS: view.snapshot.timeS, record: JSON.stringify(store.buildRecord()) };
+    await assert.rejects(store.load(meta.id, "good"), /damaged save file: .*neutronics/);
+    assert.equal(sim.runId, before.simRun, "active sim untouched");
+    assert.equal(store.getSnapshot().runId, before.runId);
+    assert.equal(store.getSnapshot().snapshot.timeS, before.timeS);
+    assert.equal(JSON.stringify(store.buildRecord()), before.record, "history and log intact");
+    run(sim, 10);
+    assert.ok(store.getSnapshot().snapshot.timeS > before.timeS, "the original run keeps running");
+  } finally {
+    off();
+  }
 });

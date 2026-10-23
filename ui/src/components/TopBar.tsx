@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Command, ScenarioName, Snapshot } from "../sim/types";
 import { fmtClock } from "../util/format";
 import { Btn } from "./common/Button";
@@ -18,10 +18,23 @@ export function TopBar(props: {
   send: (c: Command) => void;
   backendKind: string;
   lastError: string | null;
+  onSave: () => void;
+  onLoad: () => void;
+  onTrends: () => void;
+  onLog: () => void;
 }) {
   const { s, send } = props;
   const [scenario, setScenario] = useState<ScenarioName>("hotStandby");
   const [confirmLoad, setConfirmLoad] = useState(false);
+  // One disarm timer at a time, so a re-armed START never expires early from an older click.
+  const disarmTimer = useRef<ReturnType<typeof setTimeout>>();
+  useEffect(() => () => clearTimeout(disarmTimer.current), []);
+  const armStart = (armed: boolean) => {
+    clearTimeout(disarmTimer.current);
+    setConfirmLoad(armed);
+    if (armed) disarmTimer.current = setTimeout(() => setConfirmLoad(false), 4000);
+  };
+  const scenarioLabel = SCENARIOS.find((sc) => sc.name === scenario)?.label ?? scenario;
   const allIn = s.rods.positions.every((p) => p < 0.5);
   // The host is falling behind the requested speed (smoothed rate below 90 %, or time piling up).
   const lagging = !s.paused && (s.effectiveSpeed < 0.9 * s.speed || s.clockBacklogS > 1);
@@ -64,7 +77,7 @@ export function TopBar(props: {
             value={scenario}
             onChange={(e) => {
               setScenario(e.target.value as ScenarioName);
-              setConfirmLoad(false);
+              armStart(false);
             }}
           >
             {SCENARIOS.map((sc) => (
@@ -76,17 +89,41 @@ export function TopBar(props: {
           <Btn
             tone="amber"
             active={confirmLoad}
+            title={confirmLoad ? `Click again to restart at ${scenarioLabel}; the current run is replaced` : `Restart the sim at ${scenarioLabel} (asks to confirm)`}
             onClick={() => {
               if (!confirmLoad) {
-                setConfirmLoad(true);
-                setTimeout(() => setConfirmLoad(false), 4000);
+                armStart(true);
               } else {
-                setConfirmLoad(false);
+                armStart(false);
                 send({ type: "loadScenario", name: scenario });
               }
             }}
           >
-            {confirmLoad ? "CONFIRM" : "LOAD"}
+            {confirmLoad ? "CONFIRM?" : "START"}
+          </Btn>
+        </div>
+      </div>
+
+      <div className="tb-block">
+        <div className="tb-label">SAVED RUNS</div>
+        <div className="row gap4">
+          <Btn tone="plain" onClick={props.onSave} title="Pause and save the current run">
+            SAVE
+          </Btn>
+          <Btn tone="plain" onClick={props.onLoad} title="Load a saved run">
+            LOAD
+          </Btn>
+        </div>
+      </div>
+
+      <div className="tb-block">
+        <div className="tb-label">VIEWS</div>
+        <div className="row gap4">
+          <Btn tone="plain" onClick={props.onTrends} title="Full trend page">
+            TRENDS
+          </Btn>
+          <Btn tone="plain" onClick={props.onLog} title="Event log: operator actions and alarms">
+            LOG
           </Btn>
         </div>
       </div>

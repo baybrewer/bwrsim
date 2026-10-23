@@ -45,9 +45,23 @@ export interface HistoryQueryResult {
   bucketS: number;
   /** Buckets aggregated (the cost of the query). */
   buckets: number;
-  /** Start time of the latest bucket in each column. */
+  /** Start time of the latest bucket in each column, clamped to t0 (the drawing x). */
   t: number[];
+  /**
+   * When each column's `last` values were sampled: on level 0 the exact sample time; on a
+   * coarse level the unclamped start of the column's latest bucket, the sample lying in
+   * [lastBucketT, lastBucketT + bucketS). A coarse `last` is not a reading at `t`.
+   */
+  lastBucketT: number[];
   series: Record<string, SeriesColumns>;
+}
+
+/** The latest retained sample at or before a time (see `History.asOf`). */
+export interface AsOfSample {
+  /** The sample was taken in [from, to]; from === to when its time is exact (level 0). */
+  from: number;
+  to: number;
+  values: Record<string, number | null>;
 }
 
 export function levelBucketS(level: number): number {
@@ -356,7 +370,7 @@ export class History {
     const lv = this.levels[k];
     const [from, to] = this.range(k, t0, t1);
     const ids = channelIds.filter((id) => lv.series[id]);
-    const out: HistoryQueryResult = { level: k, bucketS: levelBucketS(k), buckets: to - from, t: [], series: {} };
+    const out: HistoryQueryResult = { level: k, bucketS: levelBucketS(k), buckets: to - from, t: [], lastBucketT: [], series: {} };
     for (const id of ids) out.series[id] = emptyColumns();
     const span = t1 - t0;
     let col = -1;
@@ -366,14 +380,42 @@ export class History {
       if (px !== col) {
         col = px;
         out.t.push(bt);
+        out.lastBucketT.push(lv.t[i]);
         for (const id of ids) pushFrom(out.series[id], lv.series[id], i);
       } else {
         const j = out.t.length - 1;
         out.t[j] = bt;
+        out.lastBucketT[j] = lv.t[i];
         for (const id of ids) foldInto(out.series[id], j, lv.series[id], i);
       }
     }
     return out;
+  }
+
+  /**
+   * As-of reading: the latest sample at or before `t`, from the finest level that still
+   * holds `t`. Null when nothing is retained there, or when `t` falls inside a coarse
+   * bucket: its samples may lie on either side of `t`, so the latest one at or before `t`
+   * cannot be recovered (and its `last` may be a future value).
+   */
+  asOf(t: number, channelIds: readonly string[] = this.channelIds): AsOfSample | null {
+    for (let k = 0; k < this.levels.length; k++) {
+      if (!this.retains(k, t)) continue;
+      const lv = this.levels[k];
+      let i = upperBound(lv.t, t) - 1;
+      if (i < 0) return null;
+      const width = k === 0 ? 0 : levelBucketS(k);
+      // Inside a coarse bucket its last sample may be after t, so step back to the
+      // previous complete bucket: never a future value, at most two buckets stale
+      // (the caller's tolerance decides whether that is recent enough to show).
+      if (k > 0 && lv.t[i] + width > t) i -= 1;
+      if (i < 0) return null;
+      const values: Record<string, number | null> = {};
+      for (const id of channelIds) values[id] = lv.series[id] ? lv.series[id].last[i] : null;
+      // A coarse bucket's last sample is before its end; the latest sample bounds it too.
+      return { from: lv.t[i], to: k === 0 ? lv.t[i] : Math.min(lv.t[i] + width, this.lastT ?? t), values };
+    }
+    return null;
   }
 }
 
